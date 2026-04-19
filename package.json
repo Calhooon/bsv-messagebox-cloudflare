@@ -1,0 +1,14 @@
+{
+  "name": "bsv-messagebox-cloudflare",
+  "private": true,
+  "scripts": {
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "test": "cargo test 2>&1",
+    "migrate": "npx wrangler d1 migrations apply bsv-messagebox-cloudflare-prod",
+    "migrate:local": "npx wrangler d1 migrations apply bsv-messagebox-cloudflare-prod --local"
+  },
+  "devDependencies": {
+    "wrangler": "^3"
+  }
+}

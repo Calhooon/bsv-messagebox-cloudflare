@@ -1,0 +1,29 @@
+# Rust
+/target/
+Cargo.lock
+
+# WASM build artifacts
+/build/
+/dist/
+
+# Cloudflare
+.wrangler/
+.dev.vars
+
+# Node
+node_modules/
+
+# Secrets
+secrets.md
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+.claude/worktrees/
+tests/__pycache__/

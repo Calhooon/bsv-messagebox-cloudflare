@@ -1,0 +1,48 @@
+name = "bsv-messagebox-cloudflare"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-01-01"
+# account_id = "<your-cloudflare-account-id>"
+
+# Optional custom domain — configure after initial deploy
+# routes = [
+#   { pattern = "message-box.example.com", custom_domain = true }
+# ]
+
+[vars]
+BSV_NETWORK = "mainnet"
+# URL of a wallet service exposing an internalizeAction endpoint.
+# Required only when you enable paid delivery (non-zero server_fees or recipient_fees).
+WALLET_STORAGE_URL = ""
+# Flip to "true" after setting the FIREBASE_SERVICE_ACCOUNT_JSON secret.
+ENABLE_FIREBASE = "false"
+
+# Secrets (set via `wrangler secret put`):
+#   SERVER_PRIVATE_KEY            — 64-char hex BRC-31 server identity key.
+#   FIREBASE_SERVICE_ACCOUNT_JSON — Full Google service-account JSON (for FCM).
+#                                   Only required when ENABLE_FIREBASE = "true".
+#   R2_ACCESS_KEY_ID              — R2 S3 access key for presigning BEEF uploads.
+#   R2_SECRET_ACCESS_KEY          — R2 S3 secret.
+#   R2_ACCOUNT_ID                 — Cloudflare account ID (for the R2 S3 host).
+# And the plain [vars] R2_BUCKET_NAME should match the [[r2_buckets]].bucket_name.
+
+R2_BUCKET_NAME = "bsv-messagebox-beefs"
+
+[build]
+command = "worker-build --release"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "bsv-messagebox-cloudflare-prod"
+database_id = "<your-d1-database-id>"
+
+[[kv_namespaces]]
+binding = "AUTH_SESSIONS"
+id = "<your-kv-namespace-id>"
+
+# R2 bucket used by /beef/upload-url + sendMessage to handle BEEFs larger
+# than the 100 MB Workers body cap. Clients upload via presigned URL (S3 v4
+# signed in-WASM via r2_presign.rs), server fetches by key via this binding.
+[[r2_buckets]]
+binding = "BEEF_BLOBS"
+bucket_name = "bsv-messagebox-beefs"
+

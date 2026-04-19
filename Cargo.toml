@@ -1,0 +1,41 @@
+[package]
+name = "bsv-messagebox-cloudflare"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+worker = { version = "0.7", features = ["d1"] }
+serde-wasm-bindgen = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
+getrandom = { version = "0.2", features = ["js"] }
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+hex = "0.4"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4", "js"] }
+
+# FCM v1 JWT signing (RS256, PKCS#8 PEM parsing) — in-WASM RSA signing path.
+# sha2 needs the `oid` feature so it implements AssociatedOid, which
+# Pkcs1v15Sign::new::<Sha256>() requires.
+rsa = "0.9"
+sha2 = { version = "0.10", features = ["oid"] }
+pkcs8 = { version = "0.10", features = ["pem"] }
+
+# S3 v4 presigning for R2 uploads larger than the Workers 100 MB body cap.
+hmac = "0.12"
+
+# BSV
+bsv-middleware-cloudflare = "0.1.2"
+bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+# Test-only RNG for generating ephemeral RSA test keys. Not used at runtime.
+rand = "0.8"
