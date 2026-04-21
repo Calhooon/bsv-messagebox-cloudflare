@@ -5,13 +5,19 @@ Runs the same set of requests against both the reference Node.js server and the
 Rust port, and diffs response shapes field-by-field. Self-contained: only touches
 the caller's own inbox — never sends messages to strangers.
 
-Targets (both overridable via env vars NODE_URL / RUST_URL):
-  Node.js reference:   http://localhost:8080  (run via docker from message-box-server repo)
-  Rust under test:     http://localhost:8787  (wrangler dev) or your deployed Workers URL
+Targets:
+  Node.js reference:   http://localhost:8080  (local Docker: message-box-server-backend-1)
+  Rust production:     https://bsv-messagebox-cloudflare.dev-a3e.workers.dev
+
+NOTE: The public `messagebox.babbage.systems` was the original target, but it is
+RETIRED as of 2026-04-12 (404 on all endpoints — see rust-bsv-worm handoff notes).
+The local Docker container runs the exact same reference image, so it is the
+canonical Node.js message-box-server for parity testing.
 
 Prerequisites:
   - MetaNet Client wallet at localhost:3321
-  - x402-client checkout; set X402_CLIENT_DIR env var to its path
+    (identity: 03ef3231669022cc03aa26c74de784648faddb76609465c7181393efb335cbc7e0)
+  - x402-client at /Users/johncalhoun/bsv/x402-client
 
 The x402-client persists BRC-31 sessions keyed by server URL, so talking to
 two servers at once works naturally — no session-juggling required.
@@ -28,9 +34,7 @@ import traceback
 # Dependencies
 # ---------------------------------------------------------------------------
 
-X402_CLIENT_DIR = os.environ.get("X402_CLIENT_DIR")
-if not X402_CLIENT_DIR:
-    sys.exit("Set X402_CLIENT_DIR env var to the path of your x402-client checkout")
+X402_CLIENT_DIR = "/Users/johncalhoun/bsv/x402-client"
 sys.path.insert(0, X402_CLIENT_DIR)
 
 from lib.handshake import do_handshake, HandshakeError, get_or_create_session
@@ -45,19 +49,23 @@ import requests
 # ---------------------------------------------------------------------------
 
 NODE_URL = os.environ.get("NODE_URL", "http://localhost:8080")
-RUST_URL = os.environ.get("RUST_URL", "http://localhost:8787")
+RUST_URL = os.environ.get("RUST_URL", "https://bsv-messagebox-cloudflare.dev-a3e.workers.dev")
 
-WALLET_PORT = int(os.environ.get("WALLET_PORT", "3321"))
-# Public identity key of the wallet at WALLET_PORT (hex, 66 chars, secp256k1).
-# Required: tests assert recipient fields equal this value.
-SELF_IDENTITY = os.environ.get("SELF_IDENTITY", "")
-if not SELF_IDENTITY:
-    sys.exit("Set SELF_IDENTITY env var to the hex public identity key of the wallet at WALLET_PORT")
+WALLET_PORT = 3321
+SELF_IDENTITY = "03ef3231669022cc03aa26c74de784648faddb76609465c7181393efb335cbc7e0"
 
 # Set the metanet module to point at our wallet
 metanet.METANET_URL = f"http://localhost:{WALLET_PORT}"
 
-# Fields to ignore when diffing (dynamic values)
+# Fields to ignore when diffing. Two categories:
+#   1. Dynamic values generated per-request (messageId, timestamps, etc.)
+#   2. Operator-tunable config: deliveryFee and recipientFee are set per
+#      deployment via the server_fees table and message_permissions rows.
+#      Their *presence and type* is a parity concern, but their specific
+#      numeric value is not (different operators will run with different
+#      pricing — this repo defaults to 100 sats for notifications, the
+#      babbage reference uses 10). normalize() replaces their values with
+#      `<IGNORED>` so shape matches without requiring fee alignment.
 DYNAMIC_FIELDS = {
     "messageId",
     "sentMessageId",
@@ -67,6 +75,8 @@ DYNAMIC_FIELDS = {
     "updatedAt",
     "timestamp",
     "id",
+    "deliveryFee",
+    "recipientFee",
 }
 
 # Test results
