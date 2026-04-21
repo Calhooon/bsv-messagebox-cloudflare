@@ -3,22 +3,22 @@
 
 Exercises the complete payment lifecycle against the bsv-messagebox-cloudflare server:
 
-  1. Get fee quote for notifications box (expects deliveryFee=10, recipientFee=10)
+  1. Get fee quote for notifications box (expects deliveryFee=100, recipientFee=10)
   2. Obtain the server's identity key via BRC-31 handshake
   3. Derive a payment key (BRC-42) targeting the server's identity
   4. Build a P2PKH locking script for the derived key
-  5. Create a funded transaction via Wallet A (20 sats total: 10 delivery + 10 recipient)
+  5. Create a funded transaction via Wallet A (110 sats total: 100 delivery + 10 recipient)
   6. Send the message with payment body
   7. Verify 200 success
   8. Authenticate as Wallet B, list messages, confirm delivery
 
-WARNING: This test spends real BSV satoshis. Each run costs ~20 sats + mining fee.
+WARNING: This test spends real BSV satoshis. Each run costs ~110 sats + mining fee.
 
 Prerequisites:
   - Rust server running at localhost:8787 (npm run dev)
   - Wallet A (sender) at localhost:3321
   - Wallet B (receiver) at localhost:3322
-  - x402-client checkout (set X402_CLIENT_DIR env var)
+  - x402-client at /Users/johncalhoun/bsv/x402-client
 
 IMPORTANT: The MetaNet Client wallet requires MANUAL GUI APPROVAL for payment-
 related operations (getPublicKey with payment protocol, createAction). The test
@@ -45,9 +45,7 @@ import traceback
 # Dependencies
 # ---------------------------------------------------------------------------
 
-X402_CLIENT_DIR = os.environ.get("X402_CLIENT_DIR", "")
-if not X402_CLIENT_DIR:
-    sys.exit("Set X402_CLIENT_DIR env var to the path of your x402-client checkout")
+X402_CLIENT_DIR = __import__("os").environ.get("X402_CLIENT_DIR", "") or __import__("sys").exit("Set X402_CLIENT_DIR env var")
 sys.path.insert(0, X402_CLIENT_DIR)
 
 from lib.handshake import do_handshake, HandshakeError, get_or_create_session
@@ -331,7 +329,7 @@ def test_fee_quote():
            f"expected 200, got {status}")
 
     if status != 200:
-        skip("1b. deliveryFee is 10", "quote failed")
+        skip("1b. deliveryFee is 100", "quote failed")
         skip("1c. recipientFee is 10", "quote failed")
         return None
 
@@ -339,8 +337,8 @@ def test_fee_quote():
     delivery_fee = quote.get("deliveryFee")
     recipient_fee = quote.get("recipientFee")
 
-    record("1b. deliveryFee is 10", delivery_fee == 10,
-           f"expected 10, got {delivery_fee}")
+    record("1b. deliveryFee is 100", delivery_fee == 100,
+           f"expected 100, got {delivery_fee}")
     record("1c. recipientFee is 10 (auto-created default for notifications)",
            recipient_fee == 10, f"expected 10, got {recipient_fee}")
 
@@ -362,7 +360,7 @@ def test_paid_message_send(fees):
     section("Test 2: Payment Construction + Message Send")
     set_wallet_port(WALLET_A_PORT)
 
-    delivery_fee = fees.get("delivery_fee", 10) if fees else 10
+    delivery_fee = fees.get("delivery_fee", 100) if fees else 100
     recipient_fee = fees.get("recipient_fee", 10) if fees else 10
     total_sats = delivery_fee + recipient_fee
 
@@ -758,7 +756,7 @@ def main():
         print("  MODE: DRY RUN -- skipping payment creation (no sats spent)")
         print("  Tests 1 and 4 will run; test 2 (payment) and 3 (verify) will be skipped.")
     else:
-        print("  WARNING: This test spends real BSV. Each run costs ~20 sats + fee.")
+        print("  WARNING: This test spends real BSV. Each run costs ~110 sats + fee.")
         print()
         print("  IMPORTANT: The wallet requires MANUAL GUI APPROVAL for payment")
         print("  operations (getPublicKey with payment protocol, createAction).")

@@ -11,7 +11,7 @@ Tests the full payment lifecycle:
 Prerequisites:
   - Rust server running at localhost:8787 (npm run dev)
   - At least ONE MetaNet Client wallet running (ports 3321 and/or 3322)
-  - x402-client checkout; set X402_CLIENT_DIR env var to its path
+  - x402-client at /Users/johncalhoun/bsv/x402-client
   - Wallets must approve signing requests when prompted
 
 Wallet auto-detection:
@@ -34,9 +34,7 @@ import logging
 import traceback
 
 # Add x402-client to path so we can import its libraries
-X402_CLIENT_DIR = os.environ.get("X402_CLIENT_DIR")
-if not X402_CLIENT_DIR:
-    sys.exit("Set X402_CLIENT_DIR env var to the path of your x402-client checkout")
+X402_CLIENT_DIR = __import__("os").environ.get("X402_CLIENT_DIR", "") or __import__("sys").exit("Set X402_CLIENT_DIR env var")
 sys.path.insert(0, X402_CLIENT_DIR)
 
 from lib.handshake import do_handshake, HandshakeError
@@ -51,16 +49,11 @@ import lib.metanet as metanet
 
 SERVER_URL = "http://localhost:8787"
 
-# Known wallet ports and their expected identity keys.
-# Required: tests match the live wallet's reported key against this map.
-# Set WALLET_A_IDENTITY / WALLET_B_IDENTITY env vars to your wallets' public identity keys.
-_a_port = int(os.environ.get("WALLET_A_PORT", "3321"))
-_b_port = int(os.environ.get("WALLET_B_PORT", "3322"))
-_a_identity = os.environ.get("WALLET_A_IDENTITY", "")
-_b_identity = os.environ.get("WALLET_B_IDENTITY", "")
-if not _a_identity or not _b_identity:
-    sys.exit("Set WALLET_A_IDENTITY and WALLET_B_IDENTITY env vars to the hex public identity keys of your wallets")
-WALLETS = {_a_port: _a_identity, _b_port: _b_identity}
+# Known wallet ports and their expected identity keys
+WALLETS = {
+    3321: "03ef3231669022cc03aa26c74de784648faddb76609465c7181393efb335cbc7e0",
+    3322: "034aa44668fbc73ca5d490f0fa54b98b398b790856d8c55d540759ccefa5e6d0ce",
+}
 
 # Set at runtime by detect_wallets():
 #   SENDER_PORT / SENDER_IDENTITY  = wallet we sign with (always set if any wallet is live)
@@ -282,8 +275,8 @@ def test_quote_verification():
 
     record("2a. Quote returns 200", status == 200,
            f"expected 200, got {status}")
-    record("2b. deliveryFee is 10 (seeded in server_fees)", delivery_fee == 10,
-           f"expected 10, got {delivery_fee}")
+    record("2b. deliveryFee is 100 (seeded in server_fees)", delivery_fee == 100,
+           f"expected 100, got {delivery_fee}")
     record("2c. recipientFee is 10 (auto-created default for notifications)",
            recipient_fee == 10, f"expected 10, got {recipient_fee}")
 
@@ -523,11 +516,12 @@ def test_cross_identity_flow(inbox_msg_id: str | None = None):
 # ---------------------------------------------------------------------------
 
 def check_server():
-    """Quick health check."""
+    """Quick health check — 401 is expected (TS/Go parity: /health is authed)."""
     import requests
     try:
         resp = requests.get(f"{SERVER_URL}/health", timeout=5)
-        return resp.status_code == 200
+        # 200 (somehow auth'd) or 401 (unauth) both mean the server is up.
+        return resp.status_code in (200, 401)
     except Exception:
         return False
 

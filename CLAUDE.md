@@ -84,7 +84,7 @@ Five tables in `migrations/0001_initial.sql`:
 - `message_boxes` — one per `(identity_key, type)`
 - `messages` — dedup on `message_id`
 - `message_permissions` — `(recipient, sender, message_box)` unique; `sender IS NULL` = box-wide
-- `server_fees` — seeded: `notifications=10`, `inbox=0`, `payment_inbox=0`
+- `server_fees` — seeded: `notifications=100`, `inbox=0`, `payment_inbox=0` (tune via SQL UPDATE)
 - `device_registrations` — FCM token lifecycle, `active` flag
 
 ## Key Patterns
@@ -124,14 +124,11 @@ If ANY gate fails, you fix it before moving on. No exceptions.
 | **Parity** | Response shape matches Node.js server | `tests/e2e_parity.sh`, `tests/e2e_live_parity.py` |
 | **Payment** | Paid delivery with real sats | `tests/e2e_payment.py` |
 
-## Dependencies
+## Sibling Dependencies
 
-Published:
-- `bsv-rs = "0.3"` (crates.io) — BSV primitives
-- `rsa = "0.9"`, `sha2`, `pkcs8`, `hmac` (crates.io) — FCM JWT + R2 S3 v4 signing
-
-Sibling staging path dep (until published):
-- `../bsv-middleware-cloudflare-public` — BRC-103/104 + BRC-29 middleware for Workers
+Path deps (not yet on crates.io / public):
+- `../bsv-rs` — BSV primitives (`bsv-rs` crate on GitHub)
+- `../rust-middleware/bsv-middleware-cloudflare` — BRC-31 middleware for Workers
 
 External services:
 - `WALLET_STORAGE_URL` → wallet service with `internalizeAction` endpoint

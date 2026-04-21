@@ -115,7 +115,7 @@ Five tables in `migrations/0001_initial.sql`:
 - `message_boxes` — one per `(identity_key, type)`
 - `messages` — message storage, dedup on `message_id`
 - `message_permissions` — per-sender or box-wide delivery rules
-- `server_fees` — server delivery fee per box type (seeded: `notifications=10`, `inbox=0`, `payment_inbox=0`)
+- `server_fees` — server delivery fee per box type (seeded: `notifications=100`, `inbox=0`, `payment_inbox=0` — all tunable via `UPDATE server_fees SET delivery_fee = ...`)
 - `device_registrations` — FCM token lifecycle
 
 ## Build and Deploy
@@ -136,25 +136,20 @@ npm run deploy           # deploy to Cloudflare Workers
 5. Apply migrations: `npx wrangler d1 migrations apply bsv-messagebox-cloudflare-prod --remote`
 6. Set the mandatory secret:
    ```bash
-   # 64-char hex secp256k1 private key used as the BRC-31 server identity.
    echo "<hex-private-key>" | npx wrangler secret put SERVER_PRIVATE_KEY
    ```
 7. **(Optional)** Enable FCM push:
    ```bash
-   # Firebase console → Project Settings → Service accounts → "Generate new private key"
    cat service-account.json | npx wrangler secret put FIREBASE_SERVICE_ACCOUNT_JSON
    # Then set ENABLE_FIREBASE = "true" in wrangler.toml [vars].
    ```
 8. **(Optional)** Enable the R2 >100 MB BEEF upload extension:
    ```bash
    npx wrangler r2 bucket create <your-bucket-name>
-   # Then: dashboard → R2 → Manage R2 API Tokens → Create API Token
-   #   (Object Read & Write scope). Paste returned values:
+   # Dashboard → R2 → Manage R2 API Tokens → Create (Object R/W scope)
    echo "<r2-access-key-id>"     | npx wrangler secret put R2_ACCESS_KEY_ID
    echo "<r2-secret-access-key>" | npx wrangler secret put R2_SECRET_ACCESS_KEY
    echo "<your-account-id>"      | npx wrangler secret put R2_ACCOUNT_ID
-   # Update wrangler.toml [[r2_buckets]].bucket_name + [vars].R2_BUCKET_NAME
-   # to match the bucket you just created.
    ```
 9. Deploy: `npm run deploy`
 
@@ -170,21 +165,18 @@ cargo test --lib
 worker-build --release
 ```
 
-End-to-end suites (require a running dev server or deployment, a BRC-31 client such as the one in `tests/`, and a MetaNet Client wallet at `localhost:3321`):
+End-to-end suites (require a running dev server or deployment, a BRC-31 client such as x402-client, and a MetaNet Client wallet at `localhost:3321`):
 
 | Suite | What it proves |
 |---|---|
-| `tests/e2e_message_cycle.sh` | send → list → acknowledge round trip (8 assertions) |
-| `tests/e2e_parity.sh --rust-only` | Response shape parity vs the TS/Go servers (46 assertions) |
-| `tests/e2e_live_parity.py` | **Live diff** against a second server (e.g. `messagebox.babbage.systems`). 12 tests covering every endpoint + error path. |
-| `tests/e2e_real_sats.py` | Fee enforcement + cross-identity flows with real BSV sats (19 assertions) |
-| `tests/e2e_payment.py` | Full BRC-29 paid delivery with a real on-chain payment tx (18 assertions) |
-| `tests/e2e_r2_upload.py` | 150 MB BEEF upload via presigned R2 URL, bypassing the 100 MB Workers cap |
+| `tests/e2e_message_cycle.sh` | send → list → acknowledge round trip |
+| `tests/e2e_parity.sh --rust-only` | Response shape parity vs TS/Go servers (46 assertions) |
+| `tests/e2e_live_parity.py` | **Live diff** against a second server. 12/12 vs `messagebox.babbage.systems`. |
+| `tests/e2e_real_sats.py` | Fee enforcement + cross-identity flows with real sats (19 assertions) |
+| `tests/e2e_payment.py` | Full BRC-29 paid delivery with a real on-chain payment tx |
+| `tests/e2e_r2_upload.py` | 150 MB BEEF upload via presigned R2 URL, bypassing the 100 MB cap |
 
-Env vars the tests read:
-- `X402_CLI` or `X402_CLIENT_DIR` — path to your BRC-31 client's CLI / library
-- `NODE_URL` and `RUST_URL` — reference + target server URLs for live parity
-- `WALLET_A_IDENTITY`, `WALLET_B_IDENTITY`, `SELF_IDENTITY` — the public identity keys of the wallets on `localhost:3321` / `3322`
+Env vars the tests read: `X402_CLI`, `X402_CLIENT_DIR`, `NODE_URL`, `RUST_URL`, `WALLET_A_IDENTITY`, `WALLET_B_IDENTITY`, `SELF_IDENTITY`.
 
 ## Consumers
 

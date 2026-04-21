@@ -1,4 +1,4 @@
--- bsv-messagebox-cloudflare: D1 schema
+-- rust-message-box: D1 schema
 -- Ported from message-box-server MySQL (5 migrations consolidated)
 
 -- Message boxes: one per (identityKey, type) pair
@@ -57,7 +57,10 @@ CREATE TABLE IF NOT EXISTS server_fees (
 );
 
 -- Seed default server fees
-INSERT OR IGNORE INTO server_fees (message_box, delivery_fee) VALUES ('notifications', 10);
+-- 100 sats ≈ $0.000015 at $15/BSV. Covers Cloudflare Workers costs at modest
+-- volume while staying imperceptibly cheap to end users. Operators can tune:
+--   UPDATE server_fees SET delivery_fee = N WHERE message_box = 'notifications';
+INSERT OR IGNORE INTO server_fees (message_box, delivery_fee) VALUES ('notifications', 100);
 INSERT OR IGNORE INTO server_fees (message_box, delivery_fee) VALUES ('inbox', 0);
 INSERT OR IGNORE INTO server_fees (message_box, delivery_fee) VALUES ('payment_inbox', 0);
 
