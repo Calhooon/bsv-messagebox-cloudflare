@@ -7,7 +7,7 @@ the caller's own inbox — never sends messages to strangers.
 
 Targets:
   Node.js reference:   http://localhost:8080  (local Docker: message-box-server-backend-1)
-  Rust production:     https://bsv-messagebox-cloudflare.dev-a3e.workers.dev
+  Rust production:     https://rust-message-box.dev-a3e.workers.dev
 
 NOTE: The public `messagebox.babbage.systems` was the original target, but it is
 RETIRED as of 2026-04-12 (404 on all endpoints — see rust-bsv-worm handoff notes).
@@ -49,7 +49,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 NODE_URL = os.environ.get("NODE_URL", "http://localhost:8080")
-RUST_URL = os.environ.get("RUST_URL", "https://bsv-messagebox-cloudflare.dev-a3e.workers.dev")
+RUST_URL = os.environ.get("RUST_URL", "https://rust-message-box.dev-a3e.workers.dev")
 
 WALLET_PORT = 3321
 SELF_IDENTITY = "03ef3231669022cc03aa26c74de784648faddb76609465c7181393efb335cbc7e0"

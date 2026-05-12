@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """E2E test: Full BRC-29 payment flow with real BSV satoshis.
 
-Exercises the complete payment lifecycle against the bsv-messagebox-cloudflare server:
+Exercises the complete payment lifecycle against the rust-message-box server:
 
   1. Get fee quote for notifications box (expects deliveryFee=100, recipientFee=10)
   2. Obtain the server's identity key via BRC-31 handshake
@@ -45,7 +45,7 @@ import traceback
 # Dependencies
 # ---------------------------------------------------------------------------
 
-X402_CLIENT_DIR = __import__("os").environ.get("X402_CLIENT_DIR", "") or __import__("sys").exit("Set X402_CLIENT_DIR env var")
+X402_CLIENT_DIR = "/Users/johncalhoun/bsv/x402-client"
 sys.path.insert(0, X402_CLIENT_DIR)
 
 from lib.handshake import do_handshake, HandshakeError, get_or_create_session

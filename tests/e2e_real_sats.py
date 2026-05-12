@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""E2E payment flow tests for bsv-messagebox-cloudflare using real BSV satoshis.
+"""E2E payment flow tests for rust-message-box using real BSV satoshis.
 
 Tests the full payment lifecycle:
   1. Fee enforcement (missing payment -> 400)
@@ -34,7 +34,7 @@ import logging
 import traceback
 
 # Add x402-client to path so we can import its libraries
-X402_CLIENT_DIR = __import__("os").environ.get("X402_CLIENT_DIR", "") or __import__("sys").exit("Set X402_CLIENT_DIR env var")
+X402_CLIENT_DIR = "/Users/johncalhoun/bsv/x402-client"
 sys.path.insert(0, X402_CLIENT_DIR)
 
 from lib.handshake import do_handshake, HandshakeError
