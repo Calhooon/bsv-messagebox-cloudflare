@@ -7,7 +7,7 @@
 #   1. Node.js server running via docker compose on localhost:8080
 #   2. Rust server running via wrangler dev on localhost:8787
 #   3. MetaNet Client wallet running at localhost:3321
-#   4. x402-client CLI (set X402_CLI env var)
+#   4. x402-client CLI at ~/bsv/x402-client/cli.py
 #
 # Usage: ./tests/e2e_parity.sh [--rust-only]
 #
@@ -18,11 +18,7 @@
 set -uo pipefail
 # Note: -e intentionally omitted so all tests run even if some commands fail
 
-CLI="${X402_CLI:-}"
-if [[ -z "$CLI" ]]; then
-  echo "Set X402_CLI env var to the x402-client cli.py path" >&2
-  exit 1
-fi
+CLI="../x402-client/cli.py"
 NODE_SERVER="http://localhost:8080"
 RUST_SERVER="http://localhost:8787"
 MSG_ID="parity-$(date +%s)"

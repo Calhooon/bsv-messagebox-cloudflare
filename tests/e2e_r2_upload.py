@@ -16,7 +16,8 @@ the R2 pipeline, not the BSV internalization path. Acceptance:
 Prerequisites:
   - Rust server running at localhost:8787 (npm run dev)
   - MetaNet Client wallet A at localhost:3321
-  - X402_CLI env var pointing at x402-client/cli.py (required)
+  - X402_CLI env var pointing at x402-client/cli.py (defaults to
+    ../x402-client/cli.py)
   - .dev.vars must have R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY /
     R2_ACCOUNT_ID / R2_BUCKET_NAME populated
 
@@ -37,7 +38,7 @@ import urllib.parse
 
 
 SERVER = "http://localhost:8787"
-CLI = os.environ.get("X402_CLI") or sys.exit("Set X402_CLI env var to x402-client cli.py path")
+CLI = os.environ.get("X402_CLI", "../x402-client/cli.py")
 
 
 def _presign_r2(method, host, canonical_path, access_key, secret_key, expires=60):
@@ -214,7 +215,7 @@ def main():
 
     # Load R2 access keys from .dev.vars.
     r2_cfg = {}
-    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".dev.vars")) as f:
+    with open("./.dev.vars") as f:
         for line in f:
             if "=" in line:
                 k, v = line.rstrip("\n").split("=", 1)

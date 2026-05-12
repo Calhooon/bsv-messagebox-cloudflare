@@ -18,7 +18,7 @@ Prerequisites:
   - Rust server running at localhost:8787 (npm run dev)
   - Wallet A (sender) at localhost:3321
   - Wallet B (receiver) at localhost:3322
-  - x402-client at /Users/johncalhoun/bsv/x402-client
+  - x402-client at ../x402-client
 
 IMPORTANT: The MetaNet Client wallet requires MANUAL GUI APPROVAL for payment-
 related operations (getPublicKey with payment protocol, createAction). The test
@@ -45,7 +45,7 @@ import traceback
 # Dependencies
 # ---------------------------------------------------------------------------
 
-X402_CLIENT_DIR = __import__("os").environ.get("X402_CLIENT_DIR", "") or __import__("sys").exit("Set X402_CLIENT_DIR env var")
+X402_CLIENT_DIR = "../x402-client"
 sys.path.insert(0, X402_CLIENT_DIR)
 
 from lib.handshake import do_handshake, HandshakeError, get_or_create_session

@@ -46,3 +46,40 @@ id = "<your-kv-namespace-id>"
 binding = "BEEF_BLOBS"
 bucket_name = "bsv-messagebox-beefs"
 
+# MessageHub — per-identity hibernatable WebSocket DO (M9). Routing via
+# idFromName(identity_key); WS lifecycle + event surface live in
+# `src/message_hub.rs`. Deliberately a new class name (not MessageRoom)
+# to avoid collision with the v2 deletion.
+[[durable_objects.bindings]]
+name = "MESSAGE_HUB"
+class_name = "MessageHub"
+
+# EngineIoSession — per-sid Engine.IO + Socket.IO transport state (M10
+# Phase A — issue #61). Routing via idFromName(sid). Holds polling
+# buffer + transport state (polling vs websocket) + pending packets.
+# Pre-WS-upgrade polling traffic is handled in the Worker
+# (src/socketio_worker.rs); the DO is touched only on WS upgrade.
+[[durable_objects.bindings]]
+name = "ENGINEIO_SESSION"
+class_name = "EngineIoSession"
+
+# Durable Object migrations — required so Cloudflare knows what classes
+# exist across versions. v1 created MessageRoom (WebSocket rooms); v2
+# removed it when we dropped WebSocket to match go-messagebox-server
+# scope; v3 introduces MessageHub for the M9 hibernatable-WS rebuild;
+# v4 introduces EngineIoSession for the M10 socket.io compat shim.
+[[migrations]]
+tag = "v1"
+new_classes = ["MessageRoom"]
+
+[[migrations]]
+tag = "v2"
+deleted_classes = ["MessageRoom"]
+
+[[migrations]]
+tag = "v3"
+new_classes = ["MessageHub"]
+
+[[migrations]]
+tag = "v4"
+new_classes = ["EngineIoSession"]

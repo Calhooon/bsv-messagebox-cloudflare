@@ -11,7 +11,7 @@ Tests the full payment lifecycle:
 Prerequisites:
   - Rust server running at localhost:8787 (npm run dev)
   - At least ONE MetaNet Client wallet running (ports 3321 and/or 3322)
-  - x402-client at /Users/johncalhoun/bsv/x402-client
+  - x402-client at ../x402-client
   - Wallets must approve signing requests when prompted
 
 Wallet auto-detection:
@@ -34,7 +34,7 @@ import logging
 import traceback
 
 # Add x402-client to path so we can import its libraries
-X402_CLIENT_DIR = __import__("os").environ.get("X402_CLIENT_DIR", "") or __import__("sys").exit("Set X402_CLIENT_DIR env var")
+X402_CLIENT_DIR = "../x402-client"
 sys.path.insert(0, X402_CLIENT_DIR)
 
 from lib.handshake import do_handshake, HandshakeError

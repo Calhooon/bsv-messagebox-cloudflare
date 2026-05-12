@@ -1,0 +1,34 @@
+[package]
+name = "load_gen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace — do NOT inherit from bsv-messagebox-cloudflare workspace.
+# This is a native binary that links against bsv-rs (crates.io) and runs
+# under tokio. The parent crate compiles to wasm32 and has different deps.
+[workspace]
+
+[[bin]]
+name = "load_gen"
+path = "src/main.rs"
+
+[dependencies]
+bsv-rs = { version = "0.3", features = ["auth", "wallet", "http", "primitives"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+url = "2"
+http = "1"
+anyhow = "1"
+hdrhistogram = "7"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

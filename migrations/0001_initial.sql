@@ -1,4 +1,4 @@
--- rust-message-box: D1 schema
+-- bsv-messagebox-cloudflare: D1 schema
 -- Ported from message-box-server MySQL (5 migrations consolidated)
 
 -- Message boxes: one per (identityKey, type) pair
