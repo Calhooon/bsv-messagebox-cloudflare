@@ -21,7 +21,7 @@ pub fn openapi_spec() -> Value {
 fn info() -> Value {
     json!({
         "title": "bsv-messagebox-cloudflare",
-        "description": "BSV message box service — authenticated message delivery with permissions, payments, and device registration. All authenticated endpoints use BRC-31 mutual authentication. For payloads ≤100 MB this server is byte-for-byte compatible with the TS `message-box-server` and Go `go-messagebox-server` reference implementations; above 100 MB it exposes an opt-in Rust-only R2 upload extension (see `POST /beef/upload-url`).",
+        "description": "BSV message box service — authenticated message delivery with permissions, payments, and device registration. All authenticated endpoints use BRC-31 mutual authentication. For payloads ≤100 MB this server is byte-for-byte compatible with the TS `message-box-server` and Go `go-messagebox-server` reference implementations; above 100 MB it exposes an opt-in Rust-only R2 upload extension (see `POST /beef/upload-url`).\n\nIn addition to the HTTP routes documented here, the service exposes a WebSocket endpoint at `GET /ws` (Upgrade: websocket) that mirrors the TS `@bsv/authsocket` event surface (`joinRoom`, `leaveRoom`, `sendMessage`, etc.) on a per-identity hibernatable Cloudflare Durable Object. WebSocket APIs are out of OpenAPI 3.0 scope — OpenAPI does not model WS event channels — so they are intentionally not included in this spec. See the project README's \"WebSocket\" section for the event envelope and parity boundary; AsyncAPI would be the appropriate spec format if a machine-readable description is needed in the future.",
         "version": "0.1.0",
         "license": { "name": "Proprietary" }
     })

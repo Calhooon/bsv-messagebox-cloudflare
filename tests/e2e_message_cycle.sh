@@ -4,16 +4,11 @@
 #   1. npm run dev (wrangler dev server at localhost:8787)
 #   2. MetaNet Client wallet running at localhost:3321
 #   3. Approve signing requests in wallet GUI when prompted
-#   4. Set X402_CLI env var to the path of your x402-client cli.py
 #
-# Usage: X402_CLI=/path/to/x402-client/cli.py ./tests/e2e_message_cycle.sh
+# Usage: ./tests/e2e_message_cycle.sh
 
 set -e
-CLI="${X402_CLI:-}"
-if [[ -z "$CLI" ]]; then
-  echo "Set X402_CLI env var to the x402-client cli.py path" >&2
-  exit 1
-fi
+CLI="../x402-client/cli.py"
 SERVER="http://localhost:8787"
 IDENTITY_KEY=$(python3 "$CLI" identity 2>/dev/null)
 MSG_ID="e2e-test-$(date +%s)"

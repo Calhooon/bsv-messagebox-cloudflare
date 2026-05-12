@@ -9,6 +9,10 @@
     "migrate:local": "npx wrangler d1 migrations apply bsv-messagebox-cloudflare-prod --local"
   },
   "devDependencies": {
+    "@bsv/authsocket-client": "^2.0.2",
+    "@bsv/message-box-client": "^2.1.1",
+    "@bsv/sdk": "^2.1.0",
+    "socket.io-client": "^4.8.3",
     "wrangler": "^3"
   }
 }

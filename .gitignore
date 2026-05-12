@@ -27,3 +27,5 @@ secrets.md
 *.code-workspace
 .claude/worktrees/
 tests/__pycache__/
+tests/wire_compat_probe/node_modules/
+tests/load_gen/target/
