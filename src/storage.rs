@@ -5,6 +5,18 @@ use worker::D1Database;
 
 use crate::d1::Query;
 
+/// Max messages returned by a single `/listMessages` call.
+///
+/// The canonical TS message-box-server returns the *entire* mailbox (no LIMIT)
+/// and relies on clients `acknowledgeMessage`-ing (which DELETEs) to keep boxes
+/// small — fine on a Node host with GBs of RAM. This relay is a Cloudflare
+/// Worker with a hard **128 MB isolate ceiling**, so an unbounded `SELECT` of a
+/// box that accumulated many un-acknowledged messages OOMs the isolate (CF 1102)
+/// and fails every request sharing it. Kept small so even large DKG/Paillier
+/// bodies stay well under the ceiling; a draining client (list → acknowledge →
+/// repeat) still walks any backlog, and live delivery is unaffected (WS push).
+const LIST_MESSAGES_LIMIT: u32 = 100;
+
 /// Storage handle wrapping the D1 database binding.
 pub struct Storage<'a> {
     pub db: &'a D1Database,
@@ -145,12 +157,19 @@ impl<'a> Storage<'a> {
             None => return Ok(Vec::new()), // No box = empty list (not an error)
         };
 
+        // Bounded (see LIST_MESSAGES_LIMIT), DELIBERATELY UN-ORDERED: an
+        // `ORDER BY created_at` (no covering index) forces a full scan+sort of
+        // the whole matching set into the 128 MB isolate before LIMIT applies,
+        // which still OOMs a bloated box. Un-ordered, the engine stops after
+        // LIMIT rows (rowid / insertion order ≈ oldest-first).
         Query::new(
             "SELECT message_id AS messageId, body, sender, created_at, updated_at \
-             FROM messages WHERE recipient = ? AND message_box_id = ?",
+             FROM messages WHERE recipient = ? AND message_box_id = ? \
+             LIMIT ?",
         )
         .bind(identity_key)
         .bind(box_id)
+        .bind(LIST_MESSAGES_LIMIT)
         .fetch_all(self.db)
         .await
     }
