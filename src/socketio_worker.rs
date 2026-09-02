@@ -81,7 +81,58 @@ const KV_IDENTITY_PREFIX: &str = "sio:identity:";
 const KV_QUEUE_PREFIX: &str = "sio:queue:";
 const KV_CONNECTED_PREFIX: &str = "sio:connected:";
 const KV_CLOSED_PREFIX: &str = "sio:closed:";
-const KV_TTL_SECONDS: u64 = 3600;
+/// Lazy touch marker (H5 fix): present ⇒ this sid's session keys were
+/// refreshed within the last `ttl/2` — skip re-writing (Cloudflare KV allows
+/// ~1 write/sec/key; an unconditional per-request touch was the 2026-06-17
+/// 429 incident on the HTTP layer). BEST-EFFORT rate limiting, not a hard
+/// invariant: KV reads are eventually consistent, so a freshly-written marker
+/// can read as absent from another isolate for up to ~60s — the extra
+/// refreshes in that window are idempotent re-writes whose errors are
+/// non-fatal (`save_*` log-and-continue).
+const KV_TOUCH_PREFIX: &str = "sio:touch:";
+/// Fallback session TTL when `SESSION_TTL_SECONDS` is unset — matches the
+/// HTTP auth middleware's default (lib.rs).
+const KV_TTL_FALLBACK_SECONDS: u64 = 3600;
+
+/// H5 (LOW 2026-07-09 incident sweep): the socket.io KV TTL was HARDCODED to
+/// 1h while the HTTP layer honored `SESSION_TTL_SECONDS` (8h for LOW's
+/// multi-hand tables). Scope: this TTL governs POLLING-transport sessions
+/// only — a WS-upgraded session's state lives in the DO's WS attachment
+/// (no TTL, hibernation-safe) and reads KV once, at upgrade time. One
+/// deployment knob now rules both layers. Floored at 60: Cloudflare KV
+/// rejects `expiration_ttl < 60`, and a rejected put here would silently
+/// drop every session write (the `save_*` helpers log-and-continue).
+fn sio_ttl(env: &Env) -> u64 {
+    parse_session_ttl(env.var("SESSION_TTL_SECONDS").ok().map(|v| v.to_string()))
+}
+
+/// Pure half of `sio_ttl` (unit-tested): unset/garbage → the 1h fallback;
+/// a parsed value is floored at KV's 60s minimum.
+fn parse_session_ttl(raw: Option<String>) -> u64 {
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.max(60))
+        .unwrap_or(KV_TTL_FALLBACK_SECONDS)
+}
+
+#[cfg(test)]
+mod ttl_tests {
+    use super::parse_session_ttl;
+
+    /// The real producer path is `sio_ttl` reading wrangler `[vars]` — this
+    /// drives its pure half with the exact strings a deployment can set.
+    #[test]
+    fn session_ttl_parse_floor_and_fallback() {
+        assert_eq!(parse_session_ttl(None), 3600, "unset → 1h fallback");
+        assert_eq!(parse_session_ttl(Some("".into())), 3600, "empty → fallback");
+        assert_eq!(parse_session_ttl(Some("8h".into())), 3600, "garbage → fallback");
+        // KV rejects expiration_ttl < 60 — a sub-minute config must not
+        // silently drop every session write (review round-A finding).
+        assert_eq!(parse_session_ttl(Some("0".into())), 60, "0 parses → floored");
+        assert_eq!(parse_session_ttl(Some("30".into())), 60, "sub-minute → floored");
+        assert_eq!(parse_session_ttl(Some("60".into())), 60);
+        assert_eq!(parse_session_ttl(Some("28800".into())), 28800, "LOW's 8h passes through");
+    }
+}
 
 const LONG_POLL_MS: u64 = 25_000;
 const LONG_POLL_TICK_MS: u64 = 200;
@@ -106,11 +157,11 @@ async fn load_auth_state(kv: &KvStore, sid: &str) -> SessionAuthState {
     }
 }
 
-async fn save_auth_state(kv: &KvStore, sid: &str, state: &SessionAuthState) {
+async fn save_auth_state(kv: &KvStore, sid: &str, state: &SessionAuthState, ttl: u64) {
     let key = format!("{KV_AUTH_PREFIX}{sid}");
     match kv.put(&key, state) {
         Ok(builder) => {
-            if let Err(e) = builder.expiration_ttl(KV_TTL_SECONDS).execute().await {
+            if let Err(e) = builder.expiration_ttl(ttl).execute().await {
                 console_log!("SIOW: save_auth_state sid={sid}: {e}");
             }
         }
@@ -118,11 +169,11 @@ async fn save_auth_state(kv: &KvStore, sid: &str, state: &SessionAuthState) {
     }
 }
 
-async fn save_identity(kv: &KvStore, sid: &str, identity: &str) {
+async fn save_identity(kv: &KvStore, sid: &str, identity: &str, ttl: u64) {
     let key = format!("{KV_IDENTITY_PREFIX}{sid}");
     match kv.put(&key, identity) {
         Ok(builder) => {
-            if let Err(e) = builder.expiration_ttl(KV_TTL_SECONDS).execute().await {
+            if let Err(e) = builder.expiration_ttl(ttl).execute().await {
                 console_log!("SIOW: save_identity sid={sid}: {e}");
             }
         }
@@ -130,11 +181,11 @@ async fn save_identity(kv: &KvStore, sid: &str, identity: &str) {
     }
 }
 
-async fn mark_connected(kv: &KvStore, sid: &str) {
+async fn mark_connected(kv: &KvStore, sid: &str, ttl: u64) {
     let key = format!("{KV_CONNECTED_PREFIX}{sid}");
     match kv.put(&key, "1") {
         Ok(builder) => {
-            if let Err(e) = builder.expiration_ttl(KV_TTL_SECONDS).execute().await {
+            if let Err(e) = builder.expiration_ttl(ttl).execute().await {
                 console_log!("SIOW: mark_connected sid={sid}: {e}");
             }
         }
@@ -148,11 +199,11 @@ async fn is_connected(kv: &KvStore, sid: &str) -> bool {
     matches!(kv.get(&key).text().await, Ok(Some(_)))
 }
 
-async fn mark_closed(kv: &KvStore, sid: &str) {
+async fn mark_closed(kv: &KvStore, sid: &str, ttl: u64) {
     let key = format!("{KV_CLOSED_PREFIX}{sid}");
     match kv.put(&key, "1") {
         Ok(builder) => {
-            if let Err(e) = builder.expiration_ttl(KV_TTL_SECONDS).execute().await {
+            if let Err(e) = builder.expiration_ttl(ttl).execute().await {
                 console_log!("SIOW: mark_closed sid={sid}: {e}");
             }
         }
@@ -173,12 +224,12 @@ async fn read_queue(kv: &KvStore, sid: &str) -> Vec<String> {
     }
 }
 
-async fn write_queue(kv: &KvStore, sid: &str, q: &[String]) {
+async fn write_queue(kv: &KvStore, sid: &str, q: &[String], ttl: u64) {
     let key = format!("{KV_QUEUE_PREFIX}{sid}");
     let value = serde_json::to_string(q).unwrap_or_else(|_| "[]".into());
     match kv.put(&key, value) {
         Ok(builder) => {
-            if let Err(e) = builder.expiration_ttl(KV_TTL_SECONDS).execute().await {
+            if let Err(e) = builder.expiration_ttl(ttl).execute().await {
                 console_log!("SIOW: write_queue sid={sid}: {e}");
             }
         }
@@ -186,18 +237,81 @@ async fn write_queue(kv: &KvStore, sid: &str, q: &[String]) {
     }
 }
 
-async fn append_to_queue(kv: &KvStore, sid: &str, encoded_packet: String) {
+async fn append_to_queue(kv: &KvStore, sid: &str, encoded_packet: String, ttl: u64) {
     let mut q = read_queue(kv, sid).await;
     q.push(encoded_packet);
-    write_queue(kv, sid, &q).await;
+    write_queue(kv, sid, &q, ttl).await;
 }
 
-async fn drain_queue(kv: &KvStore, sid: &str) -> Vec<String> {
+async fn drain_queue(kv: &KvStore, sid: &str, ttl: u64) -> Vec<String> {
     let q = read_queue(kv, sid).await;
     if !q.is_empty() {
-        write_queue(kv, sid, &Vec::new()).await;
+        write_queue(kv, sid, &Vec::new(), ttl).await;
     }
     q
+}
+
+/// H5 — LAZY touch-on-traffic: refresh an authenticated session's KV entries
+/// (auth/identity/connected) roughly once per `ttl/2` (BEST-EFFORT — see
+/// `KV_TOUCH_PREFIX` on the eventual-consistency window), so an ACTIVE long
+/// sitting never expires mid-game while an idle session still ages out on
+/// schedule. Call sites are the REAL traffic producers (review round-B
+/// 2026-07-10: the AuthSocket client wraps every post-auth emit in an
+/// `authMessage` General, so the raw-EVENT path alone never fires):
+///   • `handle_authmessage` `AuthenticatedGeneral` — every wrapped client emit;
+///   • `handle_socketio_event` non-auth path — unwrapped/legacy events;
+///   • `touch_session_if_due` from the polling GET — a connected-but-quiet
+///     session's long-poll (EIO v4 heartbeats are server→client, so a Ping
+///     never arrives from a real polling client; round-2B F2).
+/// Below this session TTL the marker is skipped and every touch refreshes:
+/// KV's 60s minimum `expiration_ttl` would put the marker at parity with (or
+/// past) the session keys, so the marker could SUPPRESS the refresh right up
+/// to the moment the session dies (review round-2B F1). At sub-2-minute TTLs
+/// the 1-write/sec/key concern the marker exists for doesn't apply — the
+/// refresh cadence is bounded by the client's own request rate over a
+/// seconds-scale lifetime.
+const KV_TOUCH_MIN_MARKER_TTL: u64 = 120;
+
+async fn touch_session(kv: &KvStore, sid: &str, auth: &SessionAuthState, ttl: u64) {
+    let use_marker = ttl >= KV_TOUCH_MIN_MARKER_TTL;
+    let marker = format!("{KV_TOUCH_PREFIX}{sid}");
+    if use_marker && matches!(kv.get(&marker).text().await, Ok(Some(_))) {
+        return; // refreshed within the last ttl/2 — nothing to do
+    }
+    save_auth_state(kv, sid, auth, ttl).await;
+    if let Some(identity) = auth.verified_identity_key() {
+        save_identity(kv, sid, identity, ttl).await;
+    }
+    mark_connected(kv, sid, ttl).await;
+    if !use_marker {
+        return;
+    }
+    match kv.put(&marker, "1") {
+        Ok(builder) => {
+            // ttl/2 ≥ 60 here (ttl ≥ 120), so the marker ALWAYS expires with
+            // refresh headroom left on the session keys.
+            if let Err(e) = builder.expiration_ttl(ttl / 2).execute().await {
+                console_log!("SIOW: touch marker sid={sid}: {e}");
+            }
+        }
+        Err(e) => console_log!("SIOW: touch marker build sid={sid}: {e}"),
+    }
+}
+
+/// Marker-gated touch for call sites that have NOT already loaded auth state
+/// (the engine.io heartbeat): check the marker BEFORE paying the auth read,
+/// and only refresh a session that is actually authenticated — an anonymous
+/// pinger must never mint session state.
+async fn touch_session_if_due(kv: &KvStore, sid: &str, ttl: u64) {
+    let marker = format!("{KV_TOUCH_PREFIX}{sid}");
+    if matches!(kv.get(&marker).text().await, Ok(Some(_))) {
+        return;
+    }
+    let auth = load_auth_state(kv, sid).await;
+    if !auth.is_authenticated() {
+        return;
+    }
+    touch_session(kv, sid, &auth, ttl).await;
 }
 
 /// Load BRC-103 session state for a sid. Public so `EngineIoSession`
@@ -216,6 +330,7 @@ pub async fn load_auth_state_public(env: &Env, sid: &str) -> SessionAuthState {
 
 pub async fn handle_polling_post(body: &str, env: &Env, sid: &str) -> Result<Response> {
     let kv = auth_kv(env)?;
+    let ttl = sio_ttl(env);
 
     if is_closed(&kv, sid).await {
         return public_polling_text_response("ok", 200);
@@ -239,12 +354,17 @@ pub async fn handle_polling_post(body: &str, env: &Env, sid: &str) -> Result<Res
                 // Server-only; ignore from client.
             }
             EngineIoPacket::Close => {
-                mark_closed(&kv, sid).await;
+                mark_closed(&kv, sid, ttl).await;
             }
             EngineIoPacket::Ping(payload) => {
                 // Engine.IO 2probe → reply 3probe (or any Ping → Pong).
+                // NOTE (review round-2B F2): under EIO v4 the heartbeat is
+                // server→client, so a real polling client never sends Ping
+                // here — the quiet-session touch lives on the polling GET
+                // (the long-poll IS a quiet session's traffic), not on this
+                // branch.
                 let pong = EngineIoPacket::Pong(payload).encode();
-                append_to_queue(&kv, sid, pong).await;
+                append_to_queue(&kv, sid, pong, ttl).await;
             }
             EngineIoPacket::Pong(_) => {
                 // Bare heartbeat ack — nothing to do.
@@ -267,6 +387,7 @@ pub async fn handle_polling_post(body: &str, env: &Env, sid: &str) -> Result<Res
 // ===========================================================================
 
 async fn handle_socketio_in_worker(payload: &str, env: &Env, kv: &KvStore, sid: &str) {
+    let ttl = sio_ttl(env);
     let pkt = match SocketIoPacket::decode(payload) {
         Ok(p) => p,
         Err(e) => {
@@ -282,11 +403,11 @@ async fn handle_socketio_in_worker(payload: &str, env: &Env, kv: &KvStore, sid: 
                 data: Some(json!({ "sid": sid })),
             };
             let frame = EngineIoPacket::Message(ack.encode()).encode();
-            append_to_queue(kv, sid, frame).await;
-            mark_connected(kv, sid).await;
+            append_to_queue(kv, sid, frame, ttl).await;
+            mark_connected(kv, sid, ttl).await;
         }
         SocketIoPacket::Disconnect { .. } => {
-            mark_closed(kv, sid).await;
+            mark_closed(kv, sid, ttl).await;
         }
         SocketIoPacket::Event {
             nsp,
@@ -303,6 +424,7 @@ async fn handle_socketio_in_worker(payload: &str, env: &Env, kv: &KvStore, sid: 
 }
 
 async fn handle_socketio_event(env: &Env, kv: &KvStore, sid: &str, nsp: &str, data: &[Value]) {
+    let ttl = sio_ttl(env);
     let event_name = match data.first().and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => {
@@ -326,6 +448,9 @@ async fn handle_socketio_event(env: &Env, kv: &KvStore, sid: &str, nsp: &str, da
         console_log!("SIOW: dropping non-auth event '{event_name}' on unauthenticated sid={sid}");
         return;
     }
+    // H5: real traffic keeps a live session's KV entries fresh (lazy —
+    // at most one refresh per ttl/2; see touch_session).
+    touch_session(kv, sid, &auth, ttl).await;
 
     // Forward to MessageHub. Returned outbound events are wrapped as
     // signed Generals and enqueued for polling-GET drain.
@@ -357,7 +482,7 @@ async fn handle_socketio_event(env: &Env, kv: &KvStore, sid: &str, nsp: &str, da
         match build_outbound_general(payload, &auth, &wallet) {
             Ok(general) => {
                 let frame = encode_outbound_authmessage(&general);
-                append_to_queue(kv, sid, frame).await;
+                append_to_queue(kv, sid, frame, ttl).await;
             }
             Err(e) => {
                 console_log!("SIOW: build General '{out_name}' sid={sid}: {e}");
@@ -367,6 +492,7 @@ async fn handle_socketio_event(env: &Env, kv: &KvStore, sid: &str, nsp: &str, da
 }
 
 async fn handle_authmessage(env: &Env, kv: &KvStore, sid: &str, nsp: &str, arg: &Value) {
+    let ttl = sio_ttl(env);
     let server_key = match env.secret("SERVER_PRIVATE_KEY") {
         Ok(s) => s.to_string(),
         Err(e) => {
@@ -391,14 +517,14 @@ async fn handle_authmessage(env: &Env, kv: &KvStore, sid: &str, nsp: &str, arg: 
             // Authenticated.
             for out_msg in &msgs {
                 let frame = encode_outbound_authmessage(out_msg);
-                append_to_queue(kv, sid, frame).await;
+                append_to_queue(kv, sid, frame, ttl).await;
             }
             if let Some(out) = msgs.first() {
                 if let Ok(new_state) = session_from_initial_response(arg, out) {
                     if let Some(identity) = new_state.verified_identity_key() {
-                        save_identity(kv, sid, identity).await;
+                        save_identity(kv, sid, identity, ttl).await;
                     }
-                    save_auth_state(kv, sid, &new_state).await;
+                    save_auth_state(kv, sid, &new_state, ttl).await;
                     console_log!(
                         "SIOW: BRC-103 complete sid={sid} identity={}",
                         new_state.verified_identity_key().unwrap_or("<unknown>")
@@ -412,6 +538,14 @@ async fn handle_authmessage(env: &Env, kv: &KvStore, sid: &str, nsp: &str, arg: 
             // `authenticationSuccess` directly here without
             // round-tripping anywhere; we do the same. Other event
             // names forward to MessageHub.
+            //
+            // H5 touch lives HERE because this arm IS the live traffic
+            // path: the AuthSocket client wraps EVERY post-auth emit
+            // (joinRoom/sendMessage/…) in a signed General, so a session
+            // that only ever produced wrapped events would otherwise die
+            // exactly TTL after its handshake no matter how active it was
+            // (review round-B finding, 2026-07-10).
+            touch_session(kv, sid, &current, ttl).await;
             let (event_name, event_data) = decode_event_payload(&payload);
 
             if event_name == "authenticated" {
@@ -420,7 +554,7 @@ async fn handle_authmessage(env: &Env, kv: &KvStore, sid: &str, nsp: &str, arg: 
                 match build_outbound_general(ack_payload, &current, &wallet) {
                     Ok(general) => {
                         let frame = encode_outbound_authmessage(&general);
-                        append_to_queue(kv, sid, frame).await;
+                        append_to_queue(kv, sid, frame, ttl).await;
                         console_log!("SIOW: fast-path authenticationSuccess sid={sid}");
                     }
                     Err(e) => console_log!("SIOW: build authSuccess sid={sid}: {e}"),
@@ -442,7 +576,7 @@ async fn handle_authmessage(env: &Env, kv: &KvStore, sid: &str, nsp: &str, arg: 
                 match build_outbound_general(payload, &current, &wallet) {
                     Ok(general) => {
                         let frame = encode_outbound_authmessage(&general);
-                        append_to_queue(kv, sid, frame).await;
+                        append_to_queue(kv, sid, frame, ttl).await;
                     }
                     Err(e) => console_log!("SIOW: build General '{out_name}' sid={sid}: {e}"),
                 }
@@ -467,15 +601,23 @@ async fn handle_authmessage(env: &Env, kv: &KvStore, sid: &str, nsp: &str, arg: 
 // ===========================================================================
 
 pub async fn handle_polling_get(env: &Env, sid: &str) -> Result<Response> {
+    let ttl = sio_ttl(env);
     let kv = auth_kv(env)?;
 
     if is_closed(&kv, sid).await {
         return public_polling_text_response(&EngineIoPacket::Close.encode(), 200);
     }
 
+    // H5: a connected-but-QUIET polling session produces no events, but it IS
+    // long-polling this endpoint continuously — that is its real liveness
+    // signal (EIO v4 clients never send Ping over polling; review round-2B
+    // F2). Marker-gated + authenticated-only: an anonymous GET refreshes
+    // nothing.
+    touch_session_if_due(&kv, sid, ttl).await;
+
     let deadline = Date::now().as_millis() + LONG_POLL_MS;
     loop {
-        let drained = drain_queue(&kv, sid).await;
+        let drained = drain_queue(&kv, sid, ttl).await;
         if !drained.is_empty() {
             // Each queue entry is a full Engine.IO packet body; we
             // join them with the protocol's record separator. We
@@ -540,35 +682,60 @@ async fn forward_event_to_message_hub(
         "data": data,
     })
     .to_string();
-    let headers = Headers::new();
-    if headers.set("content-type", "application/json").is_err() {
-        return Vec::new();
-    }
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post)
-        .with_headers(headers)
-        .with_body(Some(payload.into()));
-    let Ok(req) = Request::new_with_init("https://do.local/internal/socketio-event", &init) else {
-        return Vec::new();
-    };
-    let mut resp = match stub.fetch_with_request(req).await {
-        Ok(r) => r,
-        Err(e) => {
-            console_log!("SIOW: socketio-event fetch sid={sid}: {e}");
-            return Vec::new();
+    // bsv-low#249 (ack-reliability): same bounded-retry as the WS-path forward in
+    // `engineio::session` — an unbounded DO→MessageHub subrequest could stall a
+    // polling send's ack past the client's WS-ack budget (here the ack is enqueued
+    // for the polling-GET drain, so a stall delays the drain just as badly). Bound
+    // each attempt + retry once; idempotent on the UNIQUE messageId. See
+    // `hub_forward` for the rationale.
+    crate::hub_forward::run_forward_with_retry(|attempt_idx| {
+        let stub = &stub;
+        let payload = payload.clone();
+        async move {
+            let headers = Headers::new();
+            if headers.set("content-type", "application/json").is_err() {
+                return None;
+            }
+            let mut init = RequestInit::new();
+            init.with_method(Method::Post)
+                .with_headers(headers)
+                .with_body(Some(payload.into()));
+            let Ok(req) = Request::new_with_init("https://do.local/internal/socketio-event", &init)
+            else {
+                return None;
+            };
+            let t0 = Date::now().as_millis();
+            let result = crate::hub_forward::with_do_op_timeout(
+                async {
+                    let mut resp = stub.fetch_with_request(req).await?;
+                    resp.json::<HubEventResponse>().await
+                },
+                crate::hub_forward::FORWARD_OP_TIMEOUT_MS,
+            )
+            .await;
+            let dt = Date::now().as_millis().saturating_sub(t0);
+            match result {
+                Ok(body) => {
+                    console_log!(
+                        "TRACE_LAT siow.forward attempt={attempt_idx} sid={sid} outcome=ok ms={dt}"
+                    );
+                    Some(
+                        body.outbound
+                            .into_iter()
+                            .map(|e| (e.event_name, e.data))
+                            .collect::<Vec<(String, Value)>>(),
+                    )
+                }
+                Err(e) => {
+                    console_log!(
+                        "TRACE_LAT siow.forward attempt={attempt_idx} sid={sid} outcome=retryable ms={dt} err={e}"
+                    );
+                    None
+                }
+            }
         }
-    };
-    let body: HubEventResponse = match resp.json().await {
-        Ok(b) => b,
-        Err(e) => {
-            console_log!("SIOW: socketio-event response sid={sid}: {e}");
-            return Vec::new();
-        }
-    };
-    body.outbound
-        .into_iter()
-        .map(|e| (e.event_name, e.data))
-        .collect()
+    })
+    .await
 }
 
 async fn register_sid_with_hub(env: &Env, identity_key: &str, sid: &str) -> Result<()> {

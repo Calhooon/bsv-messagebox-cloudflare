@@ -146,7 +146,7 @@ mod tests {
         assert!(matches!(QVal::from("hello"), QVal::Text(_)));
         assert!(matches!(QVal::from(String::from("hi")), QVal::Text(_)));
         assert!(matches!(QVal::from(true), QVal::Bool(true)));
-        assert!(matches!(QVal::from(3.14_f64), QVal::Float(_)));
+        assert!(matches!(QVal::from(2.5_f64), QVal::Float(_)));
         assert!(matches!(QVal::from(None::<i32>), QVal::Null));
         assert!(matches!(QVal::from(Some(42_i32)), QVal::Int(42)));
     }

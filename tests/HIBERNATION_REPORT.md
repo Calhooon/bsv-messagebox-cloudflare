@@ -38,14 +38,14 @@ Hibernation is working on prod. A `MessageHub` Durable Object that idles for 60 
 
 Use the CF GraphQL Analytics API. Required:
 
-- Account ID: `your-cloudflare-account-id`
-- MessageHub namespace ID: `your-message-hub-do-namespace-id` (resolved via `GET /accounts/.../workers/durable_objects/namespaces`)
+- Account ID: `<redacted-cloudflare-id>`
+- MessageHub namespace ID: `b29f0bb08bd24c9895a7da2439918f3d` (resolved via `GET /accounts/.../workers/durable_objects/namespaces`)
 - A CF API token with `Analytics: Read` permission (the deploy token in `secrets.md` works)
 
 ```bash
 TOKEN=$(grep "^export CLOUDFLARE_API_TOKEN=" secrets.md | head -1 | sed 's/^export CLOUDFLARE_API_TOKEN=//' | tr -d '"')
-ACCOUNT_ID=your-cloudflare-account-id
-NS=your-message-hub-do-namespace-id
+ACCOUNT_ID=<redacted-cloudflare-id>
+NS=b29f0bb08bd24c9895a7da2439918f3d
 END=$(python3 -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))")
 START=$(python3 -c "from datetime import datetime, timezone, timedelta; print((datetime.now(timezone.utc) - timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
 

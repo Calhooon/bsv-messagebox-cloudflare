@@ -17,7 +17,7 @@ canonical Node.js message-box-server for parity testing.
 Prerequisites:
   - MetaNet Client wallet at localhost:3321
     (identity: 03ef3231669022cc03aa26c74de784648faddb76609465c7181393efb335cbc7e0)
-  - x402-client at ../x402-client
+  - x402-client at /Users/johncalhoun/bsv/x402-client
 
 The x402-client persists BRC-31 sessions keyed by server URL, so talking to
 two servers at once works naturally — no session-juggling required.
@@ -34,7 +34,7 @@ import traceback
 # Dependencies
 # ---------------------------------------------------------------------------
 
-X402_CLIENT_DIR = "../x402-client"
+X402_CLIENT_DIR = "/Users/johncalhoun/bsv/x402-client"
 sys.path.insert(0, X402_CLIENT_DIR)
 
 from lib.handshake import do_handshake, HandshakeError, get_or_create_session

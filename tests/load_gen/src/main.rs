@@ -21,7 +21,7 @@ mod load;
 mod serialize;
 
 #[derive(Debug, Parser)]
-#[command(name = "load_gen", about = "BRC-31 + WS load generator for bsv-messagebox-cloudflare")]
+#[command(name = "load_gen", about = "BRC-31 + WS load generator for rust-message-box")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -52,9 +52,9 @@ enum Cmd {
     Analytics {
         #[arg(long, env = "CLOUDFLARE_API_TOKEN")]
         token: String,
-        #[arg(long, default_value = "your-cloudflare-account-id")]
+        #[arg(long, default_value = "<redacted-cloudflare-id>")]
         account_id: String,
-        #[arg(long, default_value = "your-message-hub-do-namespace-id")]
+        #[arg(long, default_value = "b29f0bb08bd24c9895a7da2439918f3d")]
         namespace_id: String,
         #[arg(long)]
         start: String,

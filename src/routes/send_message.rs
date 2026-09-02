@@ -24,9 +24,21 @@
 //! contain only outcome → wire-format translation.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::time::Duration;
 
 use serde_json::{json, Value};
-use worker::{console_log, Date, Env, Headers, Method, Request, RequestInit};
+use worker::{console_log, Date, Delay, Env, Headers, Method, Request, RequestInit};
+
+/// Hard cap on the best-effort WS live-push fan-out to a recipient's Durable
+/// Object (`push_to_recipient_sockets`). The push MUST NOT block `POST
+/// /sendMessage`: the message is already durable in D1 and offline / slow-DO
+/// clients receive it via `listMessages` backfill. Without this cap an
+/// unresponsive `/internal/push` DO fetch hangs the whole send for the client's
+/// full request timeout (~30s) — which wedged every authed send under load
+/// (the relay's `/sendMessage` "canceled" 30s hang, 0 CPU). 2s is far above a
+/// healthy DO RTT (single-digit ms) yet returns promptly when a DO is stuck.
+const PUSH_FANOUT_TIMEOUT_MS: u64 = 2_000;
 
 use crate::beef_upload;
 use crate::fcm;
@@ -83,6 +95,33 @@ pub enum SendOutcome {
 
     /// Something else went wrong (D1 read/write, R2 fetch, etc.).
     InternalError { detail: String },
+
+    /// A TRANSIENT D1 fault (cold-start blip / momentary storage-DO contention)
+    /// that did not clear within the bounded in-request retry. Distinct from
+    /// `InternalError` so the caller can return a client-RETRYABLE status (HTTP
+    /// 503) rather than a terminal 500 — and, critically, WITHOUT the ~10s hang
+    /// the un-bounded write path used to inflict (bsv-low#249): the write path now
+    /// fails fast here. The client's own resend then succeeds against a warm
+    /// binding, so a momentary blip no longer strands a move → no spurious
+    /// escalation.
+    TransientError { detail: String },
+}
+
+/// Map a `worker::Error` bubbled out of the D1 read/write helpers onto the right
+/// send outcome: the bounded retry loops only ever propagate a TRANSIENT error
+/// after exhausting their attempts (a genuine error short-circuits without
+/// retry), so a transient class here means "D1 momentarily unavailable" →
+/// client-retryable, whereas anything else is a real internal fault.
+fn classify_store_error(e: worker::Error) -> SendOutcome {
+    if crate::storage::is_transient_d1_error(&e) {
+        SendOutcome::TransientError {
+            detail: e.to_string(),
+        }
+    } else {
+        SendOutcome::InternalError {
+            detail: e.to_string(),
+        }
+    }
 }
 
 /// Run the shared write path. Idempotent w.r.t. how the request was
@@ -100,27 +139,47 @@ pub async fn process_send(
     env: &Env,
     store: &Storage<'_>,
 ) -> SendOutcome {
-    // -- 1. Resolve per-recipient fees (auto-creates default permissions). --
+    // -- 1. Resolve per-recipient context (recipient fee + server delivery fee + the
+    //       recipient's message-box id) in ONE D1 `batch()` round-trip each — #9: this is
+    //       the per-round-message relay hot path (keygen/aux), formerly 3-4 SEQUENTIAL D1
+    //       queries. `box_id == None` ⇒ create lazily in the insert loop (only the first
+    //       message to a recipient). --
     let mut blocked = Vec::new();
-    let mut fee_map: Vec<(String, String, i32)> = Vec::new();
+    // (recipient, message_id, recipient_fee, box_id)
+    let mut ctx_map: Vec<(String, String, i32, Option<i64>)> = Vec::new();
+    let mut delivery_fee: i32 = 0;
 
     for (recipient, message_id) in &validated.recipients {
-        let fee = match store
-            .get_recipient_fee(recipient, sender_key, &validated.message_box)
+        // bsv-low#249 diagnostic: time the D1 read_send_context (find_message_box
+        // READ — the review flagged it has read-retry but NO op-timeout, so a
+        // read stall would surface here). Paired with the box/insert timers below
+        // and the TRACE_LAT route_ms in lib.rs, the next run pins any relay-side
+        // stall to an exact D1 op.
+        let t_ctx_start = Date::now().as_millis();
+        let ctx = match store
+            .read_send_context(recipient, sender_key, &validated.message_box)
             .await
         {
-            Ok(f) => f,
-            Err(e) => {
-                return SendOutcome::InternalError {
-                    detail: e.to_string(),
-                }
-            }
+            Ok(c) => c,
+            Err(e) => return classify_store_error(e),
         };
+        console_log!(
+            "TRACE_LAT send.read_ctx recipient={} ms={}",
+            recipient,
+            Date::now().as_millis().saturating_sub(t_ctx_start)
+        );
+        // server delivery fee is per-message_box — identical for every recipient.
+        delivery_fee = ctx.server_fee;
 
-        if fee < 0 {
+        if ctx.recipient_fee < 0 {
             blocked.push(recipient.clone());
         } else {
-            fee_map.push((recipient.clone(), message_id.clone(), fee));
+            ctx_map.push((
+                recipient.clone(),
+                message_id.clone(),
+                ctx.recipient_fee,
+                ctx.box_id,
+            ));
         }
     }
 
@@ -129,10 +188,10 @@ pub async fn process_send(
     }
 
     // -- 2. Decide whether payment is required. --
-    let delivery_fee: i32 = store
-        .get_server_delivery_fee(&validated.message_box)
-        .await
-        .unwrap_or_default();
+    let fee_map: Vec<(String, String, i32)> = ctx_map
+        .iter()
+        .map(|(r, m, f, _)| (r.clone(), m.clone(), *f))
+        .collect();
     let any_recipient_fee = fee_map.iter().any(|(_, _, f)| *f > 0);
     let requires_payment = delivery_fee > 0 || any_recipient_fee;
 
@@ -172,16 +231,25 @@ pub async fn process_send(
 
     // -- 4. Insert per-recipient rows into D1. Same column shape as the
     //       HTTP path — the parity contract. --
-    let mut results = Vec::with_capacity(fee_map.len());
-    for (recipient, message_id, _fee) in &fee_map {
-        let box_id = match store
-            .get_or_create_message_box(recipient, &validated.message_box)
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                return SendOutcome::InternalError {
-                    detail: e.to_string(),
+    let mut results = Vec::with_capacity(ctx_map.len());
+    for (recipient, message_id, _fee, box_id_opt) in &ctx_map {
+        // #9: the batched read already fetched the box id; only hit D1 to create the box
+        // when it doesn't exist yet (first message to this recipient/box).
+        let box_id = match box_id_opt {
+            Some(id) => *id,
+            None => {
+                let t_box_start = Date::now().as_millis();
+                let r = store
+                    .get_or_create_message_box(recipient, &validated.message_box)
+                    .await;
+                console_log!(
+                    "TRACE_LAT send.get_or_create_box recipient={} ms={}",
+                    recipient,
+                    Date::now().as_millis().saturating_sub(t_box_start)
+                );
+                match r {
+                    Ok(id) => id,
+                    Err(e) => return classify_store_error(e),
                 }
             }
         };
@@ -204,10 +272,18 @@ pub async fn process_send(
             None => json!({ "message": validated.body }).to_string(),
         };
 
-        match store
+        let t_ins_start = Date::now().as_millis();
+        let ins = store
             .insert_message(message_id, box_id, sender_key, recipient, &stored_body)
-            .await
-        {
+            .await;
+        console_log!(
+            "TRACE_LAT send.insert_message recipient={} msgId={} ms={} dup={}",
+            recipient,
+            message_id,
+            Date::now().as_millis().saturating_sub(t_ins_start),
+            matches!(&ins, Ok(false))
+        );
+        match ins {
             Ok(true) => {}
             Ok(false) => {
                 return SendOutcome::DuplicateMessage {
@@ -215,11 +291,7 @@ pub async fn process_send(
                     message_id: message_id.clone(),
                 };
             }
-            Err(e) => {
-                return SendOutcome::InternalError {
-                    detail: e.to_string(),
-                }
-            }
+            Err(e) => return classify_store_error(e),
         }
 
         results.push(RecipientResult {
@@ -305,6 +377,20 @@ pub fn outcome_to_http(outcome: SendOutcome) -> (Value, u16) {
             }),
             500,
         ),
+        SendOutcome::TransientError { detail } => (
+            json!({
+                "status": "error",
+                "code": "ERR_D1_UNAVAILABLE",
+                "description": format!(
+                    "The relay is momentarily unavailable; please retry: {}",
+                    detail
+                ),
+            }),
+            // 503 = client-retryable. The send failed FAST (bounded write
+            // timeout+retry), never the ~10s hang — the client resend lands on a
+            // warm binding, so a momentary D1 blip no longer strands a move.
+            503,
+        ),
     }
 }
 
@@ -388,9 +474,25 @@ async fn push_to_recipient_sockets(
         message_id,
         t_fanout_start
     );
-    match stub.fetch_with_request(req).await {
-        Ok(_) => {
-            let t_done = Date::now().as_millis();
+    // Bound the DO push: race the subrequest against a `PUSH_FANOUT_TIMEOUT_MS`
+    // `Delay`. On timeout we ABANDON the push (dropping the fetch future cancels
+    // the subrequest) and return — best-effort, exactly as this function's
+    // contract documents — so a wedged/slow recipient DO can never hang the send.
+    let mut fetch = Box::pin(stub.fetch_with_request(req));
+    let mut push_timeout = Box::pin(Delay::from(Duration::from_millis(PUSH_FANOUT_TIMEOUT_MS)));
+    let push_result = std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(r) = fetch.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(r));
+        }
+        if push_timeout.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(None);
+        }
+        std::task::Poll::Pending
+    })
+    .await;
+    let t_done = Date::now().as_millis();
+    match push_result {
+        Some(Ok(_)) => {
             console_log!(
                 "TRACE_PHD broadcast.fanout.ok recipient={} msgId={} t={} rtt_ms={}",
                 recipient,
@@ -399,8 +501,7 @@ async fn push_to_recipient_sockets(
                 t_done.saturating_sub(t_fanout_start)
             );
         }
-        Err(e) => {
-            let t_done = Date::now().as_millis();
+        Some(Err(e)) => {
             console_log!(
                 "TRACE_PHD broadcast.fanout.err recipient={} msgId={} t={} rtt_ms={} err={}",
                 recipient,
@@ -415,6 +516,26 @@ async fn push_to_recipient_sockets(
                 recipient,
                 message_box,
                 e
+            );
+        }
+        None => {
+            // Timed out — best-effort push abandoned. The D1 row is the source of
+            // truth; the recipient gets the message on its next `listMessages`
+            // (the MPC ceremonies' reliability-drain backfill covers this).
+            console_log!(
+                "TRACE_PHD broadcast.fanout.timeout recipient={} msgId={} t={} after_ms={}",
+                recipient,
+                message_id,
+                t_done,
+                PUSH_FANOUT_TIMEOUT_MS
+            );
+            console_log!(
+                "WS push: fan-out to recipient={} room={}-{} TIMED OUT after {}ms (best-effort; \
+                 message already durable in D1, delivered via listMessages backfill)",
+                recipient,
+                recipient,
+                message_box,
+                PUSH_FANOUT_TIMEOUT_MS
             );
         }
     }
@@ -480,6 +601,18 @@ mod tests {
             body["description"],
             "An internal error has occurred: kaboom"
         );
+    }
+
+    #[test]
+    fn outcome_transient_to_http_is_retryable_503() {
+        let outcome = SendOutcome::TransientError {
+            detail: "D1_ERROR: write op exceeded 2000ms bound".into(),
+        };
+        let (body, status) = outcome_to_http(outcome);
+        // 503 (client-retryable) — NOT 500, and NOT the old ~10s hang.
+        assert_eq!(status, 503);
+        assert_eq!(body["code"], "ERR_D1_UNAVAILABLE");
+        assert_eq!(body["status"], "error");
     }
 
     #[test]

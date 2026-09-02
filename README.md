@@ -1,4 +1,6 @@
-# bsv-messagebox-cloudflare
+> **Public release mirror.** This repository receives tagged releases of a private canonical repository (every Cloudflare resource identifier is scrubbed; deployment configs are placeholders). Issues and PRs are welcome here; development happens upstream and lands as the next release.
+
+# rust-message-box
 
 BSV peer-to-peer messaging service on Cloudflare Workers. Rust compiled to WASM.
 
@@ -172,10 +174,10 @@ npm run deploy           # deploy to Cloudflare Workers
 ### Initial Cloudflare setup
 
 1. Create a Cloudflare account, note your `account_id`
-2. `npx wrangler d1 create bsv-messagebox-cloudflare-prod` — record the returned `database_id`
+2. `npx wrangler d1 create rust-message-box-prod` — record the returned `database_id`
 3. `npx wrangler kv namespace create AUTH_SESSIONS` — record the returned `id`
 4. Fill `wrangler.toml` with your `account_id`, `database_id`, and KV `id`
-5. Apply migrations: `npx wrangler d1 migrations apply bsv-messagebox-cloudflare-prod --remote`
+5. Apply migrations: `npx wrangler d1 migrations apply rust-message-box-prod --remote`
 6. Set secrets:
    ```bash
    # 64-char hex secp256k1 private key used as the BRC-31 server identity.
@@ -226,6 +228,8 @@ Any client that implements BRC-31 auth and (for paid delivery) wallet `internali
 - MetaNet Client wallet — paid notifications and paywalled mailbox delivery
 - `bsv-worm` — reliable message delivery with retry semantics
 - `LobsterFarm` — real-time coordination
+- LOW (heads-up poker) — dedicated `low-relay` deployment via `wrangler.low.toml`
+  with an 8h session TTL; see [docs/LOW-RELAY.md](docs/LOW-RELAY.md)
 
 ## License
 

@@ -78,6 +78,81 @@ const IDENTITY_KEY_HEADER: &str = "x-bsv-auth-identity-key";
 /// subscribers (whose state lives in a different DO class — `EngineIoSession`).
 const SOCKETIO_SUB_PREFIX: &str = "socketio_sub:";
 
+/// DO-storage key prefix for the room→peer map (#40 peer-left
+/// notification). `peer_by_room:<my_room_id>` → the identity key of the
+/// LAST counterparty that pushed a message INTO that room (learned from
+/// `/internal/push` — the only path an outside identity's traffic reaches
+/// this per-identity hub). When the owner's last live session leaves a
+/// room, this is who gets the cross-DO `peerLeft`. Presence-only:
+/// nothing here ever gates message delivery or auth.
+const PEER_BY_ROOM_PREFIX: &str = "peer_by_room:";
+
+/// DO-storage key prefix for a room's last-seen heartbeat
+/// (`lastseen:<room>` → `u64` epoch-millis of the most recent
+/// high-signal touch: a send into the room, or a join). ADVISORY ONLY —
+/// `present` (a live socket joined right now) stays the primary presence
+/// signal; a stale or absent `lastSeenMs` must NEVER latch "left" or a
+/// false status. Best-effort like `peer_by_room:`: write failures are
+/// swallowed, and the key is simply OMITTED from `/presence` when unset
+/// (never emitted as 0/null). Never gates delivery, auth, or money.
+const LAST_SEEN_PREFIX: &str = "lastseen:";
+
+/// DO-storage key prefix for the tier-2 rejoin-window signal
+/// (`rejoindeadline:<room>` → `u64` epoch-millis). Written by the STAYING
+/// player (via `POST /rejoin-deadline`, routed here) once it decides its
+/// peer left and starts its grace ladder; read back by a crashed/reloaded
+/// rejoiner's `GET /presence` so both sides share ONE synchronized
+/// countdown. ADVISORY / UX-ONLY, same fail-quiet discipline as
+/// `lastseen:`: the value is stored verbatim and simply OMITTED from
+/// `/presence` when absent — the CLIENT decides past-vs-future. It NEVER
+/// gates delivery, auth, or money (money-safety rides on the tower case +
+/// the pre-signed nLockTime refund); a wrong value can only make a rejoiner
+/// hurry or give up (still refunded), or be overridden by the tower
+/// deadline. A new key — no migration needed.
+const REJOIN_DEADLINE_PREFIX: &str = "rejoindeadline:";
+
+/// DO-storage key prefix for a pending (debounced) peer-left notification
+/// (`pendingleft:<room>` → [`PendingPeerLeft`]). Written when the owner's
+/// LAST live session departs a room; consumed by the DO alarm ~4s later,
+/// which re-checks occupancy and pushes `/internal/peer-left` ONLY if the
+/// room is still empty. Exists because the LOW client's inbound watchdog
+/// self-heals via leaveRoom+rejoin with a ~1-2s gap — an immediate push
+/// turned that flap into a false "opponent lost connection" during a
+/// funded hand (bsv-low run bundle prod-dist-2026-07-24_04-06-50). One
+/// entry per room (trailing edge: a re-departure overwrites it), so a
+/// flap during the window collapses to a single trailing check.
+const PENDING_LEFT_PREFIX: &str = "pendingleft:";
+
+/// Trailing debounce window for the peer-left push. Must comfortably
+/// exceed the watchdog's self-heal gap (~1-2s) while adding only a small
+/// worst-case delay to REAL departure detection. The client's presence
+/// freshness discriminator rides `lastseen:` (stamped IMMEDIATELY at
+/// departure, #225) and is unaffected by this delay.
+const PEER_LEFT_DEBOUNCE_MS: u64 = 4_000;
+
+/// The identity-key prefix of an owner-prefixed room id
+/// (`<66-hex-identity>-<suffix>`), or `None` when the shape doesn't
+/// match. Mirrors `validate_room_owned`'s ownership model without
+/// needing the identity in hand.
+fn room_identity(room_id: &str) -> Option<&str> {
+    let (id, _) = room_id.split_once('-')?;
+    (id.len() == 66 && id.chars().all(|c| c.is_ascii_hexdigit())).then_some(id)
+}
+
+/// The box suffix of an owner-prefixed room id (everything after the
+/// `<identity>-` prefix), or `None` when the shape doesn't match.
+fn room_suffix(room_id: &str) -> Option<&str> {
+    let (id, suffix) = room_id.split_once('-')?;
+    (id.len() == 66 && id.chars().all(|c| c.is_ascii_hexdigit()) && !suffix.is_empty())
+        .then_some(suffix)
+}
+
+/// The PEER's equivalent room for one of OUR rooms: same box suffix,
+/// their identity prefix. `<peer>-<suffix of my_room>`.
+fn peer_room(peer_identity: &str, my_room: &str) -> Option<String> {
+    Some(format!("{peer_identity}-{}", room_suffix(my_room)?))
+}
+
 /// Per-socket state stored via `serialize_attachment`. Recovered in
 /// every later event handler (message/close/error) via
 /// `deserialize_attachment`. Survives hibernation per the workers-rs
@@ -240,6 +315,11 @@ pub struct MessageHub {
     /// write path via `process_send` for the WS `sendMessage` event
     /// handler (#44).
     env: Env,
+    /// Once-per-instance guard for the pendingleft re-arm recovery scan
+    /// (`rearm_pending_departures_once`). `Cell` is fine: a DO instance
+    /// is single-threaded. NOT persisted — a fresh isolate re-runs the
+    /// scan, which is exactly the point.
+    rearm_scan_done: std::cell::Cell<bool>,
 }
 
 impl DurableObject for MessageHub {
@@ -252,10 +332,22 @@ impl DurableObject for MessageHub {
             .expect("WebSocketRequestResponsePair::new should not fail for static strings");
         state.set_websocket_auto_response(&pair);
 
-        Self { state, env }
+        Self {
+            state,
+            env,
+            rearm_scan_done: std::cell::Cell::new(false),
+        }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
+        // Presence-flap debounce recovery net: on the first request of
+        // this instance's life, re-arm the alarm for any stored
+        // `pendingleft:` entries (see `rearm_pending_departures_once`).
+        // DO alarms are durable, so this only matters after a failure
+        // path stranded an entry — cheap (one prefix list, usually
+        // empty) and guarded to once per isolate, the same
+        // once-per-isolate init discipline used elsewhere in this stack.
+        self.rearm_pending_departures_once().await;
         // The DO accepts two distinct kinds of incoming `fetch` calls:
         //
         //   1. WebSocket upgrade (`Upgrade: websocket`) — public-facing,
@@ -309,6 +401,24 @@ impl DurableObject for MessageHub {
         }
         if req.method() == Method::Post && path == "/internal/socketio-unregister" {
             return self.handle_socketio_unregister(&mut req).await;
+        }
+        // #40 peer presence (same worker-internal trust model as the routes
+        // above — the public internet never reaches a DO stub directly):
+        //   * /internal/peer-left — the counterparty's hub says they left;
+        //     fan `peerLeft` out to this owner's live sessions.
+        //   * /internal/presence  — polling fallback: is the owner seated
+        //     in ?room right now (routed here by lib.rs /presence).
+        if req.method() == Method::Post && path == "/internal/peer-left" {
+            return self.handle_peer_left(&mut req).await;
+        }
+        if req.method() == Method::Get && path == "/internal/presence" {
+            return self.handle_presence(&req).await;
+        }
+        // Tier-2 rejoin-window WRITE (routed here by lib.rs
+        // /rejoin-deadline): the stayer publishes the deadline it will honor
+        // for this room. Best-effort store; UX-only, never a gate.
+        if req.method() == Method::Post && path == "/internal/rejoin-deadline" {
+            return self.handle_set_rejoin_deadline(&mut req).await;
         }
 
         Response::error(
@@ -380,12 +490,38 @@ impl DurableObject for MessageHub {
         // best-effort: if the socket is already torn down, ignore.
         let mirror_code = u16::try_from(code).ok().filter(|c| *c >= 1000);
         let _ = ws.close(mirror_code.or(Some(1000)), Some(reason.as_str()));
+        // #40: a closed socket (tab close / crash / network drop) departs
+        // every room it had joined — if any was the identity's last seat,
+        // tell the peer. Best-effort: presence never fails the close path.
+        self.teardown_departed_socket(&ws).await;
         Ok(())
     }
 
-    async fn websocket_error(&self, _ws: WebSocket, error: Error) -> Result<()> {
+    async fn websocket_error(&self, ws: WebSocket, error: Error) -> Result<()> {
         console_log!("MessageHub: WS error: {}", error);
+        // #225: an ABRUPT termination (network death, killed tab, TCP
+        // reset) can surface here instead of — or as well as —
+        // `websocket_close`. It is a departure all the same: run the
+        // identical teardown so the peer still gets its `peerLeft` push
+        // and `/presence` flips promptly. `teardown_departed_socket`'s
+        // attachment latch makes the close+error double-fire emit at
+        // most one notification. Best-effort mirror-close so the
+        // runtime fully releases the socket; errors ignored (the socket
+        // is usually already gone).
+        self.teardown_departed_socket(&ws).await;
+        let _ = ws.close(Some(1000), Some("error"));
         Ok(())
+    }
+
+    /// THE hub's alarm consumer. Today the ONLY alarm producer on this DO
+    /// is the presence-flap departure debounce (`maybe_notify_peer_left`
+    /// arms it via `ensure_alarm_no_later_than`); a future second alarm
+    /// use MUST multiplex inside this handler — a DO has exactly one
+    /// alarm slot, and a naive `set_alarm` elsewhere would silently
+    /// cancel the debounce's trailing check (and vice versa).
+    async fn alarm(&self) -> Result<Response> {
+        self.run_departure_debounce_alarm().await;
+        Response::empty()
     }
 }
 
@@ -459,6 +595,36 @@ impl MessageHub {
     /// Sockets that aren't connected just won't see the push — they'll
     /// pick the message up on their next `listMessages`. The HTTP send
     /// MUST NOT be failed by anything that happens here.
+    /// S3b — tell the BroadcastRegistry this identity subscribes to public
+    /// rooms (fire-and-forget; a lost register only delays delivery until
+    /// the next (re)join, and the client re-joins on every connect).
+    async fn notify_broadcast_registry(&self, identity: &str) {
+        let Ok(ns) = self.env.durable_object("BROADCAST_REGISTRY") else {
+            return;
+        };
+        // Sharded by the identity's first hex nibble (16 shards): the
+        // registry can never become a single-DO bottleneck at consumer
+        // scale, and /broadcast reads the shards in parallel.
+        let shard = identity.chars().next().unwrap_or('0');
+        let Ok(stub) = ns
+            .id_from_name(&format!("v1:{shard}"))
+            .and_then(|id| id.get_stub())
+        else {
+            return;
+        };
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post);
+        init.with_body(Some(
+            serde_json::json!({ "identity": identity }).to_string().into(),
+        ));
+        let Ok(req) = Request::new_with_init("https://registry/register", &init) else {
+            return;
+        };
+        if let Err(e) = stub.fetch_with_request(req).await {
+            console_log!("MessageHub: broadcast-registry notify failed (non-fatal): {e}");
+        }
+    }
+
     async fn handle_internal_push(&self, req: &mut Request) -> Result<Response> {
         let t_in = Date::now().as_millis();
         let body: PushBody = match req.json().await {
@@ -478,6 +644,15 @@ impl MessageHub {
             t_in,
             ws_count
         );
+
+        // #40 peer presence: every push into one of this identity's rooms
+        // names its counterparty (`sender` is the relay-verified identity of
+        // whoever posted). Remember it so a later leave can tell the peer.
+        // Read-compare-write: one storage read per push, a write only when
+        // the peer changes (i.e. ~once per game).
+        self.remember_room_peer(&body.room_id, &body.sender).await;
+        // Advisory heartbeat: a push into this room is high-signal activity.
+        self.stamp_last_seen(&body.room_id).await;
 
         let mut delivered = 0u32;
         for ws in self.state.get_websockets() {
@@ -691,11 +866,41 @@ impl MessageHub {
                     let _ = emit_join_failed(ws, &reason);
                     return Ok(());
                 }
+                if room_id.contains(BROADCAST_BOX_MARKER) {
+                    self.notify_broadcast_registry(&attachment.identity_key).await;
+                }
                 if !attachment.joined_rooms.iter().any(|r| r == &room_id) {
                     attachment.joined_rooms.push(room_id.clone());
                     ws.serialize_attachment(&*attachment)?;
                 }
+                // Advisory heartbeat: a join is a high-signal room touch.
+                self.stamp_last_seen(&room_id).await;
                 emit_joined_room(ws, &room_id)?;
+                // #410 (bsv-low, 2026-08-25) — the JOIN HELLO. LOW's client is
+                // HTTP-first until a WS-DELIVERED frame proves the socket
+                // (#400); under 16-pair fleet load a seat played a WHOLE HAND
+                // http-first because no delivery ever arrived on its socket.
+                // Emit one delivery-shaped frame to the JOINING socket the
+                // moment it joins: it rides the exact `emit_send_message`
+                // envelope real fan-outs use, so the message-box client's
+                // `sendMessage-{roomId}` handler surfaces it, the LOW client
+                // flips `wsProven` (any surfaced frame is proof of a live
+                // duplex socket), and LOW's ingest quarantines the junk body
+                // harmlessly. DIVERGENCE from the ts-stack reference (which
+                // emits only `joinedRoom` on join): recorded as D4 in
+                // bsv-low's register — the hello serves OUR client's
+                // http-first design; reference clients ignore an unknown
+                // plain-text message by contract (parse-tolerant handler).
+                // Best-effort: a failed hello must not fail the join.
+                if let Err(e) = emit_send_message(
+                    ws,
+                    &room_id,
+                    "relay-hello",
+                    "ws-hello",
+                    &serde_json::json!("ws-hello"),
+                ) {
+                    console_log!("MessageHub: join hello emit failed (non-fatal): {}", e);
+                }
             }
             ClientEvent::LeaveRoom { room_id } => {
                 if let Err(reason) = validate_room_owned(&attachment.identity_key, &room_id) {
@@ -708,6 +913,15 @@ impl MessageHub {
                     ws.serialize_attachment(&*attachment)?;
                 }
                 emit_left_room(ws, &room_id)?;
+                // #40: an explicit leave is a deliberate departure — if this
+                // was the identity's last seat in the room, tell the peer.
+                self.maybe_notify_peer_left(
+                    &attachment.identity_key,
+                    std::slice::from_ref(&room_id),
+                    Some(ws),
+                    None,
+                )
+                .await;
             }
             ClientEvent::SendMessage {
                 room_id,
@@ -761,6 +975,8 @@ impl MessageHub {
             room_id,
             t_in
         );
+        // Advisory heartbeat: a send is the highest-signal room touch.
+        self.stamp_last_seen(&room_id).await;
         let outbound = self
             .process_send_message(sender_key, room_id.clone(), message, payment)
             .await;
@@ -788,44 +1004,59 @@ impl MessageHub {
         message: ClientSendMessage,
         payment: Option<Value>,
     ) -> Vec<OutboundEvent> {
-        // 1. Room ownership: the socket can only send out of rooms
-        // prefixed by its verified identity. Same rule as join/leave.
-        if let Err(reason) = validate_room_owned(sender_key, &room_id) {
-            return vec![OutboundEvent::new(
-                "messageFailed",
-                json!({ "reason": reason }),
-            )];
-        }
-
-        // 2. Derive the message_box from the room suffix. The room is
-        // `<identity>-<box>` by convention (matches the TS authsocket
-        // reference at `message-box-server/src/index.ts:215`, which
-        // splits on `-` and takes element [1]).
-        let prefix = format!("{sender_key}-");
-        let message_box = room_id
-            .strip_prefix(&prefix)
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        if message_box.is_empty() {
+        // 1. Basic roomId validity.
+        if room_id.trim().is_empty() {
             return vec![OutboundEvent::new(
                 "messageFailed",
                 json!({ "reason": "Invalid room ID" }),
             )];
         }
 
-        // 3. Per-field validation. Mirrors the HTTP validator's checks
-        // (validation::validate_send_message) — same error codes, so
-        // the parity contract holds for failure modes too.
-        if message.message_id.is_empty() {
-            return vec![OutboundEvent::new(
-                "messageFailed",
-                json!({ "reason": "Each messageId must be a non-empty string." }),
-            )];
-        }
+        // 2. Validate the recipient identity up front (the room belongs to
+        //    either it or the sender — see below).
         if !is_valid_pubkey(&message.recipient) {
             return vec![OutboundEvent::new(
                 "messageFailed",
                 json!({ "reason": format!("Invalid recipient key: {}", message.recipient) }),
+            )];
+        }
+
+        // 3. Derive the message_box from whichever room the client addressed:
+        //    the RECIPIENT's room (`<recipient>-<box>` — the official
+        //    `@bsv/message-box-client` + the canonical message-box-server,
+        //    which ack + broadcast on the client-sent roomId) OR the sender's
+        //    OWN room (`<sender>-<box>` — the legacy raw-WS convention).
+        //    Crucially we ack on the SAME room_id below (`outcome_to_outbound`),
+        //    so each client's ack listener matches its own convention; the
+        //    message itself is always routed to `message.recipient`. Previously
+        //    this accepted ONLY the sender's room, so the official client —
+        //    which sends to and awaits `sendMessageAck-<recipient>-<box>` —
+        //    never got its ack: every WS send burned the 10s ack timeout and
+        //    fell back to HTTP, and the live push was lost (poll only). Read-
+        //    side ownership (joinRoom / listMessages) is still enforced, so a
+        //    sender can DEPOSIT into the recipient's box but never READ it.
+        let recipient_prefix = format!("{}-", message.recipient);
+        let sender_prefix = format!("{sender_key}-");
+        let message_box = match room_id
+            .strip_prefix(&recipient_prefix)
+            .or_else(|| room_id.strip_prefix(&sender_prefix))
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => s.to_string(),
+            None => {
+                return vec![OutboundEvent::new(
+                    "messageFailed",
+                    json!({ "reason": "Room ID must be the sender's or recipient's room (\"<id>-<box>\")" }),
+                )];
+            }
+        };
+
+        // 4. Remaining per-field validation. Mirrors the HTTP validator's
+        // checks (validation::validate_send_message) — same error codes.
+        if message.message_id.is_empty() {
+            return vec![OutboundEvent::new(
+                "messageFailed",
+                json!({ "reason": "Each messageId must be a non-empty string." }),
             )];
         }
         if message.body.is_null()
@@ -860,7 +1091,28 @@ impl MessageHub {
         };
         let store = Storage::new(&db);
 
+        let t_send_start = worker::Date::now().as_millis();
         let outcome = process_send(validated, sender_key, &self.env, &store).await;
+        // bsv-low#249 diagnostic: record the WS send outcome + duration. The
+        // measured ~10.4s `relay.send fail` events are NOT this stage — they are
+        // the CLIENT's `sendLiveMessage` waiting 10s for a `sendMessageAck` that
+        // never comes because a DUPLICATE resolves to `messageFailed` here (see
+        // outcome_to_outbound). This log proves the relay emits its WS response
+        // fast; the wait is entirely client-side.
+        worker::console_log!(
+            "TRACE_LAT ws.send room={} outcome={} ms={}",
+            room_id,
+            match &outcome {
+                SendOutcome::Success { .. } => "Success->sendMessageAck",
+                SendOutcome::DuplicateMessage { .. } => "Duplicate->sendMessageAck(FIXED #249)",
+                SendOutcome::ValidationError { .. } => "ValidationError->messageFailed",
+                SendOutcome::BlockedRecipients { .. } => "Blocked->messageFailed",
+                SendOutcome::PaymentFailed { .. } => "PaymentFailed->paymentFailed",
+                SendOutcome::InternalError { .. } => "InternalError->messageFailed",
+                SendOutcome::TransientError { .. } => "TransientError->messageFailed",
+            },
+            worker::Date::now().as_millis().saturating_sub(t_send_start)
+        );
         outcome_to_outbound(&room_id, outcome)
     }
 
@@ -912,6 +1164,9 @@ impl MessageHub {
                         json!({ "reason": reason }),
                     )];
                 }
+                if room_id.contains(BROADCAST_BOX_MARKER) {
+                    self.notify_broadcast_registry(&identity_key).await;
+                }
                 // Persist room membership on the per-sid registry entry
                 // so `handle_internal_push` filters fan-out by joined
                 // rooms — same semantics as the raw-WS path's
@@ -922,6 +1177,8 @@ impl MessageHub {
                     }
                 })
                 .await;
+                // Advisory heartbeat: a join is a high-signal room touch.
+                self.stamp_last_seen(&room_id).await;
                 vec![OutboundEvent::new(
                     "joinedRoom",
                     json!({ "roomId": room_id }),
@@ -947,14 +1204,27 @@ impl MessageHub {
                     rooms.retain(|r| r != &room_id);
                 })
                 .await;
+                // #40: explicit leave over the socket.io bridge — if this was
+                // the identity's last seat in the room, tell the peer. The
+                // registry entry was just updated, so the occupancy scan
+                // already excludes this membership; skip the sid anyway.
+                self.maybe_notify_peer_left(
+                    &identity_key,
+                    std::slice::from_ref(&room_id),
+                    None,
+                    Some(&sid),
+                )
+                .await;
                 vec![OutboundEvent::new("leftRoom", json!({ "roomId": room_id }))]
             }
             "sendMessage" => {
-                // The TS authsocket `sendMessage` data is the same body
-                // shape as the HTTP /sendMessage `message` field, plus
-                // an optional outer `payment`. Derive `roomId` from
-                // `<identity>-<messageBox>` since the wire payload
-                // doesn't carry it (matches message-box-server/src/index.ts).
+                // `sendMessage` data carries a `message` object (same shape as
+                // the HTTP /sendMessage `message` field) plus an optional outer
+                // `payment`. The room is taken from a top-level `roomId` when
+                // present (official `@bsv/message-box-client` + canonical
+                // message-box-server), else derived from the inline
+                // `message.messageBox` (legacy). See the room_id resolution
+                // below.
                 let obj = match data.as_object() {
                     Some(o) => o,
                     None => {
@@ -980,20 +1250,30 @@ impl MessageHub {
                         )];
                     }
                 };
-                // Prefer explicit messageBox in the inner object. Fallback to top-level.
-                let message_box = inner
-                    .get("messageBox")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| obj.get("messageBox").and_then(|v| v.as_str()))
-                    .unwrap_or("")
-                    .to_string();
-                if message_box.is_empty() {
-                    return vec![OutboundEvent::new(
-                        "messageFailed",
-                        json!({ "reason": "sendMessage requires messageBox" }),
-                    )];
-                }
-                let room_id = format!("{identity_key}-{message_box}");
+                // Honour a top-level `roomId` when present — that's what the
+                // official `@bsv/message-box-client` sends (`{ roomId:
+                // "<recipient>-<box>", message: {...} }`) and what the
+                // canonical message-box-server reads. Fall back to the legacy
+                // inline shape (`message.messageBox`, no roomId) by building
+                // the sender's own room. `process_send_message` accepts either
+                // the recipient's or the sender's room.
+                let room_id = match obj.get("roomId").and_then(|v| v.as_str()) {
+                    Some(r) if !r.trim().is_empty() => r.to_string(),
+                    _ => {
+                        let message_box = inner
+                            .get("messageBox")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| obj.get("messageBox").and_then(|v| v.as_str()))
+                            .unwrap_or("");
+                        if message_box.is_empty() {
+                            return vec![OutboundEvent::new(
+                                "messageFailed",
+                                json!({ "reason": "sendMessage requires roomId or messageBox" }),
+                            )];
+                        }
+                        format!("{identity_key}-{message_box}")
+                    }
+                };
                 self.process_send_message(&identity_key, room_id, parsed, payment)
                     .await
             }
@@ -1069,9 +1349,10 @@ impl MessageHub {
         // path was removed from the auth fast-path (it blocked the WS
         // event loop on cold MessageHub DO starts). Since
         // MessageBoxClient always emits `joinRoom` before any
-        // broadcast-relevant operation (sendLiveMessage joins the
-        // sender's own room for the ack; listenForLiveMessages joins
-        // the receiver's room), lazy auto-create here is the same
+        // broadcast-relevant operation (listenForLiveMessages joins the
+        // receiver's own room to receive pushes; the sendMessage ack is a
+        // direct socket emit, so it needs no room membership), lazy
+        // auto-create here is the same
         // observable behaviour with one fewer cross-DO hop on the
         // critical-path WS message handler.
         let mut entry: SocketIoRegistryEntry = match self.state.storage().get(&key).await {
@@ -1104,7 +1385,27 @@ impl MessageHub {
             Err(e) => return Response::error(format!("invalid registration body: {e}"), 400),
         };
         let key = format!("{SOCKETIO_SUB_PREFIX}{}", body.sid);
+        // #40: read the departing session's memberships BEFORE deleting the
+        // entry — a socket.io disconnect (tab close / crash / transport
+        // drop) is the LOW client's real leave signal. The leaver identity
+        // is recovered from the room's owner prefix (every joined room on a
+        // per-identity hub is owner-prefixed by construction).
+        let departing: Option<SocketIoRegistryEntry> =
+            self.state.storage().get(&key).await.ok().flatten();
         let _ = self.state.storage().delete(&key).await;
+        if let Some(entry) = departing {
+            if !entry.joined_rooms.is_empty() {
+                if let Some(leaver) = room_identity(&entry.joined_rooms[0]).map(str::to_string) {
+                    self.maybe_notify_peer_left(
+                        &leaver,
+                        &entry.joined_rooms,
+                        None,
+                        Some(&entry.sid),
+                    )
+                    .await;
+                }
+            }
+        }
         Response::from_json(&json!({ "status": "ok" }))
     }
 
@@ -1140,6 +1441,684 @@ impl MessageHub {
         }
         out
     }
+
+    // =======================================================================
+    // #40 — opponent-left notification (peer presence)
+    //
+    // Model: hubs are per-identity, rooms are owner-prefixed, so the two
+    // parties of a conversation NEVER share a hub. Each hub learns its
+    // room's counterparty from inbound `/internal/push` traffic
+    // (`remember_room_peer`), and when the owner's LAST live session
+    // departs a room (explicit `leaveRoom`, raw-WS close, or socket.io
+    // unregister) it arms a DEBOUNCED notify: `lastseen:` is stamped
+    // immediately (#225), but the cross-DO POST to the peer's hub
+    // `/internal/peer-left` — which fans a `peerLeft` event out to the
+    // peer's sessions — fires from the DO alarm ~4s later, and only if
+    // the room is STILL empty (a watchdog self-heal leave+rejoin flap
+    // pushes nothing). Presence is UX-only: it never gates delivery,
+    // auth, or storage.
+    // =======================================================================
+
+    /// Record `sender` as the counterparty of `room_id` (skip self-echo
+    /// and malformed rooms; write only on change).
+    async fn remember_room_peer(&self, room_id: &str, sender: &str) {
+        // A room's owner pushing into its own room teaches nothing.
+        if room_identity(room_id).is_none_or(|owner| owner == sender) {
+            return;
+        }
+        if sender.len() != 66 || !sender.chars().all(|c| c.is_ascii_hexdigit()) {
+            return;
+        }
+        let key = format!("{PEER_BY_ROOM_PREFIX}{room_id}");
+        let existing: Option<String> = self.state.storage().get(&key).await.ok().flatten();
+        if existing.as_deref() == Some(sender) {
+            return;
+        }
+        if let Err(e) = self.state.storage().put(&key, sender.to_string()).await {
+            console_log!("MessageHub: peer_by_room put failed for {room_id}: {e}");
+        }
+    }
+
+    /// Best-effort last-seen heartbeat: stamp `lastseen:<room>` with the
+    /// current epoch-millis on a high-signal room touch (send / join).
+    /// ADVISORY presence only — same fail-quiet discipline as
+    /// `remember_room_peer`: a write failure is logged and ignored, and
+    /// never fails the caller's path. It only ever helps the peer render
+    /// "last seen N ago"; it can never latch "left" or gate anything.
+    async fn stamp_last_seen(&self, room: &str) {
+        let key = format!("{LAST_SEEN_PREFIX}{room}");
+        if let Err(e) = self.state.storage().put(&key, Date::now().as_millis()).await {
+            console_log!("MessageHub: last_seen put failed for {room}: {e}");
+        }
+    }
+
+    /// Best-effort tier-2 rejoin-deadline store: stamp
+    /// `rejoindeadline:<room>` with the epoch-millis the STAYING player
+    /// published. Same fail-quiet discipline as `stamp_last_seen` — a write
+    /// failure is logged and swallowed, never fails the caller. The value is
+    /// stored verbatim (the client decides past-vs-future on read); it can
+    /// only ever help a rejoiner render a synchronized countdown and can
+    /// never latch a status or gate anything.
+    async fn stamp_rejoin_deadline(&self, room: &str, deadline_ms: u64) {
+        let key = format!("{REJOIN_DEADLINE_PREFIX}{room}");
+        if let Err(e) = self.state.storage().put(&key, deadline_ms).await {
+            console_log!("MessageHub: rejoin_deadline put failed for {room}: {e}");
+        }
+    }
+
+    /// Is any LIVE session of this hub's owner still joined to `room_id`,
+    /// other than the departing one? Checks raw-WS attachments (skipping
+    /// `departing_ws`) and socket.io registry entries (skipping
+    /// `departing_sid`).
+    async fn room_still_occupied(
+        &self,
+        room_id: &str,
+        departing_ws: Option<&WebSocket>,
+        departing_sid: Option<&str>,
+    ) -> bool {
+        for ws in self.state.get_websockets() {
+            if departing_ws == Some(&ws) {
+                continue;
+            }
+            if let Ok(Some(a)) = ws.deserialize_attachment::<SocketAttachment>() {
+                if a.joined_rooms.iter().any(|r| r == room_id) {
+                    return true;
+                }
+            }
+        }
+        for entry in self.list_socketio_subscribers().await {
+            if departing_sid == Some(entry.sid.as_str()) {
+                continue;
+            }
+            if entry.joined_rooms.iter().any(|r| r == room_id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Shared teardown for a raw-WS socket the runtime is done with —
+    /// BOTH lifecycle ends land here: graceful close (`websocket_close`)
+    /// and abrupt error (`websocket_error`, #225 — a dropped tab or dead
+    /// network can surface as either, or both). Reads the departing
+    /// socket's attachment, LATCHES it room-less (so whichever of
+    /// close/error fires second finds nothing to do — at most one
+    /// `peerLeft` per socket), then runs the #40 departure notify.
+    /// Best-effort throughout: presence never fails a lifecycle handler.
+    async fn teardown_departed_socket(&self, ws: &WebSocket) {
+        let attachment: Option<SocketAttachment> = ws.deserialize_attachment().ok().flatten();
+        let Some((latched, rooms, leaver)) = attachment.and_then(split_departure) else {
+            return; // no attachment, no rooms, or already latched by the other handler
+        };
+        // Write the latch BEFORE the async notify. If the write fails
+        // (socket already torn down) the worst case is a duplicate
+        // peerLeft push — which the LOW client's verify-not-a-flap
+        // presence check absorbs by design.
+        let _ = ws.serialize_attachment(&latched);
+        self.maybe_notify_peer_left(&leaver, &rooms, Some(ws), None)
+            .await;
+    }
+
+    /// A session of `leaver` departed `rooms` (leaveRoom / close /
+    /// unregister). For each room whose LAST session this was, arm the
+    /// DEBOUNCED peer-left notify (see `PENDING_LEFT_PREFIX`): the push
+    /// to the counterparty's hub happens ~4s later from the DO alarm,
+    /// and ONLY if the room is still empty then — a watchdog self-heal
+    /// flap (leaveRoom + rejoin within ~1-2s) therefore pushes nothing,
+    /// on every client version. Best-effort end to end: presence must
+    /// never fail the caller's path.
+    ///
+    /// NOTE: explicit app-level goodbyes are MESSAGES (they ride the
+    /// `/internal/push` fan-out) and never pass through here — their
+    /// immediacy is untouched by this debounce.
+    async fn maybe_notify_peer_left(
+        &self,
+        leaver: &str,
+        rooms: &[String],
+        departing_ws: Option<&WebSocket>,
+        departing_sid: Option<&str>,
+    ) {
+        for room in rooms {
+            // Final heartbeat (#225): the departing session was verifiably
+            // here until NOW — stamp `lastseen:<room>` at departure time so
+            // the peer's `/presence` carries an honest "was here until T"
+            // even when the socket died without a single further touch.
+            // Stamped for EVERY departed room (even multi-tab, where the
+            // identity remains present) — a departure is still a true
+            // "seen at T". Advisory-only, same fail-quiet discipline as
+            // every other lastseen stamp. Stamped IMMEDIATELY — the
+            // debounce below delays only the peerLeft PUSH, never this
+            // stamp (the client's freshness discriminator rides it).
+            self.stamp_last_seen(room).await;
+            if self
+                .room_still_occupied(room, departing_ws, departing_sid)
+                .await
+            {
+                continue; // another tab/device of the same identity is still seated
+            }
+            // Presence-flap debounce: arm (or re-arm — trailing edge) the
+            // single pending entry for this room and make sure the DO
+            // alarm rings no later than its due time. The alarm handler
+            // (`run_departure_debounce_alarm`) re-checks occupancy and
+            // pushes at most once.
+            let entry = arm_departure_debounce(leaver, Date::now().as_millis());
+            let due_at_ms = entry.due_at_ms;
+            let key = format!("{PENDING_LEFT_PREFIX}{room}");
+            if let Err(e) = self.state.storage().put(&key, entry).await {
+                // Can't persist the pending entry — the trailing check
+                // would never fire and a REAL departure would go silent
+                // forever. Fall back to the pre-debounce immediate push:
+                // a rare flap false-positive (absorbed by the client's
+                // verify) beats a permanently missed departure. Delete
+                // any PRIOR pending entry for this room first — the put
+                // failed, so a stale earlier-departure entry may still
+                // be stored, and left in place it would fire a SECOND
+                // push at its original due time on top of this
+                // immediate one.
+                console_log!(
+                    "MessageHub: pendingleft put failed for {room} ({e}) — \
+                     falling back to immediate peerLeft push"
+                );
+                let _ = self.state.storage().delete(&key).await;
+                self.push_peer_left(room, leaver).await;
+                continue;
+            }
+            if !self.ensure_alarm_no_later_than(due_at_ms).await {
+                // Entry stored but NO wake guaranteed — without an alarm
+                // the trailing check never runs and the entry strands
+                // (recoverable only by the next departure or the
+                // fetch-time re-arm scan, i.e. poll latency for the
+                // peer). Same reasoning as the put failure above:
+                // un-store and push immediately.
+                console_log!(
+                    "MessageHub: alarm arm failed for {room} — \
+                     falling back to immediate peerLeft push"
+                );
+                let _ = self.state.storage().delete(&key).await;
+                self.push_peer_left(room, leaver).await;
+            }
+        }
+    }
+
+    /// Cross-DO `/internal/peer-left` push to the room's known
+    /// counterparty. Single attempt, best-effort, log-only on failure —
+    /// identical semantics to the pre-debounce inline push. No-ops
+    /// quietly when the room has no learned peer (`peer_by_room:` unset)
+    /// or is malformed. Accepted bound (review LOW): a fallback
+    /// immediate push can race a concurrently armed/fired trailing
+    /// check into at most ONE duplicate peerLeft — absorbed by the
+    /// client's verify-not-a-flap presence check, same bound as the
+    /// close/error double-fire latch.
+    async fn push_peer_left(&self, room: &str, leaver: &str) {
+        let key = format!("{PEER_BY_ROOM_PREFIX}{room}");
+        let peer: Option<String> = self.state.storage().get(&key).await.ok().flatten();
+        let Some(peer) = peer else { return };
+        let Some(peer_room) = peer_room(&peer, room) else {
+            return;
+        };
+        let Ok(namespace) = self.env.durable_object("MESSAGE_HUB") else {
+            return;
+        };
+        let Ok(stub) = namespace.id_from_name(&peer).and_then(|id| id.get_stub()) else {
+            return;
+        };
+        let payload = json!({ "roomId": peer_room, "leaver": leaver }).to_string();
+        let headers = Headers::new();
+        let _ = headers.set("content-type", "application/json");
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(payload.into()));
+        let Ok(req) = Request::new_with_init("https://do.local/internal/peer-left", &init) else {
+            return;
+        };
+        match stub.fetch_with_request(req).await {
+            Ok(_) => console_log!(
+                "MessageHub: peerLeft {} → {} (room {})",
+                leaver,
+                peer,
+                peer_room
+            ),
+            Err(e) => console_log!("MessageHub: peerLeft notify failed: {e}"),
+        }
+    }
+
+    /// Make sure the DO alarm rings no later than `due_at_ms`. An
+    /// earlier-scheduled alarm is left alone (the handler re-arms for
+    /// whatever is still pending); a later, missing, or stale one is
+    /// pulled in (`alarm_needs_replacing` is the pure predicate).
+    /// Returns whether a wake at/before `due_at_ms` is CONFIRMED —
+    /// `false` means the caller must not rely on the trailing check
+    /// running (arm-path callers fall back to an immediate push).
+    async fn ensure_alarm_no_later_than(&self, due_at_ms: u64) -> bool {
+        let storage = self.state.storage();
+        let now_ms = Date::now().as_millis();
+        let current: Option<i64> = storage.get_alarm().await.ok().flatten();
+        let (Ok(due), Ok(now)) = (i64::try_from(due_at_ms), i64::try_from(now_ms)) else {
+            return false; // epoch-ms beyond i64 — unreachable in practice
+        };
+        if !alarm_needs_replacing(current, due, now) {
+            return true; // an earlier future alarm already covers us
+        }
+        let delay_ms = due_at_ms.saturating_sub(now_ms).max(1);
+        match storage
+            .set_alarm(std::time::Duration::from_millis(delay_ms))
+            .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                console_log!("MessageHub: set_alarm failed (due {due_at_ms}): {e}");
+                false
+            }
+        }
+    }
+
+    /// All pending (debounced) departure notifications, as
+    /// `(room, entry)` pairs. A storage LIST failure is an `Err` — the
+    /// caller must distinguish "cannot read" from "genuinely empty"
+    /// (consuming a fired alarm on an unreadable list would strand every
+    /// stored entry). An UNDECODABLE entry is deleted on sight (logged):
+    /// it could never fire, and skipping it would leak it forever.
+    async fn list_pending_departures(&self) -> Result<Vec<(String, PendingPeerLeft)>> {
+        let opts = ListOptions::new().prefix(PENDING_LEFT_PREFIX);
+        let map = self.state.storage().list_with_options(opts).await?;
+        let mut out = Vec::new();
+        let mut corrupt: Vec<String> = Vec::new();
+        let entries = map.entries();
+        let iter = js_sys::try_iter(&entries).ok().flatten();
+        if let Some(iter) = iter {
+            for e in iter.flatten() {
+                let arr: js_sys::Array = e.into();
+                let Some(key) = arr.get(0).as_string() else {
+                    continue;
+                };
+                let Some(room) = key.strip_prefix(PENDING_LEFT_PREFIX) else {
+                    continue;
+                };
+                let decoded = serde_wasm_bindgen::from_value::<PendingPeerLeft>(arr.get(1)).ok();
+                match classify_pending_row(room.to_string(), decoded) {
+                    PendingRowAction::Keep(room, entry) => out.push((room, entry)),
+                    PendingRowAction::DeleteCorrupt(room) => {
+                        console_log!(
+                            "MessageHub: undecodable pendingleft entry for {room} — deleting"
+                        );
+                        corrupt.push(key);
+                    }
+                }
+            }
+        }
+        for key in corrupt {
+            let _ = self.state.storage().delete(&key).await;
+        }
+        Ok(out)
+    }
+
+    /// The DO-alarm consumer for the departure debounce: run every DUE
+    /// trailing check (delete the entry, re-check occupancy, push the
+    /// peer-left iff the room is STILL empty), then re-arm the alarm for
+    /// the earliest still-pending entry, if any. Composes via
+    /// `split_due_pending` — the same pure core the unit tests drive.
+    async fn run_departure_debounce_alarm(&self) {
+        let now_ms = Date::now().as_millis();
+        let pending = match self.list_pending_departures().await {
+            Ok(p) => p,
+            Err(e) => {
+                // The fired alarm is consumed either way — if we return
+                // without re-arming, every stored entry strands until
+                // the next departure or the fetch-time recovery scan.
+                // Keep the wake chain alive: retry one window out.
+                console_log!(
+                    "MessageHub: pendingleft list failed in alarm ({e}) — \
+                     re-arming a retry in {PEER_LEFT_DEBOUNCE_MS}ms"
+                );
+                let _ = self
+                    .state
+                    .storage()
+                    .set_alarm(std::time::Duration::from_millis(PEER_LEFT_DEBOUNCE_MS))
+                    .await;
+                return;
+            }
+        };
+        let (due, _rest, next) = split_due_pending(pending, now_ms);
+        for (room, entry) in due {
+            // Delete first: the check is one-shot either way (single
+            // best-effort push, same as the pre-debounce semantics).
+            // Accepted bound (review LOW): a push failure after this
+            // delete is NOT retried — single-attempt best-effort,
+            // identical to the pre-debounce inline push; the peer's
+            // `/presence` poll is the recovery path.
+            let _ = self
+                .state
+                .storage()
+                .delete(&format!("{PENDING_LEFT_PREFIX}{room}"))
+                .await;
+            let still_occupied = self.room_still_occupied(&room, None, None).await;
+            if departure_push_due(still_occupied) {
+                self.push_peer_left(&room, &entry.leaver).await;
+            } else {
+                console_log!(
+                    "MessageHub: peerLeft for {room} suppressed — flap rejoined \
+                     within the debounce window"
+                );
+            }
+        }
+        if let Some(next_due) = next {
+            self.ensure_alarm_no_later_than(next_due).await;
+        }
+    }
+
+    /// MED-1(c) recovery net, run once per isolate from the top of
+    /// `fetch`: if any `pendingleft:` entries survived an isolate
+    /// restart with no alarm covering them (possible only via the
+    /// failure paths — DO alarms are otherwise durable), pull the alarm
+    /// in to the earliest due so their trailing checks still run.
+    /// Best-effort: on a list error the guard flag is RESET so a later
+    /// request retries the scan.
+    async fn rearm_pending_departures_once(&self) {
+        if self.rearm_scan_done.get() {
+            return;
+        }
+        self.rearm_scan_done.set(true);
+        let pending = match self.list_pending_departures().await {
+            Ok(p) => p,
+            Err(e) => {
+                console_log!("MessageHub: rearm scan list failed ({e}) — will retry");
+                self.rearm_scan_done.set(false);
+                return;
+            }
+        };
+        if let Some(earliest) = pending.iter().map(|(_, e)| e.due_at_ms).min() {
+            // Ignore the confirmation bool: this is a recovery net, not
+            // an arm path — a failure here leaves the entries no worse
+            // off, and the next request retriggers nothing (flag set)
+            // but the next departure/alarm re-arms.
+            let _ = self.ensure_alarm_no_later_than(earliest).await;
+        }
+    }
+
+    /// `/internal/peer-left` — the counterparty's hub told us their last
+    /// session left the shared conversation. Fan a `peerLeft` event out to
+    /// this owner's sessions: raw-WS sockets joined to the room get the
+    /// flat `peerLeft` envelope; socket.io sessions get a broadcast with
+    /// `event:"peerLeft"` (emitted client-side as `peerLeft-<roomId>`, the
+    /// same room-suffixed convention as `sendMessage`). UX-only — never a
+    /// message, never stored.
+    async fn handle_peer_left(&self, req: &mut Request) -> Result<Response> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PeerLeftBody {
+            room_id: String,
+            leaver: String,
+        }
+        let body: PeerLeftBody = match req.json().await {
+            Ok(b) => b,
+            Err(e) => return Response::error(format!("invalid peer-left body: {e}"), 400),
+        };
+        let mut delivered = 0u32;
+        for ws in self.state.get_websockets() {
+            let Ok(Some(a)) = ws.deserialize_attachment::<SocketAttachment>() else {
+                continue;
+            };
+            if !a.joined_rooms.iter().any(|r| r == &body.room_id) {
+                continue;
+            }
+            if emit(
+                &ws,
+                "peerLeft",
+                &json!({ "roomId": body.room_id, "identityKey": body.leaver }),
+            )
+            .is_ok()
+            {
+                delivered += 1;
+            }
+        }
+        // socket.io fan-out: same no-server-side-room-filter rule as
+        // sendMessage (the event name is room-suffixed, so client-side
+        // subscription filters; see the race note in handle_internal_push).
+        let entries = self.list_socketio_subscribers().await;
+        if !entries.is_empty() {
+            if let Ok(ns) = self.env.durable_object("ENGINEIO_SESSION") {
+                for entry in entries {
+                    let Ok(stub) = ns.id_from_name(&entry.sid).and_then(|id| id.get_stub()) else {
+                        continue;
+                    };
+                    let payload = json!({
+                        "roomId": body.room_id,
+                        "sender": body.leaver,
+                        "messageId": format!("peer-left-{}", Date::now().as_millis()),
+                        "body": {},
+                        "event": "peerLeft",
+                    })
+                    .to_string();
+                    let headers = Headers::new();
+                    let _ = headers.set("content-type", "application/json");
+                    let mut init = RequestInit::new();
+                    init.with_method(Method::Post)
+                        .with_headers(headers)
+                        .with_body(Some(payload.into()));
+                    let Ok(req) = Request::new_with_init(
+                        "https://do.local/internal/socketio-broadcast",
+                        &init,
+                    ) else {
+                        continue;
+                    };
+                    if stub.fetch_with_request(req).await.is_ok() {
+                        delivered += 1;
+                    }
+                }
+            }
+        }
+        Response::from_json(&json!({ "delivered": delivered }))
+    }
+
+    /// `/internal/rejoin-deadline?room=<roomId>` (body `{deadlineMs:<u64>}`)
+    /// — the STAYING player published the rejoin deadline it will honor for
+    /// this room. Store it verbatim under `rejoindeadline:<room>` so a
+    /// rejoiner's `/presence` reads back the synchronized countdown. An
+    /// empty/malformed room or body is a 400; the store itself is fail-quiet.
+    /// UX-only — never gates delivery, auth, or money.
+    async fn handle_set_rejoin_deadline(&self, req: &mut Request) -> Result<Response> {
+        let url = req.url()?;
+        let room = url
+            .query_pairs()
+            .find(|(k, _)| k == "room")
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default();
+        if room.is_empty() {
+            return Response::error("rejoin-deadline requires ?room=<roomId>", 400);
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RejoinDeadlineBody {
+            deadline_ms: u64,
+        }
+        let body: RejoinDeadlineBody = match req.json().await {
+            Ok(b) => b,
+            Err(e) => return Response::error(format!("invalid rejoin-deadline body: {e}"), 400),
+        };
+        self.stamp_rejoin_deadline(&room, body.deadline_ms).await;
+        Response::from_json(&json!({ "status": "success" }))
+    }
+
+    /// `/internal/presence?room=<roomId>` — is any live session of this
+    /// hub's owner joined to `room` right now? The polling fallback for
+    /// clients whose WS dropped (a caller must know the full room id —
+    /// for LOW that embeds the 64-hex gameId, so presence is only
+    /// readable by someone already in the game). UX-only.
+    async fn handle_presence(&self, req: &Request) -> Result<Response> {
+        let url = req.url()?;
+        let room = url
+            .query_pairs()
+            .find(|(k, _)| k == "room")
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default();
+        if room.is_empty() {
+            return Response::error("presence requires ?room=<roomId>", 400);
+        }
+        let present = self.room_still_occupied(&room, None, None).await;
+        // Advisory last-seen: read `lastseen:<room>` (u64 millis) and
+        // thread it through ONLY when present. A missing/unreadable key
+        // omits the field entirely — never 0/null, never a false claim.
+        let last_seen_ms: Option<u64> = self
+            .state
+            .storage()
+            .get(&format!("{LAST_SEEN_PREFIX}{room}"))
+            .await
+            .ok()
+            .flatten();
+        // Tier-2 stayer-published rejoin deadline: read `rejoindeadline:<room>`
+        // (u64 millis) verbatim and thread it through ONLY when present. The
+        // relay does NOT judge past-vs-future — that's the client's call. A
+        // missing/unreadable key omits the field (never 0/null).
+        let rejoin_deadline_ms: Option<u64> = self
+            .state
+            .storage()
+            .get(&format!("{REJOIN_DEADLINE_PREFIX}{room}"))
+            .await
+            .ok()
+            .flatten();
+        Response::from_json(&presence_body_json(
+            &room,
+            present,
+            last_seen_ms,
+            rejoin_deadline_ms,
+        ))
+    }
+}
+
+/// Build the `/internal/presence` response body. `present` (live socket)
+/// is the primary signal; `last_seen_ms` (heartbeat) and `rejoin_deadline_ms`
+/// (tier-2 stayer-published deadline) are advisory and each INCLUDED only
+/// when `Some` — an absent value OMITS its field entirely (never serialized
+/// as 0/null, so a reader can't misread it as a real value). All three are
+/// independent.
+fn presence_body_json(
+    room: &str,
+    present: bool,
+    last_seen_ms: Option<u64>,
+    rejoin_deadline_ms: Option<u64>,
+) -> Value {
+    let mut body = json!({ "room": room, "present": present });
+    if let Some(ms) = last_seen_ms {
+        body["lastSeenMs"] = json!(ms);
+    }
+    if let Some(ms) = rejoin_deadline_ms {
+        body["rejoinDeadlineMs"] = json!(ms);
+    }
+    body
+}
+
+/// Pure core of the departed-socket teardown latch (#225). Given the
+/// attachment recovered from a closing/erroring socket, decide whether a
+/// departure notification is due. Returns `None` when there is nothing
+/// to do (no joined rooms — including the already-latched case, since
+/// the latch IS an empty room list). Otherwise returns the latched
+/// (room-less) attachment to write back, the departed rooms, and the
+/// leaver identity. The runtime can fire BOTH `websocket_close` and
+/// `websocket_error` for one socket; writing the latched attachment
+/// after the first makes the second a no-op.
+fn split_departure(mut a: SocketAttachment) -> Option<(SocketAttachment, Vec<String>, String)> {
+    if a.joined_rooms.is_empty() {
+        return None;
+    }
+    let rooms = std::mem::take(&mut a.joined_rooms);
+    let leaver = a.identity_key.clone();
+    Some((a, rooms, leaver))
+}
+
+/// A pending (debounced) peer-left notification, stored at
+/// `pendingleft:<room>` between the last-session departure and the
+/// trailing alarm check. See [`PENDING_LEFT_PREFIX`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct PendingPeerLeft {
+    /// Identity that departed (the payload of the eventual push).
+    leaver: String,
+    /// Epoch-ms of the departure that (re)armed this entry. Diagnostic
+    /// only — the `lastseen:` stamp (written immediately at departure)
+    /// is the client-facing "was here until T" truth.
+    departed_at_ms: u64,
+    /// Epoch-ms when the trailing occupancy re-check is due.
+    due_at_ms: u64,
+}
+
+/// Pure core of the departure debounce ARM step: on a last-session
+/// departure (occupancy already checked empty), build the pending entry
+/// whose trailing check fires one debounce window from NOW. Trailing
+/// edge by construction — the caller stores it at `pendingleft:<room>`
+/// unconditionally, so a departure during an open window OVERWRITES the
+/// entry and re-times the single check from the latest departure.
+fn arm_departure_debounce(leaver: &str, now_ms: u64) -> PendingPeerLeft {
+    PendingPeerLeft {
+        leaver: leaver.to_string(),
+        departed_at_ms: now_ms,
+        due_at_ms: now_ms + PEER_LEFT_DEBOUNCE_MS,
+    }
+}
+
+/// Pure core of the debounce ALARM step: partition the pending entries
+/// into those whose trailing check is DUE now (re-check occupancy →
+/// push or drop, then delete) and those still waiting (stay stored),
+/// plus the earliest future due time to re-arm the DO alarm with
+/// (`None` when nothing remains).
+#[allow(clippy::type_complexity)]
+fn split_due_pending(
+    pending: Vec<(String, PendingPeerLeft)>,
+    now_ms: u64,
+) -> (
+    Vec<(String, PendingPeerLeft)>,
+    Vec<(String, PendingPeerLeft)>,
+    Option<u64>,
+) {
+    let mut due = Vec::new();
+    let mut rest = Vec::new();
+    let mut next: Option<u64> = None;
+    for (room, entry) in pending {
+        if entry.due_at_ms <= now_ms {
+            due.push((room, entry));
+        } else {
+            next = Some(next.map_or(entry.due_at_ms, |n| n.min(entry.due_at_ms)));
+            rest.push((room, entry));
+        }
+    }
+    (due, rest, next)
+}
+
+/// Pure core of the trailing check itself: a due entry pushes iff the
+/// room is STILL empty at fire time. A reoccupied room (the flap
+/// rejoined) pushes nothing — the entry is simply dropped.
+fn departure_push_due(still_occupied: bool) -> bool {
+    !still_occupied
+}
+
+/// Pure predicate of `ensure_alarm_no_later_than`: replace the DO alarm
+/// when there is none, when ours is EARLIER than the scheduled one, or
+/// when the scheduled one is already in the PAST (stale reading around a
+/// fire — the runtime reports `None` inside the alarm handler, but
+/// belt-and-braces). An earlier future alarm is left alone: its handler
+/// re-arms for whatever is still pending.
+fn alarm_needs_replacing(current: Option<i64>, due_ms: i64, now_ms: i64) -> bool {
+    match current {
+        None => true,
+        Some(t) => t > due_ms || t <= now_ms,
+    }
+}
+
+/// Per-row decision for a listed `pendingleft:` entry.
+#[derive(Debug, PartialEq, Eq)]
+enum PendingRowAction {
+    /// Decodable — a live pending departure.
+    Keep(String, PendingPeerLeft),
+    /// Undecodable — delete on sight: it can never fire, and a
+    /// skip-only policy would leak it (and its alarm churn) forever.
+    DeleteCorrupt(String),
+}
+
+/// Pure core of `list_pending_departures`' per-row handling.
+fn classify_pending_row(room: String, decoded: Option<PendingPeerLeft>) -> PendingRowAction {
+    match decoded {
+        Some(entry) => PendingRowAction::Keep(room, entry),
+        None => PendingRowAction::DeleteCorrupt(room),
+    }
 }
 
 /// Validate that `room_id` is non-empty and prefixed by
@@ -1158,6 +2137,12 @@ fn validate_room_owned(identity_key: &str, room_id: &str) -> std::result::Result
     }
     Ok(())
 }
+
+/// S3b — the broadcast BOX marker. A client subscribes by listening on its
+/// OWN box named `broadcast-low-board` (roomId `<identity>-broadcast-...`,
+/// the normal ownership rule — no public-room concept); the worker's
+/// /broadcast fan-out delivers per-subscriber into exactly that room.
+pub const BROADCAST_BOX_MARKER: &str = "-broadcast-";
 
 // ===========================================================================
 // Outbound event helpers (#43)
@@ -1279,13 +2264,42 @@ fn outcome_to_outbound(room_id: &str, outcome: SendOutcome) -> Vec<OutboundEvent
             "paymentFailed",
             json!({ "reason": description_or(&body, "payment failed") }),
         )],
-        SendOutcome::DuplicateMessage { .. } => vec![OutboundEvent::new(
-            "messageFailed",
-            json!({ "reason": "Duplicate message." }),
+        // A duplicate `messageId` means the message is ALREADY DELIVERED (stored
+        // on a prior send — messageId is a content-addressed HMAC of the body).
+        // ACK it as SUCCESS (bsv-low#249): the old `messageFailed` mapping left
+        // the client's `sendLiveMessage` waiting out its full 10 000ms WS-ack
+        // timeout (it only listens for `sendMessageAck-<room>`), then HTTP-falling-
+        // back into the same duplicate — a fixed ~10.4s stall on EVERY duplicate
+        // resend (watchdog / reconnect / mutual-wait heal), which cascaded into a
+        // spurious dispute escalation + wedge. A duplicate = delivery, not failure
+        // (matches the client's own #210 `isDuplicateMessage` semantics); acking
+        // it resolves the resend in <1s. Idempotent + honest: we only reach here
+        // because the identical-content row is already present.
+        SendOutcome::DuplicateMessage { message_id, .. } => vec![OutboundEvent::new(
+            "sendMessageAck",
+            json!({
+                "roomId": room_id,
+                "status": "success",
+                "messageId": message_id,
+                "duplicate": true,
+            }),
         )],
         SendOutcome::InternalError { detail } => vec![OutboundEvent::new(
             "messageFailed",
             json!({ "reason": format!("An internal error has occurred: {}", detail) }),
+        )],
+        SendOutcome::TransientError { detail } => vec![OutboundEvent::new(
+            // Same `messageFailed` channel; the reason flags it retryable so the
+            // WS client resends rather than treating it as terminal. The send
+            // failed FAST (bounded write timeout+retry), not the ~10s hang.
+            "messageFailed",
+            json!({
+                "reason": format!(
+                    "The relay is momentarily unavailable; please retry: {}",
+                    detail
+                ),
+                "retryable": true,
+            }),
         )],
     }
 }
@@ -1317,6 +2331,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn broadcast_box_rooms_stay_ownership_gated_and_marker_matches() {
+        let key = "03ef3231669022cc03aa26c74de784648faddb76609465c7181393efb335cbc7e0";
+        // The broadcast BOX rides the NORMAL ownership rule — own-identity
+        // rooms only (no public-room concept exists).
+        assert!(validate_room_owned(key, &format!("{key}-broadcast-low-board")).is_ok());
+        assert!(validate_room_owned(key, "broadcast-low-board").is_err());
+        assert!(format!("{key}-broadcast-low-board").contains(BROADCAST_BOX_MARKER));
+    }
+
+    #[test]
     fn validate_room_owned_accepts_owner_prefix() {
         let key = "03ef3231669022cc03aa26c74de784648faddb76609465c7181393efb335cbc7e0";
         assert!(validate_room_owned(key, &format!("{key}-inbox")).is_ok());
@@ -1346,6 +2370,70 @@ mod tests {
         // proper prefix of ours — require the explicit `-` separator.
         let other = format!("{key}suffix");
         assert!(validate_room_owned(key, &other).is_err());
+    }
+
+    #[test]
+    fn presence_body_omits_last_seen_when_unset() {
+        // Advisory contract: no last-seen key => the field is ABSENT
+        // (not 0, not null), so a reader can never misread it. With no
+        // tier-2 deadline either, `rejoinDeadlineMs` is likewise absent.
+        let body = presence_body_json("03aa-inbox", true, None, None);
+        assert_eq!(body["room"], "03aa-inbox");
+        assert_eq!(body["present"], json!(true));
+        assert!(
+            body.get("lastSeenMs").is_none(),
+            "lastSeenMs must be omitted when unset, got: {body}"
+        );
+        assert!(
+            body.get("rejoinDeadlineMs").is_none(),
+            "rejoinDeadlineMs must be omitted when unset, got: {body}"
+        );
+    }
+
+    #[test]
+    fn presence_body_includes_last_seen_when_set() {
+        // When a heartbeat exists it is threaded through as a number.
+        let body = presence_body_json("03aa-inbox", false, Some(1_700_000_000_123), None);
+        assert_eq!(body["present"], json!(false));
+        assert_eq!(body["lastSeenMs"], json!(1_700_000_000_123u64));
+        assert!(body.get("rejoinDeadlineMs").is_none());
+    }
+
+    #[test]
+    fn presence_body_includes_rejoin_deadline_when_set() {
+        // Tier-2: the stayer-published deadline is threaded through as a
+        // number, independent of the heartbeat and of `present`.
+        let body = presence_body_json("03aa-inbox", true, None, Some(1_700_000_060_000));
+        assert_eq!(body["present"], json!(true));
+        assert_eq!(body["rejoinDeadlineMs"], json!(1_700_000_060_000u64));
+        assert!(
+            body.get("lastSeenMs").is_none(),
+            "lastSeenMs stays omitted when only the deadline is set, got: {body}"
+        );
+    }
+
+    #[test]
+    fn presence_body_includes_both_last_seen_and_rejoin_deadline() {
+        let body =
+            presence_body_json("03aa-inbox", false, Some(1_700_000_000_123), Some(1_700_000_060_000));
+        assert_eq!(body["lastSeenMs"], json!(1_700_000_000_123u64));
+        assert_eq!(body["rejoinDeadlineMs"], json!(1_700_000_060_000u64));
+    }
+
+    #[test]
+    fn rejoin_deadline_body_parses_camel_case() {
+        // The tier-2 write body is `{deadlineMs:<u64>}` (camelCase on the
+        // wire, snake_case in Rust via serde rename_all).
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RejoinDeadlineBody {
+            deadline_ms: u64,
+        }
+        let parsed: RejoinDeadlineBody =
+            serde_json::from_str(r#"{"deadlineMs":1700000060000}"#).unwrap();
+        assert_eq!(parsed.deadline_ms, 1_700_000_060_000u64);
+        // A missing field is a hard parse error (=> the handler 400s).
+        assert!(serde_json::from_str::<RejoinDeadlineBody>(r#"{}"#).is_err());
     }
 
     #[test]
@@ -1520,5 +2608,604 @@ mod tests {
 
         let wrong_type = json!({"description": 42});
         assert_eq!(description_or(&wrong_type, "fallback"), "fallback");
+    }
+
+    // #40 peer presence — pure helpers.
+    const ID_A: &str = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ID_B: &str = "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    // #225 — departed-socket teardown latch (`split_departure`). The
+    // runtime can fire BOTH websocket_close and websocket_error for a
+    // single dropped socket; the latch guarantees at most one peerLeft
+    // notification per socket.
+    #[test]
+    fn split_departure_yields_rooms_and_room_less_latch() {
+        let room_a = format!("{ID_A}-low_game_deadbeef");
+        let room_b = format!("{ID_A}-inbox");
+        let a = SocketAttachment {
+            identity_key: ID_A.to_string(),
+            connected_at_ms: 1_700_000_000_000,
+            joined_rooms: vec![room_a.clone(), room_b.clone()],
+        };
+        let (latched, rooms, leaver) = split_departure(a).expect("departure due");
+        assert_eq!(leaver, ID_A);
+        assert_eq!(rooms, vec![room_a, room_b]);
+        // The latch is the SAME attachment minus rooms — identity and
+        // connect time survive so a later handler still sees a verified
+        // socket, just one with nothing left to depart.
+        assert_eq!(latched.identity_key, ID_A);
+        assert_eq!(latched.connected_at_ms, 1_700_000_000_000);
+        assert!(latched.joined_rooms.is_empty());
+    }
+
+    #[test]
+    fn split_departure_no_ops_on_empty_rooms() {
+        // No rooms — nothing to notify. This is ALSO the already-latched
+        // case: the second lifecycle event (close after error, or error
+        // after close) reads back the latched attachment and stops here.
+        let a = SocketAttachment {
+            identity_key: ID_A.to_string(),
+            connected_at_ms: 1,
+            joined_rooms: Vec::new(),
+        };
+        assert!(split_departure(a).is_none());
+    }
+
+    #[test]
+    fn split_departure_is_idempotent_through_the_latch() {
+        // Round-trip the latch exactly as the teardown does: first pass
+        // notifies and writes the latched attachment; feeding the latch
+        // back in (the double-fire) must be a no-op.
+        let a = SocketAttachment {
+            identity_key: ID_A.to_string(),
+            connected_at_ms: 2,
+            joined_rooms: vec![format!("{ID_A}-low_game_x")],
+        };
+        let (latched, _, _) = split_departure(a).expect("first pass notifies");
+        assert!(
+            split_departure(latched).is_none(),
+            "second lifecycle event must find nothing to depart"
+        );
+    }
+
+    #[test]
+    fn room_identity_extracts_owner_prefix() {
+        let room = format!("{ID_A}-low_game_deadbeef");
+        assert_eq!(room_identity(&room), Some(ID_A));
+        // malformed: no dash, short prefix, non-hex prefix
+        assert_eq!(room_identity("nodash"), None);
+        assert_eq!(room_identity("02ab-low_game_x"), None);
+        assert_eq!(room_identity(&format!("{}-box", "zz".repeat(33))), None);
+    }
+
+    #[test]
+    fn room_suffix_and_peer_room_compose() {
+        let room = format!("{ID_A}-low_game_deadbeef");
+        assert_eq!(room_suffix(&room), Some("low_game_deadbeef"));
+        assert_eq!(
+            peer_room(ID_B, &room).as_deref(),
+            Some(format!("{ID_B}-low_game_deadbeef").as_str())
+        );
+        // a suffix containing dashes survives intact (split_once)
+        let dashed = format!("{ID_A}-my-box-name");
+        assert_eq!(room_suffix(&dashed), Some("my-box-name"));
+        assert_eq!(
+            peer_room(ID_B, &dashed).as_deref(),
+            Some(format!("{ID_B}-my-box-name").as_str())
+        );
+        // malformed rooms compose nothing
+        assert_eq!(peer_room(ID_B, "garbage"), None);
+        assert_eq!(room_suffix(&format!("{ID_A}-")), None);
+    }
+
+    // bsv-low#249: a WS duplicate must ACK as success (already delivered), NOT
+    // messageFailed — the old mapping stranded sendLiveMessage for its full 10s
+    // WS-ack timeout on every duplicate resend → spurious escalation + wedge.
+    #[test]
+    fn ws_duplicate_acks_as_success_not_failed() {
+        let room = format!("{ID_A}-low_game_dupe");
+        let out = outcome_to_outbound(
+            &room,
+            SendOutcome::DuplicateMessage {
+                recipient: ID_B.to_string(),
+                message_id: "mid-abc".to_string(),
+            },
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].event_name, "sendMessageAck", "duplicate must ack, not fail");
+        assert_eq!(out[0].data["status"], "success");
+        assert_eq!(out[0].data["messageId"], "mid-abc");
+        assert_eq!(out[0].data["roomId"], room);
+        assert_eq!(out[0].data["duplicate"], true);
+    }
+
+    // Guard the contract that was the actual bug: sendLiveMessage listens ONLY
+    // for `sendMessageAck-<room>`, so a duplicate emitted on any OTHER event name
+    // re-introduces the 10s stall. Success and Duplicate must share the ack event.
+    #[test]
+    fn success_and_duplicate_share_the_ack_event() {
+        let room = format!("{ID_A}-low_game_x");
+        let success = outcome_to_outbound(
+            &room,
+            SendOutcome::Success {
+                results: vec![crate::routes::send_message::RecipientResult {
+                    recipient: ID_B.to_string(),
+                    message_id: "m1".to_string(),
+                }],
+            },
+        );
+        let dupe = outcome_to_outbound(
+            &room,
+            SendOutcome::DuplicateMessage {
+                recipient: ID_B.to_string(),
+                message_id: "m1".to_string(),
+            },
+        );
+        assert_eq!(success[0].event_name, dupe[0].event_name);
+        assert_eq!(success[0].data["status"], dupe[0].data["status"]);
+    }
+
+    // =======================================================================
+    // Presence-flap debounce (bsv-low prod-dist-2026-07-24_04-06-50): the
+    // LOW client's inbound watchdog self-heals via leaveRoom+rejoin with a
+    // ~1-2s gap. The relay must NOT translate that flap into a peerLeft
+    // push about a healthy peer — a last-session departure arms a trailing
+    // ~4s check instead, and only a room still empty at fire time pushes.
+    //
+    // `PresenceSim` mirrors the DO pipeline step-for-step using the SAME
+    // pure decision functions the production code calls
+    // (`arm_departure_debounce` / `split_due_pending` /
+    // `departure_push_due`); only the storage/alarm/cross-DO plumbing is
+    // simulated.
+    // =======================================================================
+
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct PresenceSim {
+        now: u64,
+        /// Live-session count per room for the hub owner. `> 0` models
+        /// `room_still_occupied` == true — faithfully, so multi-tab
+        /// departure suppression (leave one tab, another still seated)
+        /// is exercised, not bypassed.
+        sessions: BTreeMap<String, u32>,
+        /// Models the `pendingleft:<room>` storage entries.
+        pending: BTreeMap<String, PendingPeerLeft>,
+        /// Models the single DO alarm.
+        alarm_at: Option<u64>,
+        /// Cross-DO `/internal/peer-left` pushes: (room, leaver, at_ms).
+        pushes: Vec<(String, String, u64)>,
+        /// Models `lastseen:<room>` stamps.
+        lastseen: BTreeMap<String, u64>,
+        /// Fault knob: the NEXT pendingleft put fails (production
+        /// fallback: delete stale entry + immediate push). One-shot.
+        put_fails_once: bool,
+        /// Fault knob: the NEXT ensure_alarm after a successful put
+        /// fails (production fallback: delete entry + immediate push).
+        /// One-shot.
+        alarm_fails_once: bool,
+        /// Fault knob: the NEXT alarm-time pendingleft LIST fails
+        /// (production: consume nothing, re-arm a retry one window
+        /// out). One-shot.
+        list_fails_once: bool,
+    }
+
+    impl PresenceSim {
+        fn occupied(&self, room: &str) -> bool {
+            self.sessions.get(room).copied().unwrap_or(0) > 0
+        }
+
+        fn join(&mut self, room: &str) {
+            // Mirrors ClientEvent::JoinRoom: membership + lastseen stamp.
+            *self.sessions.entry(room.to_string()).or_insert(0) += 1;
+            self.lastseen.insert(room.to_string(), self.now);
+        }
+
+        /// ONE session of `leaver` departs `room`. Mirrors
+        /// `maybe_notify_peer_left`: stamp `lastseen` immediately (every
+        /// departure, even multi-tab); if another session is still
+        /// seated, stop (the `room_still_occupied` gate); otherwise
+        /// arm/overwrite the trailing debounce entry and pull the alarm
+        /// in (`ensure_alarm_no_later_than`), with the two production
+        /// fallback paths modeled via the fault knobs.
+        fn depart(&mut self, room: &str, leaver: &str) {
+            if let Some(n) = self.sessions.get_mut(room) {
+                *n = n.saturating_sub(1);
+            }
+            // #225 final heartbeat: stamped IMMEDIATELY at departure time.
+            self.lastseen.insert(room.to_string(), self.now);
+            if self.occupied(room) {
+                return; // another tab/device of the same identity is still seated
+            }
+            let entry = arm_departure_debounce(leaver, self.now);
+            let due = entry.due_at_ms;
+            if std::mem::take(&mut self.put_fails_once) {
+                // Production put-failure fallback: delete any STALE prior
+                // entry (it must not fire a second push later), push now.
+                self.pending.remove(room);
+                self.pushes
+                    .push((room.to_string(), leaver.to_string(), self.now));
+                return;
+            }
+            self.pending.insert(room.to_string(), entry);
+            if std::mem::take(&mut self.alarm_fails_once) {
+                // Production alarm-failure fallback: un-store + push now.
+                self.pending.remove(room);
+                self.pushes
+                    .push((room.to_string(), leaver.to_string(), self.now));
+                return;
+            }
+            if self.alarm_at.is_none_or(|t| t > due) {
+                self.alarm_at = Some(due);
+            }
+        }
+
+        /// Advance the clock, firing the DO alarm whenever due. Mirrors
+        /// `MessageHub::alarm` → `run_departure_debounce_alarm`.
+        fn advance_to(&mut self, t: u64) {
+            while let Some(at) = self.alarm_at {
+                if at > t {
+                    break;
+                }
+                self.now = at;
+                self.fire_alarm();
+            }
+            self.now = self.now.max(t);
+        }
+
+        fn fire_alarm(&mut self) {
+            self.alarm_at = None;
+            if std::mem::take(&mut self.list_fails_once) {
+                // Production MED-1(b) branch: an unreadable list consumes
+                // the wake — re-arm a retry one window out, touch nothing.
+                self.alarm_at = Some(self.now + PEER_LEFT_DEBOUNCE_MS);
+                return;
+            }
+            let pending: Vec<(String, PendingPeerLeft)> = std::mem::take(&mut self.pending)
+                .into_iter()
+                .collect();
+            let (due, rest, next) = split_due_pending(pending, self.now);
+            self.pending = rest.into_iter().collect();
+            for (room, entry) in due {
+                let still_occupied = self.occupied(&room);
+                if departure_push_due(still_occupied) {
+                    self.pushes.push((room, entry.leaver, self.now));
+                }
+            }
+            if let Some(n) = next {
+                self.alarm_at = Some(n);
+            }
+        }
+    }
+
+    const ROOM_A_SUFFIX: &str = "low_game_feedface";
+
+    fn sim_room_a() -> String {
+        format!("{ID_A}-{ROOM_A_SUFFIX}")
+    }
+
+    #[test]
+    fn arm_departure_debounce_times_trailing_check_from_now() {
+        let e = arm_departure_debounce(ID_A, 10_000);
+        assert_eq!(e.leaver, ID_A);
+        assert_eq!(e.departed_at_ms, 10_000);
+        assert_eq!(e.due_at_ms, 10_000 + PEER_LEFT_DEBOUNCE_MS);
+    }
+
+    #[test]
+    fn split_due_pending_partitions_and_finds_earliest_next() {
+        let mk = |due: u64| PendingPeerLeft {
+            leaver: ID_A.to_string(),
+            departed_at_ms: due - PEER_LEFT_DEBOUNCE_MS,
+            due_at_ms: due,
+        };
+        let pending = vec![
+            ("r1".to_string(), mk(5_000)),  // due
+            ("r2".to_string(), mk(9_000)),  // future
+            ("r3".to_string(), mk(6_000)),  // due (boundary: <= now)
+            ("r4".to_string(), mk(7_500)),  // future (earliest next)
+        ];
+        let (due, rest, next) = split_due_pending(pending, 6_000);
+        let due_rooms: Vec<&str> = due.iter().map(|(r, _)| r.as_str()).collect();
+        let rest_rooms: Vec<&str> = rest.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(due_rooms, vec!["r1", "r3"]);
+        assert_eq!(rest_rooms, vec!["r2", "r4"]);
+        assert_eq!(next, Some(7_500), "next alarm = earliest FUTURE due");
+        // Nothing pending → no re-arm.
+        let (d, r, n) = split_due_pending(Vec::new(), 6_000);
+        assert!(d.is_empty() && r.is_empty() && n.is_none());
+    }
+
+    #[test]
+    fn departure_push_due_only_when_room_still_empty() {
+        assert!(departure_push_due(false), "still empty → push");
+        assert!(!departure_push_due(true), "reoccupied (flap rejoined) → silent");
+    }
+
+    #[test]
+    fn alarm_needs_replacing_three_way_predicate() {
+        let now = 10_000i64;
+        let due = 14_000i64;
+        // No alarm at all → set ours.
+        assert!(alarm_needs_replacing(None, due, now));
+        // A LATER alarm → pull it in to ours.
+        assert!(alarm_needs_replacing(Some(20_000), due, now));
+        // An EARLIER future alarm covers us → leave it alone.
+        assert!(!alarm_needs_replacing(Some(12_000), due, now));
+        // An alarm at exactly our due → equally good, leave it.
+        assert!(!alarm_needs_replacing(Some(due), due, now));
+        // STALE (already in the past, boundary t == now inclusive):
+        // belt-and-braces around a fire — replace it.
+        assert!(alarm_needs_replacing(Some(9_000), due, now));
+        assert!(alarm_needs_replacing(Some(now), due, now));
+    }
+
+    #[test]
+    fn classify_pending_row_keeps_decodable_deletes_corrupt() {
+        let entry = arm_departure_debounce(ID_A, 10_000);
+        assert_eq!(
+            classify_pending_row("r1".to_string(), Some(entry.clone())),
+            PendingRowAction::Keep("r1".to_string(), entry)
+        );
+        // Undecodable value (LOW-3): deleted on sight, never leaked.
+        assert_eq!(
+            classify_pending_row("r2".to_string(), None),
+            PendingRowAction::DeleteCorrupt("r2".to_string())
+        );
+    }
+
+    /// (1) A watchdog self-heal flap (leave, rejoin ~1.5s later) inside
+    /// the debounce window must produce ZERO peerLeft pushes.
+    #[test]
+    fn flap_within_debounce_window_pushes_nothing() {
+        let room = sim_room_a();
+        let mut sim = PresenceSim::default();
+        sim.advance_to(1_000);
+        sim.join(&room);
+        sim.advance_to(10_000);
+        sim.depart(&room, ID_A);
+        sim.advance_to(11_500); // ~1.5s gap — the real flap profile
+        sim.join(&room);
+        sim.advance_to(60_000); // let any scheduled trailing check fire
+        assert_eq!(
+            sim.pushes.len(),
+            0,
+            "a self-heal flap must not notify the peer, got: {:?}",
+            sim.pushes
+        );
+    }
+
+    /// (2) A sustained departure pushes EXACTLY ONCE, only after the
+    /// debounce window, with `lastseen` stamped at the ORIGINAL departure
+    /// time (#225 final-heartbeat semantics — never re-stamped at fire).
+    #[test]
+    fn sustained_departure_pushes_exactly_once_after_window() {
+        let room = sim_room_a();
+        let mut sim = PresenceSim::default();
+        sim.advance_to(1_000);
+        sim.join(&room);
+        sim.advance_to(10_000);
+        sim.depart(&room, ID_A);
+        sim.advance_to(120_000);
+        assert_eq!(sim.pushes.len(), 1, "exactly one push, got: {:?}", sim.pushes);
+        let (p_room, p_leaver, p_at) = &sim.pushes[0];
+        assert_eq!(p_room, &room);
+        assert_eq!(p_leaver, ID_A);
+        assert!(
+            *p_at >= 10_000 + PEER_LEFT_DEBOUNCE_MS,
+            "push must wait out the debounce window; pushed at {p_at}"
+        );
+        assert_eq!(
+            sim.lastseen[&room], 10_000,
+            "lastseen must carry the ORIGINAL departure time, not the fire time"
+        );
+    }
+
+    /// (3) Two rapid leave/rejoin cycles — still zero pushes.
+    #[test]
+    fn two_rapid_flap_cycles_push_nothing() {
+        let room = sim_room_a();
+        let mut sim = PresenceSim::default();
+        sim.join(&room);
+        sim.advance_to(10_000);
+        sim.depart(&room, ID_A);
+        sim.advance_to(11_000);
+        sim.join(&room);
+        sim.advance_to(12_000);
+        sim.depart(&room, ID_A);
+        sim.advance_to(13_000);
+        sim.join(&room);
+        sim.advance_to(60_000);
+        assert_eq!(
+            sim.pushes.len(),
+            0,
+            "rapid flap cycles must stay silent, got: {:?}",
+            sim.pushes
+        );
+    }
+
+    /// (4) Departure → rejoin → FINAL departure: exactly one push, timed
+    /// from the LAST departure (trailing edge), not the first.
+    #[test]
+    fn rejoin_then_final_departure_times_from_last_departure() {
+        let room = sim_room_a();
+        let mut sim = PresenceSim::default();
+        sim.join(&room);
+        sim.advance_to(10_000);
+        sim.depart(&room, ID_A); // first departure (a flap)
+        sim.advance_to(11_000);
+        sim.join(&room); // flap rejoin
+        sim.advance_to(12_000);
+        sim.depart(&room, ID_A); // FINAL departure
+        sim.advance_to(120_000);
+        assert_eq!(sim.pushes.len(), 1, "exactly one push, got: {:?}", sim.pushes);
+        let (_, _, p_at) = &sim.pushes[0];
+        assert!(
+            *p_at >= 12_000 + PEER_LEFT_DEBOUNCE_MS,
+            "push must be timed from the LAST departure (>= {}), got {p_at}",
+            12_000 + PEER_LEFT_DEBOUNCE_MS
+        );
+    }
+
+    /// (5) An explicit goodbye is an app-level MESSAGE (rides the
+    /// `/internal/push` fan-out), not presence — it must keep full
+    /// immediacy. The real claim is REACHABILITY: nothing on the
+    /// message path calls into the debounced departure notify. This
+    /// pointer test pins the producer set of `maybe_notify_peer_left`
+    /// against the actual source, so any new call site (e.g. someone
+    /// wiring it into a send/push handler) breaks the build's tests and
+    /// forces a review of the goodbye-immediacy claim. Current
+    /// producers, all DEPARTURES:
+    ///   1. dispatch_event / ClientEvent::LeaveRoom   (raw-WS leaveRoom)
+    ///   2. dispatch_socketio_event "leaveRoom"       (socket.io leaveRoom)
+    ///   3. handle_socketio_unregister                (socket.io disconnect)
+    ///   4. teardown_departed_socket                  (WS close/error)
+    #[test]
+    fn goodbye_immediacy_no_debounce_on_the_message_path() {
+        let src = include_str!("message_hub.rs");
+        // Needles are assembled at runtime so these literals don't count
+        // themselves as call sites.
+        let notify_needle = format!(".{}(", "maybe_notify_peer_left");
+        let push_needle = format!(".{}(", "push_peer_left");
+        let call_sites = src.matches(notify_needle.as_str()).count();
+        assert_eq!(
+            call_sites, 4,
+            "maybe_notify_peer_left producer set changed (expected the 4 \
+             departure producers) — if the new caller is on a message/send \
+             path, explicit goodbyes just lost their immediacy; re-review \
+             and update this test's producer list"
+        );
+        // And the debounced push itself must only ever be reachable from
+        // the departure pipeline: the arm/alarm fallbacks + the alarm
+        // trailing check.
+        let push_sites = src.matches(push_needle.as_str()).count();
+        assert_eq!(
+            push_sites, 3,
+            "push_peer_left caller set changed (expected: put-failure \
+             fallback, alarm-arm-failure fallback, alarm trailing check)"
+        );
+    }
+
+    /// Multi-tab: departing ONE of two live sessions is suppressed by
+    /// the `room_still_occupied` gate (no pending armed, no push, ever);
+    /// only the LAST session's departure arms the debounce. The
+    /// `lastseen` stamp still lands on EVERY departure (#225).
+    #[test]
+    fn multi_session_departure_is_suppressed_until_last() {
+        let room = sim_room_a();
+        let mut sim = PresenceSim::default();
+        sim.join(&room); // tab 1
+        sim.join(&room); // tab 2
+        sim.advance_to(10_000);
+        sim.depart(&room, ID_A); // tab 1 leaves — tab 2 still seated
+        assert!(sim.pending.is_empty(), "not the last session — nothing armed");
+        assert!(sim.alarm_at.is_none());
+        assert_eq!(sim.lastseen[&room], 10_000, "departure still stamps lastseen");
+        sim.advance_to(60_000);
+        assert_eq!(sim.pushes.len(), 0, "no push while a session remains");
+        sim.depart(&room, ID_A); // tab 2 — the LAST session
+        sim.advance_to(120_000);
+        assert_eq!(sim.pushes.len(), 1, "last-session departure pushes once");
+        assert!(sim.pushes[0].2 >= 60_000 + PEER_LEFT_DEBOUNCE_MS);
+    }
+
+    /// MED-1(a)+LOW-1: a pendingleft PUT failure falls back to the
+    /// immediate push AND deletes any stale prior entry — the stale
+    /// entry must not fire a SECOND push at its original due time.
+    #[test]
+    fn put_failure_falls_back_to_one_immediate_push_no_double() {
+        let room = sim_room_a();
+        let mut sim = PresenceSim::default();
+        sim.join(&room);
+        sim.advance_to(10_000);
+        sim.depart(&room, ID_A); // armed ok, due 14_000
+        sim.advance_to(11_000);
+        sim.join(&room); // flap rejoin — entry left for the trailing check
+        sim.advance_to(12_000);
+        sim.put_fails_once = true;
+        sim.depart(&room, ID_A); // put fails → immediate push + stale delete
+        assert_eq!(
+            sim.pushes,
+            vec![(room.clone(), ID_A.to_string(), 12_000)],
+            "fallback pushes immediately"
+        );
+        sim.advance_to(120_000); // past the stale entry's original due
+        assert_eq!(
+            sim.pushes.len(),
+            1,
+            "the stale prior entry must NOT fire a second push, got: {:?}",
+            sim.pushes
+        );
+    }
+
+    /// MED-1(a): entry stored but the alarm cannot be scheduled — the
+    /// trailing check would never run, so the fallback un-stores the
+    /// entry and pushes immediately (exactly once).
+    #[test]
+    fn alarm_schedule_failure_falls_back_to_one_immediate_push() {
+        let room = sim_room_a();
+        let mut sim = PresenceSim::default();
+        sim.join(&room);
+        sim.advance_to(10_000);
+        sim.alarm_fails_once = true;
+        sim.depart(&room, ID_A);
+        assert_eq!(
+            sim.pushes,
+            vec![(room.clone(), ID_A.to_string(), 10_000)],
+            "no wake guaranteed → push now"
+        );
+        assert!(sim.pending.is_empty(), "entry un-stored — nothing can double-fire");
+        sim.advance_to(120_000);
+        assert_eq!(sim.pushes.len(), 1);
+    }
+
+    /// MED-1(b): an unreadable pendingleft list at alarm time must not
+    /// consume the wake — the alarm re-arms one window out and the
+    /// stored entry still fires (late, exactly once).
+    #[test]
+    fn list_failure_rearms_retry_instead_of_stranding_entries() {
+        let room = sim_room_a();
+        let mut sim = PresenceSim::default();
+        sim.join(&room);
+        sim.advance_to(10_000);
+        sim.depart(&room, ID_A); // due 14_000
+        sim.list_fails_once = true; // the 14_000 fire can't read the list
+        sim.advance_to(120_000);
+        assert_eq!(
+            sim.pushes.len(),
+            1,
+            "entry must survive the failed list and fire on the retry, got: {:?}",
+            sim.pushes
+        );
+        assert_eq!(
+            sim.pushes[0].2,
+            14_000 + PEER_LEFT_DEBOUNCE_MS,
+            "retry fires one window after the failed wake"
+        );
+    }
+
+    /// (6) Debounce state is keyed per room: a sustained departure in one
+    /// room pushes once; a flap in another room stays silent.
+    #[test]
+    fn debounce_state_is_per_room() {
+        let room_a = sim_room_a();
+        let room_b = format!("{ID_A}-low_game_0ddba11");
+        let mut sim = PresenceSim::default();
+        sim.join(&room_a);
+        sim.join(&room_b);
+        sim.advance_to(10_000);
+        sim.depart(&room_a, ID_A); // sustained
+        sim.advance_to(10_500);
+        sim.depart(&room_b, ID_A); // flap...
+        sim.advance_to(11_500);
+        sim.join(&room_b); // ...rejoined
+        sim.advance_to(120_000);
+        assert_eq!(
+            sim.pushes.len(),
+            1,
+            "only the sustained room may push, got: {:?}",
+            sim.pushes
+        );
+        assert_eq!(sim.pushes[0].0, room_a);
     }
 }

@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "description": "M9 #52: probe @bsv/authsocket-client TS-style socket.io client against bsv-messagebox-cloudflare raw-WS /ws endpoint to characterize the documented parity gap. Multi-version + aggressive (signed-header forge) probes included.",
+  "description": "M9 #52: probe @bsv/authsocket-client TS-style socket.io client against rust-message-box raw-WS /ws endpoint to characterize the documented parity gap. Multi-version + aggressive (signed-header forge) probes included.",
   "scripts": {
     "probe": "node probe.mjs",
     "probe-multi": "node probe-multi.mjs",

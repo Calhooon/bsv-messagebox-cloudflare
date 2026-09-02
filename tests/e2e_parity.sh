@@ -18,7 +18,7 @@
 set -uo pipefail
 # Note: -e intentionally omitted so all tests run even if some commands fail
 
-CLI="../x402-client/cli.py"
+CLI="/Users/johncalhoun/bsv/x402-client/cli.py"
 NODE_SERVER="http://localhost:8080"
 RUST_SERVER="http://localhost:8787"
 MSG_ID="parity-$(date +%s)"

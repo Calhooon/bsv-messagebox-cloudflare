@@ -46,7 +46,7 @@ from urllib.parse import urlparse
 # ---------------------------------------------------------------------------
 # x402-client deps (re-used from tests/e2e_live_parity.py — same convention)
 # ---------------------------------------------------------------------------
-X402_CLIENT_DIR = "../x402-client"
+X402_CLIENT_DIR = "/Users/johncalhoun/bsv/x402-client"
 sys.path.insert(0, X402_CLIENT_DIR)
 
 from lib.handshake import get_or_create_session  # noqa: E402

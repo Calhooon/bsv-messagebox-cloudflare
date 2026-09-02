@@ -1,0 +1,208 @@
+{
+  "wire": "low-relay GET /presence — v1 of the THREE-STATE shape (#313 H1)",
+  "why": [
+    "Two components, two repos: the relay (rust-message-box handle_presence_route /",
+    "presence_route_response) PRODUCES these bytes, and the LOW client",
+    "(bsv-low app/src/lib/presence.ts fetchOpponentPresence / fetchLobbyHostPresence)",
+    "CONSUMES them. Pinning each side against its own idea of the wire would pin",
+    "two independent beliefs, not the agreement. So this file is the agreement:",
+    "each repo drives its REAL code through every case here, and each repo's gate",
+    "also asserts the sha256 of this file's bytes equals the constant recorded in",
+    "the other repo's test. Edit one copy and BOTH gates go red until they match.",
+    "",
+    "The load-bearing case is `hub-fault`: a relay-internal failure (DO namespace,",
+    "stub fetch, unreadable body) must NOT be spelled like an absence. It carries",
+    "HTTP 503 and NO `present` key at all — the third state is unrepresentable as",
+    "a boolean, not merely flagged beside one — and the client must read it as",
+    "null/unknown. Before #313 that case was HTTP 200 `present:false`, and a 30s",
+    "relay blip would have branded every probed live host 'away' at once.",
+    "",
+    "`presenceWire` is the producer SELF-IDENTIFYING: it appears only on a real",
+    "answer (HTTP 200) and means 'this relay distinguishes a hub fault from an",
+    "absence'. It exists because the fix ships as two independently-deployed",
+    "components: until the relay carrying it is live, a client CANNOT tell an old",
+    "build's fabricated `false` from a genuine one. Consumers that count `false`",
+    "as EVIDENCE (the #309/#313 lobby away tag) therefore require the marker and",
+    "read an unmarked `false` as unknown — see the `legacy-absence-no-marker`",
+    "case. Consumers that only latch on `true` are unaffected either way."
+  ],
+  "sha256Note": "The sha256 pinned in both repos is over the exact bytes of this file (including the trailing newline).",
+  "room": "03abababababababababababababababababababababababababababababababab-low_lobby_cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+  "cases": [
+    {
+      "name": "answered-present",
+      "producer": {
+        "kind": "answered",
+        "present": true
+      },
+      "status": 200,
+      "body": {
+        "present": true,
+        "presenceWire": 1,
+        "room": "03abababababababababababababababababababababababababababababababab-low_lobby_cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "status": "success"
+      },
+      "nowMs": 1700000060123,
+      "expectOpponentRead": {
+        "present": true,
+        "lastSeenAgoMs": null,
+        "rejoinDeadlineMs": null
+      },
+      "expectHostLivenessRead": {
+        "present": true,
+        "lastSeenAgoMs": null,
+        "rejoinDeadlineMs": null
+      }
+    },
+    {
+      "name": "answered-genuine-absence",
+      "producer": {
+        "kind": "answered",
+        "present": false
+      },
+      "status": 200,
+      "body": {
+        "present": false,
+        "presenceWire": 1,
+        "room": "03abababababababababababababababababababababababababababababababab-low_lobby_cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "status": "success"
+      },
+      "nowMs": 1700000060123,
+      "expectOpponentRead": {
+        "present": false,
+        "lastSeenAgoMs": null,
+        "rejoinDeadlineMs": null
+      },
+      "expectHostLivenessRead": {
+        "present": false,
+        "lastSeenAgoMs": null,
+        "rejoinDeadlineMs": null
+      }
+    },
+    {
+      "name": "answered-absence-with-last-seen",
+      "producer": {
+        "kind": "answered",
+        "present": false,
+        "lastSeenMs": 1700000000123
+      },
+      "status": 200,
+      "body": {
+        "lastSeenMs": 1700000000123,
+        "present": false,
+        "presenceWire": 1,
+        "room": "03abababababababababababababababababababababababababababababababab-low_lobby_cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "status": "success"
+      },
+      "nowMs": 1700000060123,
+      "expectOpponentRead": {
+        "present": false,
+        "lastSeenAgoMs": 60000,
+        "rejoinDeadlineMs": null
+      },
+      "expectHostLivenessRead": {
+        "present": false,
+        "lastSeenAgoMs": 60000,
+        "rejoinDeadlineMs": null
+      }
+    },
+    {
+      "name": "answered-present-with-rejoin-deadline",
+      "producer": {
+        "kind": "answered",
+        "present": true,
+        "rejoinDeadlineMs": 1700000060000
+      },
+      "status": 200,
+      "body": {
+        "present": true,
+        "presenceWire": 1,
+        "rejoinDeadlineMs": 1700000060000,
+        "room": "03abababababababababababababababababababababababababababababababab-low_lobby_cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "status": "success"
+      },
+      "nowMs": 1700000060123,
+      "expectOpponentRead": {
+        "present": true,
+        "lastSeenAgoMs": null,
+        "rejoinDeadlineMs": 1700000060000
+      },
+      "expectHostLivenessRead": {
+        "present": true,
+        "lastSeenAgoMs": null,
+        "rejoinDeadlineMs": 1700000060000
+      }
+    },
+    {
+      "name": "hub-fault",
+      "producer": {
+        "kind": "hub-fault"
+      },
+      "status": 503,
+      "body": {
+        "code": "ERR_PRESENCE_UNAVAILABLE",
+        "description": "presence could not be read (owner hub unreachable) — this is NOT an absence",
+        "room": "03abababababababababababababababababababababababababababababababab-low_lobby_cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "status": "error"
+      },
+      "nowMs": 1700000060123,
+      "expectOpponentRead": {
+        "present": null,
+        "lastSeenAgoMs": null,
+        "rejoinDeadlineMs": null
+      },
+      "expectHostLivenessRead": {
+        "present": null,
+        "lastSeenAgoMs": null,
+        "rejoinDeadlineMs": null
+      }
+    },
+    {
+      "name": "invalid-room",
+      "producer": {
+        "kind": "invalid-room",
+        "room": "not-a-room"
+      },
+      "status": 400,
+      "body": {
+        "code": "ERR_INVALID_ROOM",
+        "description": "presence requires ?room=<identity>-<box>",
+        "status": "error"
+      },
+      "nowMs": 1700000060123,
+      "expectOpponentRead": {
+        "present": null,
+        "lastSeenAgoMs": null,
+        "rejoinDeadlineMs": null
+      },
+      "expectHostLivenessRead": {
+        "present": null,
+        "lastSeenAgoMs": null,
+        "rejoinDeadlineMs": null
+      }
+    },
+    {
+      "name": "legacy-absence-no-marker",
+      "producer": {
+        "kind": "never-emitted-by-this-relay"
+      },
+      "status": 200,
+      "body": {
+        "present": false,
+        "room": "03abababababababababababababababababababababababababababababababab-low_lobby_cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "status": "success"
+      },
+      "nowMs": 1700000060123,
+      "expectOpponentRead": {
+        "present": false,
+        "lastSeenAgoMs": null,
+        "rejoinDeadlineMs": null
+      },
+      "expectHostLivenessRead": {
+        "present": null,
+        "lastSeenAgoMs": null,
+        "rejoinDeadlineMs": null
+      }
+    }
+  ]
+}

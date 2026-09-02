@@ -1,6 +1,6 @@
 [package]
-name = "bsv-messagebox-cloudflare"
-version = "0.2.1"
+name = "rust-message-box"
+version = "0.3.0"
 edition = "2021"
 
 [lib]
@@ -32,10 +32,22 @@ pkcs8 = { version = "0.10", features = ["pem"] }
 hmac = "0.12"
 
 # BSV
-bsv-middleware-cloudflare = "0.2"
+bsv-middleware-cloudflare = "0.3.2"
 bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
 # Test-only RNG for generating ephemeral RSA test keys. Not used at runtime.
 rand = "0.8"
+
+# 2026-07-23 (#249): the 429-fix (lazy + best-effort BRC-31 session-liveness
+# touch) is NOW in PUBLISHED bsv-middleware-cloudflare 0.3.0 — the dep above is
+# `= "0.3"` and resolves it straight from crates.io, matching the tower
+# (workers/low-watchtower, also "0.3", no patch). NO [patch.crates-io]: the old
+# patch pinned a local path against a `= "0.2"` dep, but the local crate had
+# advanced to 0.3.1 (not ^0.2) → cargo silently marked the patch UNUSED and
+# resolved registry 0.2.0 (the PRE-fix crate) — the fix was written but never
+# shipped for weeks (a dead-patch silent regression). Published 0.3.0 alone
+# removes the 429→500 trigger + adds BRC-104 replay protection. Any further
+# hardening (the bounded KV read-retry) ships as a published 0.3.2, never a
+# local path-patch. WS-1: public bsv-middleware-cloudflare is the canonical lineage.

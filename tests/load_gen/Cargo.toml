@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# Standalone workspace — do NOT inherit from bsv-messagebox-cloudflare workspace.
-# This is a native binary that links against bsv-rs (crates.io) and runs
+# Standalone workspace — do NOT inherit from rust-message-box workspace.
+# This is a native binary that links against bsv-rs (path dep) and runs
 # under tokio. The parent crate compiles to wasm32 and has different deps.
 [workspace]
 
@@ -14,7 +14,7 @@ name = "load_gen"
 path = "src/main.rs"
 
 [dependencies]
-bsv-rs = { version = "0.3", features = ["auth", "wallet", "http", "primitives"] }
+bsv-rs = { path = "/Users/johncalhoun/bsv/bsv-rs", features = ["auth", "wallet", "http", "primitives"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures-util = "0.3"

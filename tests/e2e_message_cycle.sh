@@ -8,7 +8,7 @@
 # Usage: ./tests/e2e_message_cycle.sh
 
 set -e
-CLI="../x402-client/cli.py"
+CLI="/Users/johncalhoun/bsv/x402-client/cli.py"
 SERVER="http://localhost:8787"
 IDENTITY_KEY=$(python3 "$CLI" identity 2>/dev/null)
 MSG_ID="e2e-test-$(date +%s)"

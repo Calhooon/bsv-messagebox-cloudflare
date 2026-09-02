@@ -42,7 +42,7 @@ tests/load_gen/
 
 **10k failure breakdown**: every one of the 4 upgrade failures was `getaddrinfo` failing on the load-gen host (macOS DNS resolver under load — moving to Linux would likely eliminate them). Server returned the `connected` envelope on every one of the 9,996 successful upgrades. 120/9,996 (1.2%) sockets dropped during the 120-s soak — consistent with normal CF edge connection rebalancing, not load-induced server failure.
 
-## CF DO Analytics — MessageHub namespace `your-message-hub-do-namespace-id`, 11:47–12:00 UTC
+## CF DO Analytics — MessageHub namespace `b29f0bb08bd24c9895a7da2439918f3d`, 11:47–12:00 UTC
 
 ```
 minute       activeTime(µs)   cpuTime(µs)   duration(GB-s)  outboundWsMsg

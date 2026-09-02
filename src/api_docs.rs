@@ -1,4 +1,4 @@
-// OpenAPI 3.0 specification for the bsv-messagebox-cloudflare API.
+// OpenAPI 3.0 specification for the rust-message-box API.
 // Served at GET /api-docs as a public endpoint (no auth required).
 //
 // The spec is assembled from helper functions to avoid exceeding the
@@ -20,7 +20,7 @@ pub fn openapi_spec() -> Value {
 
 fn info() -> Value {
     json!({
-        "title": "bsv-messagebox-cloudflare",
+        "title": "rust-message-box",
         "description": "BSV message box service — authenticated message delivery with permissions, payments, and device registration. All authenticated endpoints use BRC-31 mutual authentication. For payloads ≤100 MB this server is byte-for-byte compatible with the TS `message-box-server` and Go `go-messagebox-server` reference implementations; above 100 MB it exposes an opt-in Rust-only R2 upload extension (see `POST /beef/upload-url`).\n\nIn addition to the HTTP routes documented here, the service exposes a WebSocket endpoint at `GET /ws` (Upgrade: websocket) that mirrors the TS `@bsv/authsocket` event surface (`joinRoom`, `leaveRoom`, `sendMessage`, etc.) on a per-identity hibernatable Cloudflare Durable Object. WebSocket APIs are out of OpenAPI 3.0 scope — OpenAPI does not model WS event channels — so they are intentionally not included in this spec. See the project README's \"WebSocket\" section for the event envelope and parity boundary; AsyncAPI would be the appropriate spec format if a machine-readable description is needed in the future.",
         "version": "0.1.0",
         "license": { "name": "Proprietary" }
@@ -452,7 +452,7 @@ fn schema_health_response() -> Value {
         "required": ["status", "message"],
         "properties": {
             "status": { "type": "string", "enum": ["success"] },
-            "message": { "type": "string", "example": "bsv-messagebox-cloudflare is running" }
+            "message": { "type": "string", "example": "rust-message-box is running" }
         }
     })
 }
@@ -474,7 +474,106 @@ fn paths() -> Value {
     m.insert("/registerDevice".into(), path_register_device());
     m.insert("/devices".into(), path_devices());
     m.insert("/beef/upload-url".into(), path_beef_upload_url());
+    m.insert("/listTranscript".into(), path_list_transcript());
+    m.insert("/purgeTranscript".into(), path_purge_transcript());
     Value::Object(m)
+}
+
+fn path_list_transcript() -> Value {
+    json!({
+        "post": {
+            "summary": "[RUST-ONLY EXTENSION] Read the retained transcript of a message box",
+            "description": "**Not available on TS or Go reference servers.** For message boxes in this deployment's RETAINED class (box types matching the `RETAIN_BOX_PREFIXES` config), `acknowledgeMessage` marks messages delivered instead of deleting them, and this endpoint returns the full ordered chain the caller was a party to: every retained message the caller RECEIVED plus every one it SENT — nothing more. Ordering is relay insertion order (stable); any application-level sequence numbers inside the bodies remain authoritative. `acknowledged` marks per-message delivery. Rule-13 honesty: an empty `messages` with `purgedAt` present means the caller's view was purged (`purgeReason`: `client` or `expired`); empty WITHOUT `purgedAt` means no messages ever existed — within the tombstone window (2× the retention TTL, after which tombstones are garbage-collected and a very old empty read is honestly ambiguous). Caveat: a purge by the counterparty of ITS OWN mailbox removes the caller's outbound copies without a tombstone visible here.",
+            "operationId": "listTranscript",
+            "tags": ["Messages"],
+            "security": [{ "BRC31Auth": [] }],
+            "requestBody": {
+                "required": true,
+                "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ListMessagesRequest" } } }
+            },
+            "responses": {
+                "200": {
+                    "description": "The caller-scoped retained transcript, oldest first.",
+                    "content": { "application/json": { "schema": {
+                        "type": "object",
+                        "required": ["status", "messageBox", "retained", "messages"],
+                        "properties": {
+                            "status": { "type": "string", "enum": ["success"] },
+                            "messageBox": { "type": "string" },
+                            "retained": { "type": "boolean", "enum": [true] },
+                            "messages": { "type": "array", "items": {
+                                "type": "object",
+                                "properties": {
+                                    "messageId": { "type": "string" },
+                                    "sender": { "type": "string" },
+                                    "recipient": { "type": "string" },
+                                    "body": { "type": "string" },
+                                    "createdAt": { "type": "string" },
+                                    "acknowledged": { "type": "boolean" }
+                                }
+                            }},
+                            "purgedAt": { "type": "string", "description": "Present iff the caller's view was purged or expired." },
+                            "purgeReason": { "type": "string", "enum": ["client", "expired"] }
+                        }
+                    }}}
+                },
+                "400": {
+                    "description": "Validation error (missing or invalid messageBox).",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+                },
+                "403": {
+                    "description": "ERR_BOX_NOT_RETAINED — the box type is not in this deployment's retained class.",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+                },
+                "500": {
+                    "description": "Internal server error.",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+                }
+            }
+        }
+    })
+}
+
+fn path_purge_transcript() -> Value {
+    json!({
+        "post": {
+            "summary": "[RUST-ONLY EXTENSION] Purge the caller's retained rows of a message box",
+            "description": "**Not available on TS or Go reference servers.** Deletes every retained message the caller RECEIVED in the given box type (its own mailbox rows — a sender can never retract messages it delivered to a counterparty) and records a tombstone so later transcript reads can distinguish 'purged' from 'never existed'. Only participants of the box (owner, sender, or recipient of at least one message) may purge; only boxes in the retained class (`RETAIN_BOX_PREFIXES`) are purgeable. Idempotent. A TTL backstop sweep (default 14 days, `RETAIN_TTL_DAYS`) expires abandoned retained boxes regardless.",
+            "operationId": "purgeTranscript",
+            "tags": ["Messages"],
+            "security": [{ "BRC31Auth": [] }],
+            "requestBody": {
+                "required": true,
+                "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ListMessagesRequest" } } }
+            },
+            "responses": {
+                "200": {
+                    "description": "Purge applied (deleted may be 0 on a repeat purge).",
+                    "content": { "application/json": { "schema": {
+                        "type": "object",
+                        "required": ["status", "messageBox", "deleted"],
+                        "properties": {
+                            "status": { "type": "string", "enum": ["success"] },
+                            "messageBox": { "type": "string" },
+                            "deleted": { "type": "integer" }
+                        }
+                    }}}
+                },
+                "400": {
+                    "description": "Validation error (missing or invalid messageBox).",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+                },
+                "403": {
+                    "description": "ERR_BOX_NOT_RETAINED or ERR_NOT_PARTICIPANT.",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+                },
+                "500": {
+                    "description": "Internal server error.",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+                }
+            }
+        }
+    })
 }
 
 fn path_beef_upload_url() -> Value {
@@ -913,7 +1012,7 @@ mod tests {
     fn spec_is_valid_json() {
         let spec = openapi_spec();
         assert_eq!(spec["openapi"], "3.0.3");
-        assert_eq!(spec["info"]["title"], "bsv-messagebox-cloudflare");
+        assert_eq!(spec["info"]["title"], "rust-message-box");
     }
 
     #[test]
@@ -932,6 +1031,8 @@ mod tests {
             "/registerDevice",
             "/devices",
             "/beef/upload-url",
+            "/listTranscript",
+            "/purgeTranscript",
         ];
         for path in &expected {
             assert!(paths.contains_key(*path), "Missing path: {}", path);
@@ -961,6 +1062,8 @@ mod tests {
             ("/registerDevice", "post"),
             ("/devices", "get"),
             ("/beef/upload-url", "post"),
+            ("/listTranscript", "post"),
+            ("/purgeTranscript", "post"),
         ];
         for (path, method) in auth_paths {
             let endpoint = &spec["paths"][path][method];

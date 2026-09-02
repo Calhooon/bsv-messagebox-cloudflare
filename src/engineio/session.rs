@@ -70,6 +70,12 @@ const POLLING_TICK_MS: u64 = 25;
 /// our handshake without tweaks.
 const PING_INTERVAL_MS: u64 = 25_000;
 const PING_TIMEOUT_MS: u64 = 20_000;
+// The server heartbeat ticks every `PING_INTERVAL_MS`; a ping unanswered
+// for `PING_TIMEOUT_MS` is judged dead at the very next tick, and the tick
+// always lands before the CLIENT's own `pingInterval + pingTimeout` silence
+// deadline — both hold by construction, pinned at compile time.
+const _: () = assert!(PING_INTERVAL_MS > PING_TIMEOUT_MS); // the cadence judges an unanswered ping at the next tick
+const _: () = assert!(PING_INTERVAL_MS < PING_INTERVAL_MS + PING_TIMEOUT_MS); // the tick lands before the client's silence deadline
 const MAX_PAYLOAD: u64 = 1_000_000;
 
 /// Active transport for this session.
@@ -135,6 +141,8 @@ struct SessionState {
     /// guarantees the client has fully processed our InitialResponse
     /// (otherwise it couldn't have sent the General in the first place).
     authenticated_emitted: bool,
+    /// See `WsAttachment::awaiting_pong_since_ms`.
+    awaiting_pong_since_ms: Option<u64>,
 }
 
 impl SessionState {
@@ -148,6 +156,7 @@ impl SessionState {
             auth: SessionAuthState::default(),
             joined_rooms: Vec::new(),
             authenticated_emitted: false,
+            awaiting_pong_since_ms: None,
         }
     }
 
@@ -166,6 +175,7 @@ impl SessionState {
             auth: att.auth.clone(),
             joined_rooms: att.joined_rooms.clone(),
             authenticated_emitted: att.authenticated_emitted,
+            awaiting_pong_since_ms: att.awaiting_pong_since_ms,
         }
     }
 
@@ -180,6 +190,7 @@ impl SessionState {
             auth: self.auth.clone(),
             joined_rooms: self.joined_rooms.clone(),
             authenticated_emitted: self.authenticated_emitted,
+            awaiting_pong_since_ms: self.awaiting_pong_since_ms,
         }
     }
 
@@ -238,6 +249,12 @@ struct WsAttachment {
     joined_rooms: Vec<String>,
     #[serde(default)]
     authenticated_emitted: bool,
+    /// Engine.IO v4 SERVER heartbeat (2026-09-02): when the last server
+    /// `2` ping went out and is still unanswered (`None` once the client's
+    /// `3` arrives). Lives in the attachment so a hibernated DO's alarm can
+    /// judge the socket without `inner`.
+    #[serde(default)]
+    awaiting_pong_since_ms: Option<u64>,
 }
 
 /// Body for `/internal/socketio-broadcast` (Phase C). Posted by the
@@ -254,6 +271,11 @@ struct BroadcastBody {
     sender: String,
     message_id: String,
     body: Value,
+    /// Socket.io event to emit (#40): defaults to `sendMessage` (the
+    /// original broadcast shape). The hub sets `peerLeft` for presence
+    /// fan-out; `authsocket_event_name` room-suffixes it the same way.
+    #[serde(default)]
+    event: Option<String>,
 }
 
 /// One outbound socket.io event the EngineIoSession should encode as a
@@ -288,6 +310,76 @@ pub struct EngineIoSession {
     /// Node server behavior: a server restart drops live sessions and
     /// the client reconnects with a fresh sid.
     inner: RefCell<Option<SessionState>>,
+}
+
+/// What the server heartbeat does on one alarm tick for one upgraded socket.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum HeartbeatAction {
+    /// Send `2`; the client owes a `3` within `PING_TIMEOUT_MS`.
+    Ping,
+    /// The previous `2` is still unanswered past `PING_TIMEOUT_MS` — the
+    /// peer is gone; close so the client (or its absence) is honest.
+    Close,
+}
+
+/// Engine.IO v4 puts the heartbeat on the SERVER: it sends `2` every
+/// `pingInterval` and the client answers `3`; a client that hears no ping
+/// for `pingInterval + pingTimeout` closes the transport ("ping timeout")
+/// and reconnects — through polling, then a fresh upgrade. Before 2026-09-02
+/// this DO advertised the interval in its handshake and never pinged, so
+/// every browser socket died 45 s after its upgrade: a polling burst, a
+/// BRC-103 re-auth and a re-upgrade every 45 s, all hand long (LOW's
+/// survivor census: 354 socket.io long-poll requests in 37 min for ONE
+/// idle seat; D4's http-first whole hand). This is the pure schedule the
+/// alarm runs; it is tested below.
+fn heartbeat_on_alarm(
+    now_ms: u64,
+    awaiting_pong_since_ms: Option<u64>,
+    timeout_ms: u64,
+) -> HeartbeatAction {
+    match awaiting_pong_since_ms {
+        Some(since) if now_ms.saturating_sub(since) >= timeout_ms => HeartbeatAction::Close,
+        _ => HeartbeatAction::Ping,
+    }
+}
+
+impl EngineIoSession {
+    /// Arm (or re-arm) the heartbeat alarm one `PING_INTERVAL_MS` out. The
+    /// heartbeat is this DO's only alarm, so replacing is always right.
+    async fn arm_heartbeat_alarm(&self) {
+        if let Err(e) = self
+            .state
+            .storage()
+            .set_alarm(Duration::from_millis(PING_INTERVAL_MS))
+            .await
+        {
+            console_log!("EngineIoSession: heartbeat set_alarm failed: {e}");
+        }
+    }
+
+    /// Drop the alarm once no socket is attached (a hibernated DO with no
+    /// sockets must not keep waking).
+    async fn disarm_heartbeat_if_idle(&self) {
+        if self.state.get_websockets().is_empty() {
+            let _ = self.state.storage().delete_alarm().await;
+        }
+    }
+
+    /// The client's `3`: the socket is alive; clear the pending ping on the
+    /// socket's attachment (the hibernation truth) and on `inner`.
+    fn note_pong(&self, ws: Option<&WebSocket>) {
+        if let Some(state) = self.inner.borrow_mut().as_mut() {
+            state.awaiting_pong_since_ms = None;
+        }
+        if let Some(socket) = ws {
+            if let Ok(Some(mut att)) = socket.deserialize_attachment::<WsAttachment>() {
+                att.awaiting_pong_since_ms = None;
+                if let Err(e) = socket.serialize_attachment(&att) {
+                    console_log!("EngineIoSession: pong attachment persist failed: {e}");
+                }
+            }
+        }
+    }
 }
 
 impl DurableObject for EngineIoSession {
@@ -414,31 +506,88 @@ impl DurableObject for EngineIoSession {
         reason: String,
         _was_clean: bool,
     ) -> Result<()> {
-        // If the DO was hibernated, rehydrate from the WS attachment
-        // first so `unregister_with_message_hub` can read the
-        // identity_key + sid. Otherwise we'd post a no-op unregister
-        // and leak the registry entry on the per-identity MessageHub.
-        if self.inner.borrow().is_none() {
-            if let Ok(Some(att)) = ws.deserialize_attachment::<WsAttachment>() {
-                if !att.sid.is_empty() {
-                    *self.inner.borrow_mut() = Some(SessionState::from_attachment(&att));
-                }
-            }
-        }
-        if let Some(state) = self.inner.borrow_mut().as_mut() {
-            state.closed = true;
-        }
-        // Drop the registry entry on the per-identity MessageHub so
-        // future broadcast fan-outs skip this dead session.
-        self.unregister_with_message_hub().await;
+        self.teardown_ws_transport(&ws).await;
         let mirror_code = u16::try_from(code).ok().filter(|c| *c >= 1000);
         let _ = ws.close(mirror_code.or(Some(1000)), Some(reason.as_str()));
+        self.disarm_heartbeat_if_idle().await;
         Ok(())
     }
 
-    async fn websocket_error(&self, _ws: WebSocket, error: Error) -> Result<()> {
+    async fn websocket_error(&self, ws: WebSocket, error: Error) -> Result<()> {
         console_log!("EngineIoSession: WS error: {error}");
+        // #225: an ABRUPT drop (network death, killed tab, TCP reset) can
+        // surface here instead of — or as well as — `websocket_close`.
+        // Before this handler ran the teardown, an error-only drop left
+        // the `socketio_sub:<sid>` registry entry on the per-identity
+        // MessageHub alive forever: `/presence` kept reporting
+        // `present:true` AND no `peerLeft` ever reached the room peer
+        // (the 2026-07-21 LOW incident shape — a mid-hand tab close the
+        // staying player never heard about). Run the exact same teardown
+        // as a graceful close; it is idempotent across a close+error
+        // double-fire (the hub deletes the registry entry on the first
+        // unregister, so the second finds no memberships to notify).
+        // Best-effort mirror-close so the runtime fully releases the
+        // socket; errors ignored (the socket is usually already gone).
+        self.teardown_ws_transport(&ws).await;
+        let _ = ws.close(Some(1000), Some("error"));
         Ok(())
+    }
+
+    /// The Engine.IO server heartbeat tick (see `heartbeat_on_alarm`). Runs
+    /// from the WebSocket attachments so it is correct after hibernation;
+    /// re-arms itself while any upgraded socket is attached.
+    async fn alarm(&self) -> Result<Response> {
+        let sockets = self.state.get_websockets();
+        let now = Date::now().as_millis();
+        let mut any_attached = false;
+        for ws in sockets {
+            let Ok(Some(mut att)) = ws.deserialize_attachment::<WsAttachment>() else {
+                continue;
+            };
+            if att.sid.is_empty() {
+                continue;
+            }
+            any_attached = true;
+            if !matches!(att.transport, Transport::WebSocket) {
+                continue; // still upgrading: the polling side carries liveness until `5`
+            }
+            match heartbeat_on_alarm(now, att.awaiting_pong_since_ms, PING_TIMEOUT_MS) {
+                HeartbeatAction::Close => {
+                    console_log!(
+                        "EngineIoSession: heartbeat — no pong within {PING_TIMEOUT_MS} ms, closing sid={}",
+                        att.sid
+                    );
+                    let _ = ws.close(Some(1000), Some("ping timeout"));
+                }
+                HeartbeatAction::Ping => {
+                    let ping = EngineIoPacket::Ping(String::new()).encode();
+                    match ws.send_with_str(&ping) {
+                        Ok(()) => {
+                            att.awaiting_pong_since_ms = Some(now);
+                            if let Err(e) = ws.serialize_attachment(&att) {
+                                console_log!(
+                                    "EngineIoSession: heartbeat attachment persist failed: {e}"
+                                );
+                            }
+                            if let Some(state) = self.inner.borrow_mut().as_mut() {
+                                state.awaiting_pong_since_ms = Some(now);
+                            }
+                        }
+                        Err(e) => {
+                            console_log!(
+                                "EngineIoSession: heartbeat ping send failed ({e}), closing sid={}",
+                                att.sid
+                            );
+                            let _ = ws.close(Some(1000), Some("ping send failed"));
+                        }
+                    }
+                }
+            }
+        }
+        if any_attached {
+            self.arm_heartbeat_alarm().await;
+        }
+        Response::ok("heartbeat")
     }
 }
 
@@ -707,10 +856,7 @@ impl EngineIoSession {
                 self.send_or_enqueue(pong, ws_for_response);
             }
             EngineIoPacket::Pong(_) => {
-                // Bare pong ack — nothing to do. The auto-response pair
-                // configured for hibernatable WS handles the heartbeat
-                // path normally; this branch covers a manual pong from
-                // a non-hibernated WS or polling.
+                self.note_pong(ws_for_response);
             }
             EngineIoPacket::Message(payload) => {
                 self.dispatch_socketio(&payload, ws_for_response).await;
@@ -734,8 +880,13 @@ impl EngineIoSession {
                 );
                 if let Some(state) = self.inner.borrow_mut().as_mut() {
                     state.transport = Transport::WebSocket;
+                    state.awaiting_pong_since_ms = None;
                 }
                 self.persist_to_ws_attachment();
+                // The server heartbeat starts with the upgrade (Engine.IO v4:
+                // the SERVER pings). Without it the client times out at
+                // pingInterval + pingTimeout and falls back to polling.
+                self.arm_heartbeat_alarm().await;
             }
             EngineIoPacket::Noop => {
                 // Server-only; ignore from client.
@@ -1211,37 +1362,73 @@ impl EngineIoSession {
         })
         .to_string();
 
-        let headers = Headers::new();
-        if headers.set("content-type", "application/json").is_err() {
-            return Vec::new();
-        }
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post)
-            .with_headers(headers)
-            .with_body(Some(payload.into()));
-        let req = match Request::new_with_init("https://do.local/internal/socketio-event", &init) {
-            Ok(r) => r,
-            Err(e) => {
-                console_error!("EngineIoSession: request build failed: {e}");
-                return Vec::new();
+        // bsv-low#249 (ack-reliability): the DO→MessageHub forward used to be an
+        // UNBOUNDED `stub.fetch_with_request(req).await`. When the target
+        // per-identity MessageHub DO was momentarily cold/evicted/relocating, the
+        // subrequest stalled past the client's fixed 10 000ms WS-ack timeout — so
+        // no `sendMessageAck-<room>` reached the sender, `sendLiveMessage` fell
+        // back to HTTP, and a FRESH send (`shuffle_pass #1`) fast-stored via the
+        // hop-less HTTP path (the `relay.send ok 10597ms` evidence). Bound each
+        // attempt with a `Delay` race + one retry: a stalled first attempt is
+        // abandoned in FORWARD_OP_TIMEOUT_MS and a fresh subrequest usually hits a
+        // warm instance and acks sub-second (well inside the client's budget). The
+        // insert is idempotent on a UNIQUE messageId, so a dropped-but-landed
+        // first attempt converges to a duplicate-ack on retry — money-safe, at-
+        // least-once, one ack per frame. See `hub_forward` for the full rationale.
+        crate::hub_forward::run_forward_with_retry(|attempt_idx| {
+            let stub = &stub;
+            let payload = payload.clone();
+            async move {
+                let headers = Headers::new();
+                if headers.set("content-type", "application/json").is_err() {
+                    return None;
+                }
+                let mut init = RequestInit::new();
+                init.with_method(Method::Post)
+                    .with_headers(headers)
+                    .with_body(Some(payload.into()));
+                let req = match Request::new_with_init(
+                    "https://do.local/internal/socketio-event",
+                    &init,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        console_error!("EngineIoSession: request build failed: {e}");
+                        return None;
+                    }
+                };
+                let t0 = Date::now().as_millis();
+                // Bound the fetch AND the body read together — a slow body drain
+                // stalls just as effectively as a slow connect.
+                let result = crate::hub_forward::with_do_op_timeout(
+                    async {
+                        let mut resp = stub.fetch_with_request(req).await?;
+                        resp.json::<HubEventResponse>().await
+                    },
+                    crate::hub_forward::FORWARD_OP_TIMEOUT_MS,
+                )
+                .await;
+                let dt = Date::now().as_millis().saturating_sub(t0);
+                match result {
+                    Ok(body) => {
+                        console_log!(
+                            "TRACE_LAT ws.forward attempt={attempt_idx} outcome=ok ms={dt}"
+                        );
+                        Some(body.outbound)
+                    }
+                    Err(e) => {
+                        // Timeout or fetch/JSON error — retryable. The loop tries a
+                        // fresh subrequest; if the bound is exhausted it returns no
+                        // events and the client's HTTP fallback is the safety net.
+                        console_log!(
+                            "TRACE_LAT ws.forward attempt={attempt_idx} outcome=retryable ms={dt} err={e}"
+                        );
+                        None
+                    }
+                }
             }
-        };
-
-        let mut resp = match stub.fetch_with_request(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                console_log!("EngineIoSession: socketio-event fetch failed: {e}");
-                return Vec::new();
-            }
-        };
-        let body: HubEventResponse = match resp.json().await {
-            Ok(b) => b,
-            Err(e) => {
-                console_log!("EngineIoSession: socketio-event response JSON: {e}");
-                return Vec::new();
-            }
-        };
-        body.outbound
+        })
+        .await
     }
 
     /// Register this sid with the per-identity MessageHub so that any
@@ -1262,6 +1449,35 @@ impl EngineIoSession {
         }
         self.post_registration(identity_key, &sid, /*register=*/ true)
             .await;
+    }
+
+    /// Shared teardown for the session's WS transport ending — BOTH
+    /// lifecycle ends land here: graceful close (`websocket_close`) and
+    /// abrupt error (`websocket_error`, #225). If the DO was hibernated,
+    /// rehydrate from the WS attachment first so
+    /// `unregister_with_message_hub` can read the identity_key + sid —
+    /// otherwise we'd post a no-op unregister and leak the registry
+    /// entry on the per-identity MessageHub. Then mark the session
+    /// closed and unregister; the hub's unregister handler is what fans
+    /// `peerLeft` out to the room peer, stamps the final
+    /// `lastseen:<room>`, and clears `present`. Idempotent across a
+    /// close+error double-fire: the hub deletes the registry entry on
+    /// the first unregister, so the second finds no memberships and
+    /// emits nothing.
+    async fn teardown_ws_transport(&self, ws: &WebSocket) {
+        if self.inner.borrow().is_none() {
+            if let Ok(Some(att)) = ws.deserialize_attachment::<WsAttachment>() {
+                if !att.sid.is_empty() {
+                    *self.inner.borrow_mut() = Some(SessionState::from_attachment(&att));
+                }
+            }
+        }
+        if let Some(state) = self.inner.borrow_mut().as_mut() {
+            state.closed = true;
+        }
+        // Drop the registry entry on the per-identity MessageHub so
+        // future broadcast fan-outs skip this dead session.
+        self.unregister_with_message_hub().await;
     }
 
     /// Inverse of `register_with_message_hub` — called on close /
@@ -1448,7 +1664,10 @@ impl EngineIoSession {
         };
 
         let ev = OutboundSocketIoEvent {
-            event_name: "sendMessage".to_string(),
+            // #40: the hub names the event (peer-presence fan-out reuses this
+            // route with `event:"peerLeft"`); absent = the original
+            // `sendMessage` broadcast shape.
+            event_name: body.event.as_deref().unwrap_or("sendMessage").to_string(),
             data: json!({
                 "roomId": body.room_id,
                 "sender": body.sender,
@@ -1572,7 +1791,10 @@ pub fn open_handshake_packet(sid: &str) -> EngineIoPacket {
 /// Raw WS clients keep the flat name + data.roomId convention from the
 /// M9 #43 spec — that path doesn't go through this function.
 fn authsocket_event_name(name: &str, data: &Value) -> String {
-    if matches!(name, "sendMessage" | "sendMessageAck") {
+    // `peerLeft` (#40) follows the same room-suffixed convention so a
+    // client can `socket.on('peerLeft-<roomId>')` alongside its
+    // `sendMessage-<roomId>` subscription.
+    if matches!(name, "sendMessage" | "sendMessageAck" | "peerLeft") {
         if let Some(room_id) = data.get("roomId").and_then(|v| v.as_str()) {
             return format!("{name}-{room_id}");
         }
@@ -1639,6 +1861,56 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_pings_when_nothing_is_pending_and_closes_only_past_the_timeout() {
+        // fresh socket: ping
+        assert_eq!(
+            heartbeat_on_alarm(1_000_000, None, PING_TIMEOUT_MS),
+            HeartbeatAction::Ping
+        );
+        // a ping answered (cleared) before the next tick: ping again
+        assert_eq!(
+            heartbeat_on_alarm(1_025_000, None, PING_TIMEOUT_MS),
+            HeartbeatAction::Ping
+        );
+        // unanswered but inside the timeout: keep waiting (ping again, never close early)
+        assert_eq!(
+            heartbeat_on_alarm(1_019_999, Some(1_000_000), PING_TIMEOUT_MS),
+            HeartbeatAction::Ping
+        );
+        // unanswered past the timeout: close
+        assert_eq!(
+            heartbeat_on_alarm(1_020_000, Some(1_000_000), PING_TIMEOUT_MS),
+            HeartbeatAction::Close
+        );
+        // the alarm cadence (25 s) is longer than the timeout (20 s) — a
+        // compile-time invariant (`HEARTBEAT_CADENCE_JUDGES_AT_NEXT_TICK`):
+        // an unanswered ping is ALWAYS judged closed at the very next tick
+        assert_eq!(
+            heartbeat_on_alarm(
+                1_000_000 + PING_INTERVAL_MS,
+                Some(1_000_000),
+                PING_TIMEOUT_MS
+            ),
+            HeartbeatAction::Close
+        );
+        // clock skew backwards never closes
+        assert_eq!(
+            heartbeat_on_alarm(999_000, Some(1_000_000), PING_TIMEOUT_MS),
+            HeartbeatAction::Ping
+        );
+    }
+
+    #[test]
+    fn an_old_attachment_without_the_heartbeat_field_still_deserializes() {
+        let v: WsAttachment = serde_json::from_str(r#"{"sid":"abc","connected":true}"#).unwrap();
+        assert_eq!(v.sid, "abc");
+        assert!(v.awaiting_pong_since_ms.is_none());
+        let s = SessionState::from_attachment(&v);
+        assert!(s.awaiting_pong_since_ms.is_none());
+        assert!(s.to_attachment().awaiting_pong_since_ms.is_none());
+    }
+
+    #[test]
     fn make_session_id_is_unique_and_url_safe() {
         let a = make_session_id();
         let b = make_session_id();
@@ -1648,5 +1920,33 @@ mod tests {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
         assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn authsocket_event_name_suffixes_peer_left() {
+        // #40: peerLeft follows the room-suffixed convention so clients can
+        // socket.on('peerLeft-<roomId>') like their sendMessage subscription.
+        let data = serde_json::json!({"roomId": "02aa-low_game_x"});
+        assert_eq!(
+            authsocket_event_name("peerLeft", &data),
+            "peerLeft-02aa-low_game_x"
+        );
+        // no roomId → flat name (defensive)
+        assert_eq!(
+            authsocket_event_name("peerLeft", &serde_json::json!({})),
+            "peerLeft"
+        );
+    }
+
+    #[test]
+    fn broadcast_body_event_defaults_to_none() {
+        // Absent `event` = the original sendMessage broadcast shape — the
+        // hub's existing pushes stay wire-compatible.
+        let raw = r#"{"roomId":"r","sender":"s","messageId":"m","body":{}}"#;
+        let b: BroadcastBody = serde_json::from_str(raw).unwrap();
+        assert!(b.event.is_none());
+        let raw2 = r#"{"roomId":"r","sender":"s","messageId":"m","body":{},"event":"peerLeft"}"#;
+        let b2: BroadcastBody = serde_json::from_str(raw2).unwrap();
+        assert_eq!(b2.event.as_deref(), Some("peerLeft"));
     }
 }

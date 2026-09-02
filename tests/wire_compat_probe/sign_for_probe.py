@@ -2,7 +2,7 @@
 """M9 #52 aggressive-probe helper.
 
 Produces real BRC-31 signed headers for an arbitrary GET URL on the
-local bsv-messagebox-cloudflare Worker, prints them as JSON on stdout. Used by
+local rust-message-box Worker, prints them as JSON on stdout. Used by
 probe-aggressive.mjs to stuff the headers into socket.io's
 `extraHeaders` so we can ask: 'what happens if a TS client somehow
 manages to attach valid BRC-31 auth to its socket.io polling probe?'

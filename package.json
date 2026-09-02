@@ -1,12 +1,13 @@
 {
-  "name": "bsv-messagebox-cloudflare",
+  "name": "rust-message-box",
   "private": true,
   "scripts": {
     "dev": "npx wrangler dev",
     "deploy": "npx wrangler deploy",
     "test": "cargo test 2>&1",
-    "migrate": "npx wrangler d1 migrations apply bsv-messagebox-cloudflare-prod",
-    "migrate:local": "npx wrangler d1 migrations apply bsv-messagebox-cloudflare-prod --local"
+    "migrate": "npx wrangler d1 migrations apply rust-message-box-prod",
+    "migrate:local": "npx wrangler d1 migrations apply rust-message-box-prod --local",
+    "migrate:low": "npx wrangler d1 migrations apply low-relay-prod -c wrangler.low.toml --remote"
   },
   "devDependencies": {
     "@bsv/authsocket-client": "^2.0.2",

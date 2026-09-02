@@ -1,4 +1,4 @@
-# bsv-messagebox-cloudflare
+# rust-message-box
 
 BSV peer-to-peer messaging service on Cloudflare Workers. Rust compiled to WASM.
 Port of the Node.js [`message-box-server`](https://github.com/bsv-blockchain/message-box-server)
@@ -26,8 +26,8 @@ worker-build --release   # Build WASM
 npm run deploy           # Deploy
 
 # D1 migrations
-npx wrangler d1 migrations apply bsv-messagebox-cloudflare-prod          # remote
-npx wrangler d1 migrations apply bsv-messagebox-cloudflare-prod --local  # local
+npx wrangler d1 migrations apply rust-message-box-prod          # remote
+npx wrangler d1 migrations apply rust-message-box-prod --local  # local
 ```
 
 Build target: `wasm32-unknown-unknown`. Output: `build/worker/shim.mjs`.
@@ -100,7 +100,7 @@ WS Upgrade   → lib.rs (/ws) → BRC-31 auth on upgrade
 - **fcm_jwt.rs / fcm_token.rs / fcm_cache.rs** — the JWT → OAuth2 → KV cache
   pipeline. Pure-Rust: `rsa 0.9` + `sha2` + `pkcs8` compile clean to wasm32.
 - **validation.rs** — Request body shape + field checks, returns structured errors.
-- **d1.rs** — Parameterized D1 query builder.
+- **d1.rs** — Parameterized D1 query builder (shared pattern from rust-wallet-infra).
 - **types.rs** — Shared request/response types.
 - **api_docs.rs** — OpenAPI 3.0 spec served at `/api-docs`.
 
@@ -312,9 +312,9 @@ If ANY gate fails, you fix it before moving on. No exceptions.
 
 ## Sibling Dependencies
 
-crates.io deps:
-- [`bsv-rs`](https://crates.io/crates/bsv-rs) — BSV primitives. Source: [`Calhooon/bsv-rs`](https://github.com/Calhooon/bsv-rs).
-- [`bsv-middleware-cloudflare`](https://crates.io/crates/bsv-middleware-cloudflare) — BRC-31 middleware for Workers. Source: [`Calhooon/bsv-middleware-cloudflare`](https://github.com/Calhooon/bsv-middleware-cloudflare).
+Path deps (not yet on crates.io / public):
+- `../bsv-rs` — BSV primitives (`bsv-rs` crate on GitHub)
+- `../rust-middleware/bsv-middleware-cloudflare` — BRC-31 middleware for Workers
 
 External services:
 - `WALLET_STORAGE_URL` → wallet service with `internalizeAction` endpoint
@@ -324,8 +324,14 @@ External services:
 
 | What | Where |
 |---|---|
-| Original TS server | [`bsv-blockchain/message-box-server`](https://github.com/bsv-blockchain/message-box-server) |
-| Go reference port | [`bsv-blockchain/go-messagebox-server`](https://github.com/bsv-blockchain/go-messagebox-server) |
-| BSV primitives (Rust) | [`Calhooon/bsv-rs`](https://github.com/Calhooon/bsv-rs) (crates.io: [`bsv-rs`](https://crates.io/crates/bsv-rs)) |
-| TS client | [`@bsv/message-box-client`](https://github.com/bsv-blockchain/message-box-client) |
-| TS auth-socket client | [`@bsv/authsocket-client`](https://github.com/bsv-blockchain/authsocket-client) |
+| Original TS server | `~/bsv/message-box-server/` |
+| BRC-31 auth middleware | `~/bsv/rust-middleware/bsv-middleware-cloudflare/` |
+| BSV primitives | `~/bsv/bsv-rs/` |
+| D1 query builder pattern | `~/bsv/rust-wallet-infra/src/d1/` |
+| CF Worker pattern | `~/bsv/rust-chaintracks/src/lib.rs` |
+
+## Consumers
+
+- MetaNet Client wallet — paid notifications, paywalled mailbox
+- `bsv-worm` — reliable delivery with retry
+- `LobsterFarm` — coordination via FCM push and polling
