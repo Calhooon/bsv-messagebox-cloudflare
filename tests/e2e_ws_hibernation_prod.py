@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """M9 #50 — hibernation observation against deployed prod.
 
@@ -57,8 +58,8 @@ except ImportError as e:
     sys.exit(1)
 
 
-PROD_HTTP = "https://rust-message-box.dev-a3e.workers.dev"
-PROD_WS = "wss://rust-message-box.dev-a3e.workers.dev/ws"
+PROD_HTTP = os.environ.get("PROD_URL", "https://<your-relay>.workers.dev")
+PROD_WS = PROD_HTTP.replace("https://", "wss://") + "/ws"
 RECV_TIMEOUT_S = 10.0  # generous for prod
 DEFAULT_IDLE_S = 60.0  # > 30 s threshold; should engage hibernation
 

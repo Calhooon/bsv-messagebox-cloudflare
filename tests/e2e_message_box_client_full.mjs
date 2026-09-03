@@ -44,7 +44,7 @@
  *
  * RUNS AGAINST:
  *   1. Local wrangler dev (http://localhost:8787) — full Phase A+B+C code path
- *   2. Deployed prod (https://rust-message-box.dev-a3e.workers.dev)
+ *   2. Deployed prod (PROD_URL from the environment)
  *
  * IMPORTANT — PROD CAVEAT (per orchestrator hint):
  *   The deployed prod (commit f85e0bb) is still on M9 head; Phase A/B/C
@@ -74,7 +74,7 @@ import https from "node:https";
 
 const LOCAL_HOST = process.env.LOCAL_URL || "http://localhost:8787";
 const PROD_HOST =
-  process.env.PROD_URL || "https://rust-message-box.dev-a3e.workers.dev";
+  process.env.PROD_URL || "https://<your-relay>.workers.dev";
 
 const STEP_TIMEOUT_MS = 30_000;
 const RECV_TIMEOUT_MS = 8_000;

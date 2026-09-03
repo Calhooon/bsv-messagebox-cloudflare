@@ -4,6 +4,12 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.3 — 2026-09-03
+
+### Public-tree hygiene
+- The e2e/probe test targets read the deployed relay URL from `PROD_URL`; no account host
+  is named anywhere in the tree (the public mirror must never carry deployment identifiers).
+
 ## 0.3.2 — 2026-09-03
 
 ### Broadcast subscriptions live as long as their socket
