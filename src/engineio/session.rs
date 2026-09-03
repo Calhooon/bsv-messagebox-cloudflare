@@ -143,6 +143,13 @@ struct SessionState {
     authenticated_emitted: bool,
     /// See `WsAttachment::awaiting_pong_since_ms`.
     awaiting_pong_since_ms: Option<u64>,
+    /// See `WsAttachment::pings_since_registry_refresh`. Carried here so
+    /// `to_attachment()` (run on every persisted mutation, e.g. each pong)
+    /// preserves the heartbeat's count instead of resetting it — LOW run 10
+    /// (2026-09-03): a hard `0` here meant the registry entry was never
+    /// refreshed and every broadcast subscriber went deaf 30 min after its
+    /// last join while its socket kept answering pings.
+    pings_since_registry_refresh: u32,
 }
 
 impl SessionState {
@@ -157,6 +164,7 @@ impl SessionState {
             joined_rooms: Vec::new(),
             authenticated_emitted: false,
             awaiting_pong_since_ms: None,
+            pings_since_registry_refresh: 0,
         }
     }
 
@@ -176,6 +184,7 @@ impl SessionState {
             joined_rooms: att.joined_rooms.clone(),
             authenticated_emitted: att.authenticated_emitted,
             awaiting_pong_since_ms: att.awaiting_pong_since_ms,
+            pings_since_registry_refresh: att.pings_since_registry_refresh,
         }
     }
 
@@ -191,7 +200,14 @@ impl SessionState {
             joined_rooms: self.joined_rooms.clone(),
             authenticated_emitted: self.authenticated_emitted,
             awaiting_pong_since_ms: self.awaiting_pong_since_ms,
-            pings_since_registry_refresh: 0,
+            // LOW run 10 (2026-09-03): this was a hard `0`. Every pong
+            // re-persists the attachment through here, so the heartbeat's
+            // counter was reset before it could ever reach
+            // REFRESH_EVERY_PINGS — the registry entry was NEVER refreshed
+            // and every broadcast subscriber went deaf exactly 30 min after
+            // its last join (a live, ping-answering socket that received
+            // nothing). The counter is session state like the rest.
+            pings_since_registry_refresh: self.pings_since_registry_refresh,
         }
     }
 
@@ -602,6 +618,10 @@ impl DurableObject for EngineIoSession {
                             }
                             if let Some(state) = self.inner.borrow_mut().as_mut() {
                                 state.awaiting_pong_since_ms = Some(now);
+                                // Keep the in-memory copy in step: the next
+                                // `to_attachment()` (any persisted mutation,
+                                // e.g. the pong) must not clobber the count.
+                                state.pings_since_registry_refresh = att.pings_since_registry_refresh;
                             }
                         }
                         Err(e) => {
@@ -1963,6 +1983,29 @@ mod tests {
         let s = SessionState::from_attachment(&v);
         assert!(s.awaiting_pong_since_ms.is_none());
         assert!(s.to_attachment().awaiting_pong_since_ms.is_none());
+    }
+
+    /// LOW run 10 (2026-09-03): the heartbeat's registry-refresh counter must
+    /// SURVIVE the round trip every persisted mutation makes — the pong
+    /// handler rehydrates `SessionState` from the attachment and writes it
+    /// back through `to_attachment()`. A hard `0` there reset the count on
+    /// every pong, so `REFRESH_EVERY_PINGS` was never reached, the registry
+    /// entry was never refreshed, and a live socket went deaf to every
+    /// broadcast 30 minutes after its last join (seat A missed blocks 965143
+    /// and 965144 while answering every ping).
+    #[test]
+    fn the_registry_refresh_counter_survives_the_attachment_round_trip() {
+        let v: WsAttachment = serde_json::from_str(
+            r#"{"sid":"abc","connected":true,"joined_rooms":["02aa-broadcast-low-tip"],"pings_since_registry_refresh":5}"#,
+        )
+        .unwrap();
+        let s = SessionState::from_attachment(&v);
+        assert_eq!(s.pings_since_registry_refresh, 5);
+        assert_eq!(s.to_attachment().pings_since_registry_refresh, 5, "a pong must not reset the count");
+        // A fresh session starts at 0 and an old attachment without the field reads 0.
+        assert_eq!(SessionState::new("x".into()).to_attachment().pings_since_registry_refresh, 0);
+        let old: WsAttachment = serde_json::from_str(r#"{"sid":"abc"}"#).unwrap();
+        assert_eq!(SessionState::from_attachment(&old).pings_since_registry_refresh, 0);
     }
 
     #[test]

@@ -4,6 +4,17 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.5 — 2026-09-03
+
+### Broadcast subscribers no longer go deaf after 30 minutes
+- The heartbeat's registry-refresh counter (`pings_since_registry_refresh`) is now
+  carried in the session state, so the attachment re-persisted on every pong keeps
+  it. It was written back as a hard `0`, so the count never reached
+  `REFRESH_EVERY_PINGS`, the registry entry was never refreshed, and a live socket
+  holding `broadcast-*` rooms stopped receiving broadcasts exactly 30 minutes after
+  its last join while still answering every ping (LOW run 10: a seat missed two
+  block announcements). Pinned by a round-trip unit test.
+
 ## 0.3.4 — 2026-09-03
 
 ### Public-tree hygiene, enforced
