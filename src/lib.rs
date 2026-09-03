@@ -172,7 +172,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         }
         let mut req = req;
         let raw = req.bytes().await?;
-        let (sender, send_body) = match split_push_body(&raw) {
+        let (sender, send_body) = match split_push_body(&raw, Date::now().as_millis()) {
             Ok(x) => x,
             Err(reason) => return Response::error(reason, 400),
         };
@@ -940,7 +940,7 @@ async fn route_socketio_request(mut req: Request, env: &Env, ctx: &Context) -> R
 /// pubkey hex) and the remaining `/sendMessage`-shaped JSON (re-serialized
 /// without `sender`, so the reference validator sees exactly what an authed
 /// client would have sent).
-fn split_push_body(raw: &[u8]) -> std::result::Result<(String, Vec<u8>), String> {
+fn split_push_body(raw: &[u8], now_ms: u64) -> std::result::Result<(String, Vec<u8>), String> {
     let mut v: serde_json::Value =
         serde_json::from_slice(raw).map_err(|e| format!("push body is not JSON: {e}"))?;
     let obj = v
@@ -952,6 +952,40 @@ fn split_push_body(raw: &[u8]) -> std::result::Result<(String, Vec<u8>), String>
         .ok_or_else(|| "push body needs a `sender` identity key".to_string())?;
     if !validation::is_valid_pubkey(&sender) {
         return Err("push `sender` must be a 33-byte compressed pubkey hex".to_string());
+    }
+    // `/sendMessage`'s validator wants `{ "message": { recipient, messageBox,
+    // body, messageId } }`. A producer may send that exact shape, or the FLAT
+    // `{ recipient, messageBox, body }` the first-party producers send — the
+    // relay wraps it and mints the `messageId` it did not carry (a sha256 of
+    // the sender, recipient, box, body and the millisecond: 64 hex, so the
+    // client's acknowledge path accepts it as a stored id). Before this the
+    // route answered ERR_MESSAGE_REQUIRED to every first-party push and not
+    // one server event was ever stored (LOW, 2026-09-03).
+    if obj.get("message").is_none() {
+        let recipient = obj.remove("recipient");
+        let message_box = obj.remove("messageBox");
+        let body = obj.remove("body");
+        let mut message = serde_json::Map::new();
+        if let Some(r) = recipient {
+            message.insert("recipient".into(), r);
+        }
+        if let Some(b) = message_box {
+            message.insert("messageBox".into(), b);
+        }
+        if let Some(b) = body {
+            message.insert("body".into(), b);
+        }
+        if let Some(id) = obj.remove("messageId") {
+            message.insert("messageId".into(), id);
+        } else {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(sender.as_bytes());
+            h.update(serde_json::to_vec(&serde_json::Value::Object(message.clone())).unwrap_or_default());
+            h.update(now_ms.to_string().as_bytes());
+            message.insert("messageId".into(), serde_json::Value::String(hex::encode(h.finalize())));
+        }
+        obj.insert("message".into(), serde_json::Value::Object(message));
     }
     let rest = serde_json::to_vec(&v).map_err(|e| format!("re-serialize failed: {e}"))?;
     Ok((sender, rest))
@@ -969,21 +1003,45 @@ mod push_route_tests {
             r#"{{"sender":"{}","recipient":"03ff","messageBox":"low_events","body":{{"kind":"case"}}}}"#,
             SENDER.to_ascii_uppercase()
         );
-        let (sender, rest) = split_push_body(raw.as_bytes()).unwrap();
+        let (sender, rest) = split_push_body(raw.as_bytes(), 1_700_000_000_000).unwrap();
         assert_eq!(sender, SENDER); // lower-cased
         let v: serde_json::Value = serde_json::from_slice(&rest).unwrap();
         assert!(v.get("sender").is_none());
-        assert_eq!(v["recipient"], "03ff");
-        assert_eq!(v["messageBox"], "low_events");
-        assert_eq!(v["body"]["kind"], "case");
+        // The flat producer shape is wrapped into `/sendMessage`'s `message`
+        // object, with a minted 64-hex messageId (a stored-id shape).
+        assert_eq!(v["message"]["recipient"], "03ff");
+        assert_eq!(v["message"]["messageBox"], "low_events");
+        assert_eq!(v["message"]["body"]["kind"], "case");
+        let id = v["message"]["messageId"].as_str().unwrap();
+        assert_eq!(id.len(), 64);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn a_wrapped_flat_push_passes_the_send_message_validator() {
+        let raw = format!(
+            r#"{{"sender":"{SENDER}","recipient":"{SENDER}","messageBox":"low_events","body":{{"kind":"pot"}}}}"#
+        );
+        let (_, rest) = split_push_body(raw.as_bytes(), 1_700_000_000_000).unwrap();
+        assert!(validation::validate_send_message(&rest).is_ok(), "{}", String::from_utf8_lossy(&rest));
+    }
+
+    #[test]
+    fn split_push_body_passes_an_explicit_message_wrapper_through() {
+        let raw = format!(
+            r#"{{"sender":"{SENDER}","message":{{"recipient":"03ff","messageBox":"low_events","body":"x","messageId":"m1"}}}}"#
+        );
+        let (_, rest) = split_push_body(raw.as_bytes(), 1_700_000_000_000).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&rest).unwrap();
+        assert_eq!(v["message"]["messageId"], "m1");
     }
 
     #[test]
     fn split_push_body_refuses_a_missing_or_malformed_sender_and_non_objects() {
-        assert!(split_push_body(br#"{"recipient":"03ff"}"#).is_err());
-        assert!(split_push_body(br#"{"sender":"nothex","recipient":"03ff"}"#).is_err());
-        assert!(split_push_body(br#"[1,2]"#).is_err());
-        assert!(split_push_body(b"not json").is_err());
+        assert!(split_push_body(br#"{"recipient":"03ff"}"#, 1_700_000_000_000).is_err());
+        assert!(split_push_body(br#"{"sender":"nothex","recipient":"03ff"}"#, 1_700_000_000_000).is_err());
+        assert!(split_push_body(br#"[1,2]"#, 1_700_000_000_000).is_err());
+        assert!(split_push_body(b"not json", 1_700_000_000_000).is_err());
     }
 }
 

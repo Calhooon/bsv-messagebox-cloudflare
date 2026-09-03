@@ -68,7 +68,7 @@ const POLLING_TICK_MS: u64 = 25;
 /// Engine.IO heartbeat parameters. Mirrors the reference socket.io
 /// Node server defaults so an unmodified `socket.io-client@4.x` accepts
 /// our handshake without tweaks.
-const PING_INTERVAL_MS: u64 = 25_000;
+pub(crate) const PING_INTERVAL_MS: u64 = 25_000;
 const PING_TIMEOUT_MS: u64 = 20_000;
 // The server heartbeat ticks every `PING_INTERVAL_MS`; a ping unanswered
 // for `PING_TIMEOUT_MS` is judged dead at the very next tick, and the tick
@@ -191,6 +191,7 @@ impl SessionState {
             joined_rooms: self.joined_rooms.clone(),
             authenticated_emitted: self.authenticated_emitted,
             awaiting_pong_since_ms: self.awaiting_pong_since_ms,
+            pings_since_registry_refresh: 0,
         }
     }
 
@@ -255,6 +256,13 @@ struct WsAttachment {
     /// judge the socket without `inner`.
     #[serde(default)]
     awaiting_pong_since_ms: Option<u64>,
+    /// Server pings sent since this socket's broadcast-registry entry was
+    /// last refreshed (2026-09-03): a socket holding a `broadcast-*` room
+    /// refreshes it every `REFRESH_EVERY_PINGS` pings, so the subscription
+    /// lives exactly as long as the socket (the registry's window was a
+    /// 10-minute assumption from the pre-heartbeat world).
+    #[serde(default)]
+    pings_since_registry_refresh: u32,
 }
 
 /// Body for `/internal/socketio-broadcast` (Phase C). Posted by the
@@ -574,6 +582,19 @@ impl DurableObject for EngineIoSession {
                     match ws.send_with_str(&ping) {
                         Ok(()) => {
                             att.awaiting_pong_since_ms = Some(now);
+                            // A live socket holding a broadcast room keeps its
+                            // registry entry fresh from the heartbeat.
+                            let mut refresh: Option<String> = None;
+                            if att.joined_rooms.iter().any(|r| r.contains(crate::message_hub::BROADCAST_BOX_MARKER)) {
+                                att.pings_since_registry_refresh = att.pings_since_registry_refresh.saturating_add(1);
+                                if att.pings_since_registry_refresh >= crate::broadcast_registry::REFRESH_EVERY_PINGS {
+                                    att.pings_since_registry_refresh = 0;
+                                    refresh = att.auth.verified_identity_key().map(str::to_string);
+                                }
+                            }
+                            if let Some(identity) = refresh {
+                                crate::broadcast_registry::register_identity(&self.env, &identity).await;
+                            }
                             if let Err(e) = ws.serialize_attachment(&att) {
                                 console_log!(
                                     "EngineIoSession: heartbeat attachment persist failed: {e}"

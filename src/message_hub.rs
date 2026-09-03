@@ -609,30 +609,7 @@ impl MessageHub {
     /// rooms (fire-and-forget; a lost register only delays delivery until
     /// the next (re)join, and the client re-joins on every connect).
     async fn notify_broadcast_registry(&self, identity: &str) {
-        let Ok(ns) = self.env.durable_object("BROADCAST_REGISTRY") else {
-            return;
-        };
-        // Sharded by the identity's first hex nibble (16 shards): the
-        // registry can never become a single-DO bottleneck at consumer
-        // scale, and /broadcast reads the shards in parallel.
-        let shard = identity.chars().next().unwrap_or('0');
-        let Ok(stub) = ns
-            .id_from_name(&format!("v1:{shard}"))
-            .and_then(|id| id.get_stub())
-        else {
-            return;
-        };
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post);
-        init.with_body(Some(
-            serde_json::json!({ "identity": identity }).to_string().into(),
-        ));
-        let Ok(req) = Request::new_with_init("https://registry/register", &init) else {
-            return;
-        };
-        if let Err(e) = stub.fetch_with_request(req).await {
-            console_log!("MessageHub: broadcast-registry notify failed (non-fatal): {e}");
-        }
+        crate::broadcast_registry::register_identity(&self.env, identity).await
     }
 
     async fn handle_internal_push(&self, req: &mut Request) -> Result<Response> {

@@ -4,6 +4,24 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.2 — 2026-09-03
+
+### Broadcast subscriptions live as long as their socket
+- The broadcast registry entry is refreshed from the Engine.IO heartbeat every
+  `REFRESH_EVERY_PINGS` (7 × 25 s) while a socket holds a `broadcast-*` room, and the
+  freshness window is 30 min (was 10 min with NO refresh — a pre-heartbeat assumption that
+  every socket re-joined every 45 s; once sockets lived for hours, a subscriber joined at
+  T was stale by T+10 min and every broadcast after that fanned out to nobody).
+  `register_identity` is one shared helper (hub join + heartbeat). Proven on a live felt:
+  four consecutive block announcements delivered 0–11 s after each block.
+
+### `/push` accepts the flat first-party body
+- `POST /push` wraps a flat `{sender, recipient, messageBox, body}` into `/sendMessage`'s
+  `{message: {…, messageId}}` with a minted 64-hex `messageId` (sha256 over the parts and
+  the clock); an explicit `message` wrapper passes through unchanged. The route used to
+  answer `ERR_MESSAGE_REQUIRED` to every flat first-party push, so no server event was
+  ever stored. The validator runs on the wrapped body.
+
 ## 0.3.1 — 2026-09-03
 
 ### Presence as EVENTS (no client poll)
