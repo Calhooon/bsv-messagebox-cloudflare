@@ -4,6 +4,18 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.6 — 2026-09-03
+
+### Broadcast subscribers stay subscribed (the second half of 0.3.5)
+- The session's own `joined_rooms` — the list the heartbeat alarm reads to decide
+  whether a socket keeps its broadcast-registry entry alive — was declared, persisted
+  and read but never WRITTEN (only the per-identity hub tracked rooms). So the
+  heartbeat refresh still never ran after 0.3.5 (228 alarms, 0 refreshes in a
+  28-minute window) and a live socket went deaf 30 minutes after its join. The routed
+  `joinRoom` (once the hub confirmed it) / `leaveRoom` now record membership in the
+  session and persist it with the attachment. Pinned by a membership round-trip test
+  and a source pin on the routing block.
+
 ## 0.3.5 — 2026-09-03
 
 ### Broadcast subscribers no longer go deaf after 30 minutes

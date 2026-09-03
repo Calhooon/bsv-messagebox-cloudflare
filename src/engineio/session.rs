@@ -281,6 +281,43 @@ struct WsAttachment {
     pings_since_registry_refresh: u32,
 }
 
+/// Record a `joinRoom` / `leaveRoom` in the SESSION's own room list — the list
+/// the heartbeat alarm reads from the attachment to decide whether this socket
+/// keeps a broadcast-registry entry alive (`alarm`: `att.joined_rooms …
+/// BROADCAST_BOX_MARKER`). LOW run 11 (2026-09-03): this list was declared,
+/// persisted and READ, but never WRITTEN — only the per-identity hub tracked
+/// rooms — so the heartbeat refresh never ran once (228 alarms, 0 refreshes in
+/// 28 minutes) and every broadcast subscriber went deaf exactly 30 minutes after
+/// its join, even after the counter itself was made to survive (0.3.5).
+/// Returns true when the list changed (the caller persists the attachment).
+/// A join is recorded only once the hub confirmed it (`joinedRoom`), so a
+/// refused join (wrong owner) can never keep a registry entry alive.
+pub(crate) fn record_room_membership(
+    rooms: &mut Vec<String>,
+    event_name: &str,
+    data: &Value,
+    hub_confirmed_join: bool,
+) -> bool {
+    let Some(room) = data.as_str() else {
+        return false;
+    };
+    match event_name {
+        "joinRoom" => {
+            if !hub_confirmed_join || rooms.iter().any(|r| r == room) {
+                return false;
+            }
+            rooms.push(room.to_string());
+            true
+        }
+        "leaveRoom" => {
+            let before = rooms.len();
+            rooms.retain(|r| r != room);
+            rooms.len() != before
+        }
+        _ => false,
+    }
+}
+
 /// Body for `/internal/socketio-broadcast` (Phase C). Posted by the
 /// per-identity MessageHub when an HTTP `POST /sendMessage` (or any
 /// other write path) needs to fan out to socket.io subscribers.
@@ -1314,6 +1351,18 @@ impl EngineIoSession {
                 let outbound = self
                     .forward_event_to_message_hub(&identity_key, &sid, &name, &data)
                     .await;
+                // LOW run 11 (2026-09-03): mirror the hub's room membership into
+                // the SESSION's own list — the heartbeat's registry-refresh gate
+                // reads it from the attachment — and persist it. See
+                // `record_room_membership`.
+                let hub_confirmed_join = outbound.iter().any(|ev| ev.event_name == "joinedRoom");
+                let rooms_changed = match self.inner.borrow_mut().as_mut() {
+                    Some(s) => record_room_membership(&mut s.joined_rooms, &name, &data, hub_confirmed_join),
+                    None => false,
+                };
+                if rooms_changed {
+                    self.persist_to_ws_attachment();
+                }
                 for ev in outbound {
                     self.emit_signed_general(&ev, &snap_state, &wallet, nsp, ws_for_response);
                 }
@@ -2006,6 +2055,55 @@ mod tests {
         assert_eq!(SessionState::new("x".into()).to_attachment().pings_since_registry_refresh, 0);
         let old: WsAttachment = serde_json::from_str(r#"{"sid":"abc"}"#).unwrap();
         assert_eq!(SessionState::from_attachment(&old).pings_since_registry_refresh, 0);
+    }
+
+    /// LOW run 11 (2026-09-03): the alarm's refresh gate reads the SESSION's
+    /// `joined_rooms`, which nothing ever wrote — 228 heartbeat alarms, zero
+    /// registry refreshes. The membership is recorded from the routed
+    /// joinRoom/leaveRoom events (join only once the hub confirmed it), and it
+    /// rides the attachment like every other persisted field.
+    #[test]
+    fn room_membership_is_recorded_in_the_session_and_survives_the_attachment() {
+        let mut rooms: Vec<String> = Vec::new();
+        let room = serde_json::json!("02aa-broadcast-low-tip");
+        // A join the hub refused (wrong owner) records nothing.
+        assert!(!record_room_membership(&mut rooms, "joinRoom", &room, false));
+        assert!(rooms.is_empty());
+        // A confirmed join records once; a repeat is a no-op.
+        assert!(record_room_membership(&mut rooms, "joinRoom", &room, true));
+        assert!(!record_room_membership(&mut rooms, "joinRoom", &room, true));
+        assert_eq!(rooms, vec!["02aa-broadcast-low-tip".to_string()]);
+        // Non-string data / other events never touch the list.
+        assert!(!record_room_membership(&mut rooms, "joinRoom", &serde_json::json!(7), true));
+        assert!(!record_room_membership(&mut rooms, "sendMessage", &room, true));
+        // The recorded room is exactly what the alarm's gate looks for…
+        assert!(rooms.iter().any(|r| r.contains(crate::message_hub::BROADCAST_BOX_MARKER)));
+        // …and it survives the attachment round trip.
+        let mut s = SessionState::new("abc".into());
+        s.joined_rooms = rooms.clone();
+        assert_eq!(SessionState::from_attachment(&s.to_attachment()).joined_rooms, rooms);
+        // Leaving removes it; leaving twice is a no-op.
+        assert!(record_room_membership(&mut rooms, "leaveRoom", &room, false));
+        assert!(!record_room_membership(&mut rooms, "leaveRoom", &room, false));
+        assert!(rooms.is_empty());
+    }
+
+    /// The routing block must record membership AFTER the hub answered (its
+    /// `joinedRoom` is the confirmation) and persist it — a source pin, like
+    /// the alarm's teardown pin above.
+    #[test]
+    fn the_event_routing_records_room_membership_and_persists_it() {
+        let src = include_str!("session.rs");
+        let start = src.find("// -- 2. Phase C event routing --").expect("the routing block");
+        let end = src[start..].find("AuthOutcome::Quiet").expect("the routing block ends") + start;
+        let block = &src[start..end];
+        assert!(block.contains("forward_event_to_message_hub("));
+        assert!(block.contains("record_room_membership(&mut s.joined_rooms, &name, &data, hub_confirmed_join)"));
+        assert!(block.contains("self.persist_to_ws_attachment();"));
+        assert!(
+            block.find("forward_event_to_message_hub(").unwrap() < block.find("record_room_membership(").unwrap(),
+            "membership is recorded from the hub's answer, never ahead of it"
+        );
     }
 
     #[test]
