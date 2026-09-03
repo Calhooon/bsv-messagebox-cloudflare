@@ -146,6 +146,41 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // users only ever JOIN these rooms. Fan-out rides the EXISTING
     // per-identity /internal/push (each subscriber's DO delivers to its
     // own sockets filtered by joined room). Capped per event.
+    // W2-P3/P4 (bsv-low event-driven client, 2026-09-02) — FIRST-PARTY
+    // SERVER PUSH: our own workers (the tower, the app-layer) file a DURABLE
+    // message into ONE identity's box — stored in D1, live-bridged to the
+    // recipient's sockets, acknowledged by the client like any message — so
+    // a case snapshot or a money fact reaches the seat as an EVENT and
+    // survives a reload (the box replays un-acked rows). Same bearer gate as
+    // `/broadcast` (producers are our workers, never end users); the
+    // `sender` is the producer's own BRC-103 identity key, trusted under the
+    // bearer, and the rest of the body is the exact `/sendMessage` shape
+    // (`validate_send_message` + `process_send`: fees, permissions, storage,
+    // push and FCM all unchanged). No handshake per event: the bearer IS the
+    // producer's credential, exactly as on `/broadcast`.
+    if req.method() == Method::Post && req.path() == "/push" {
+        let expected = env.secret("BROADCAST_TOKEN").map(|s| s.to_string()).unwrap_or_default();
+        let got = req
+            .headers()
+            .get("Authorization")?
+            .unwrap_or_default()
+            .strip_prefix("Bearer ")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if expected.is_empty() || got != expected {
+            return Response::error("unauthorized", 401);
+        }
+        let mut req = req;
+        let raw = req.bytes().await?;
+        let (sender, send_body) = match split_push_body(&raw) {
+            Ok(x) => x,
+            Err(reason) => return Response::error(reason, 400),
+        };
+        let db = env.d1("DB")?;
+        let store = storage::Storage::new(&db);
+        let (body, status) = handle_send_message(&send_body, &sender, &env, &store).await;
+        return Response::from_json(&body).map(|r| r.with_status(status));
+    }
     if req.method() == Method::Post && req.path() == "/broadcast" {
         let expected = env.secret("BROADCAST_TOKEN").map(|s| s.to_string()).unwrap_or_default();
         let got = req
@@ -899,6 +934,57 @@ async fn route_socketio_request(mut req: Request, env: &Env, ctx: &Context) -> R
     // route to the per-sid DO unchanged.
     let stub = namespace.id_from_name(sid)?.get_stub()?;
     stub.fetch_with_request(req).await
+}
+
+/// Split a `/push` body into the producer's identity (`sender`, a compressed
+/// pubkey hex) and the remaining `/sendMessage`-shaped JSON (re-serialized
+/// without `sender`, so the reference validator sees exactly what an authed
+/// client would have sent).
+fn split_push_body(raw: &[u8]) -> std::result::Result<(String, Vec<u8>), String> {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|e| format!("push body is not JSON: {e}"))?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| "push body must be a JSON object".to_string())?;
+    let sender = obj
+        .remove("sender")
+        .and_then(|s| s.as_str().map(|s| s.to_ascii_lowercase()))
+        .ok_or_else(|| "push body needs a `sender` identity key".to_string())?;
+    if !validation::is_valid_pubkey(&sender) {
+        return Err("push `sender` must be a 33-byte compressed pubkey hex".to_string());
+    }
+    let rest = serde_json::to_vec(&v).map_err(|e| format!("re-serialize failed: {e}"))?;
+    Ok((sender, rest))
+}
+
+#[cfg(test)]
+mod push_route_tests {
+    use super::*;
+
+    const SENDER: &str = "02aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+
+    #[test]
+    fn split_push_body_extracts_the_sender_and_leaves_a_pure_send_message_body() {
+        let raw = format!(
+            r#"{{"sender":"{}","recipient":"03ff","messageBox":"low_events","body":{{"kind":"case"}}}}"#,
+            SENDER.to_ascii_uppercase()
+        );
+        let (sender, rest) = split_push_body(raw.as_bytes()).unwrap();
+        assert_eq!(sender, SENDER); // lower-cased
+        let v: serde_json::Value = serde_json::from_slice(&rest).unwrap();
+        assert!(v.get("sender").is_none());
+        assert_eq!(v["recipient"], "03ff");
+        assert_eq!(v["messageBox"], "low_events");
+        assert_eq!(v["body"]["kind"], "case");
+    }
+
+    #[test]
+    fn split_push_body_refuses_a_missing_or_malformed_sender_and_non_objects() {
+        assert!(split_push_body(br#"{"recipient":"03ff"}"#).is_err());
+        assert!(split_push_body(br#"{"sender":"nothex","recipient":"03ff"}"#).is_err());
+        assert!(split_push_body(br#"[1,2]"#).is_err());
+        assert!(split_push_body(b"not json").is_err());
+    }
 }
 
 #[cfg(test)]

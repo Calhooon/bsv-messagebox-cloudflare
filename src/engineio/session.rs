@@ -557,6 +557,16 @@ impl DurableObject for EngineIoSession {
                         "EngineIoSession: heartbeat — no pong within {PING_TIMEOUT_MS} ms, closing sid={}",
                         att.sid
                     );
+                    // The heartbeat is the DETERMINISTIC detector of a dead
+                    // client: an abruptly-killed peer sends no close frame, so
+                    // the runtime's `websocket_close` may not fire promptly —
+                    // this ping-timeout IS the departure. Run the SAME teardown
+                    // graceful/error close run (`unregister_with_message_hub` →
+                    // the hub's debounced, told-state-deduped `peerLeft`), so
+                    // the COUNTERPARTY is told their opponent left, as an EVENT,
+                    // within one ping window (never a poll). Idempotent: a later
+                    // real `websocket_close` re-runs it and the hub dedupes.
+                    self.teardown_ws_transport(&ws).await;
                     let _ = ws.close(Some(1000), Some("ping timeout"));
                 }
                 HeartbeatAction::Ping => {
@@ -1794,7 +1804,10 @@ fn authsocket_event_name(name: &str, data: &Value) -> String {
     // `peerLeft` (#40) follows the same room-suffixed convention so a
     // client can `socket.on('peerLeft-<roomId>')` alongside its
     // `sendMessage-<roomId>` subscription.
-    if matches!(name, "sendMessage" | "sendMessageAck" | "peerLeft") {
+    if matches!(
+        name,
+        "sendMessage" | "sendMessageAck" | "peerLeft" | "peerJoined" | "presence"
+    ) {
         if let Some(room_id) = data.get("roomId").and_then(|v| v.as_str()) {
             return format!("{name}-{room_id}");
         }
@@ -1901,6 +1914,27 @@ mod tests {
     }
 
     #[test]
+    fn a_ping_timeout_close_runs_the_departure_teardown_so_the_peer_is_told() {
+        // The heartbeat's Close branch is the deterministic dead-client
+        // detector; it MUST run the same teardown as a graceful/error close
+        // (which notifies the counterparty's hub) — otherwise a killed seat's
+        // opponent is never told their peer left except by a poll (owner,
+        // 2026-09-03: "if an opponent leaves the table the other person needs
+        // to know, and not through a poll"). Guard the wiring at the source
+        // (the async DO alarm path is not unit-mountable here).
+        let src = include_str!("session.rs");
+        let close_arm = src
+            .split("HeartbeatAction::Close => {")
+            .nth(1)
+            .expect("the alarm has a Close branch");
+        let body = &close_arm[..close_arm.find("HeartbeatAction::Ping").unwrap_or(close_arm.len())];
+        assert!(
+            body.contains("self.teardown_ws_transport(&ws).await;"),
+            "the ping-timeout Close branch must run teardown_ws_transport so peerLeft fires for the counterparty"
+        );
+    }
+
+    #[test]
     fn an_old_attachment_without_the_heartbeat_field_still_deserializes() {
         let v: WsAttachment = serde_json::from_str(r#"{"sid":"abc","connected":true}"#).unwrap();
         assert_eq!(v.sid, "abc");
@@ -1920,6 +1954,18 @@ mod tests {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
         assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn authsocket_event_name_suffixes_presence_events() {
+        // P2 (2026-09-02): arrival + the join-time snapshot ride the same
+        // room-suffixed convention as peerLeft.
+        for name in ["peerJoined", "presence"] {
+            assert_eq!(
+                authsocket_event_name(name, &json!({ "roomId": "03aa-low_game_1" })),
+                format!("{name}-03aa-low_game_1")
+            );
+        }
     }
 
     #[test]

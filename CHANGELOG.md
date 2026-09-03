@@ -4,6 +4,32 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.1 — 2026-09-03
+
+### Presence as EVENTS (no client poll)
+- `peerJoined-<room>` is pushed to the counterparty symmetric to `peerLeft` (hub-to-hub
+  `/internal/peer-joined`, the same `peer_room` pairing and socket.io fan-out).
+- A JOINING socket receives a `presence-<room>` SNAPSHOT of the peer room's occupancy
+  (`present: true|false`, `null` when nothing is known) — the join hello's precedent.
+- Departures and arrivals are deduped by a per-room TOLD-STATE, so a socket flap inside the
+  debounce window is suppressed and a client never sees the same transition twice.
+- The Engine.IO heartbeat's `ping timeout` close now runs the full departure teardown
+  (`unregister_with_message_hub` → `peerLeft`): a seat whose process was killed sends no
+  close frame, and before this its counterparty was never told.
+
+### First-party server push
+- `POST /push` (bearer `BROADCAST_TOKEN`, the same gate as `/broadcast`): a first-party
+  worker files a DURABLE message into ONE identity's box — stored, live-bridged to the
+  recipient's sockets, acknowledged by the client like any message, replayed un-acked after
+  a reload. The `sender` is the producer's own identity key, trusted under the bearer; the
+  rest of the body is the exact `/sendMessage` shape (`validate_send_message` + `process_send`).
+
+### Operator note
+- A Cloudflare Worker cannot reach this relay's `*.workers.dev` hostname with a plain `fetch()`
+  when it lives on the same account (error 1042 behind a 404; every `*.workers.dev` host of
+  one account is one zone). Producers on the same account call `/broadcast` and `/push`
+  through a **service binding**.
+
 ## 0.3.0 — 2026-09-02
 
 ### Transport

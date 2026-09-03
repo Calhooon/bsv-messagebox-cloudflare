@@ -122,6 +122,13 @@ const REJOIN_DEADLINE_PREFIX: &str = "rejoindeadline:";
 /// entry per room (trailing edge: a re-departure overwrites it), so a
 /// flap during the window collapses to a single trailing check.
 const PENDING_LEFT_PREFIX: &str = "pendingleft:";
+/// `presence_told:<room>` — what this hub LAST TOLD ITS OWNER about the
+/// room's counterparty (`present` / `absent`). The arrival/departure events
+/// (`peerJoined` / `peerLeft`) and the join-time snapshot all flow through
+/// `told_transition`, so the owner hears a change exactly once — a second
+/// tab joining, a flap the debounce absorbed, or a duplicate cross-DO push
+/// emits nothing. Storage, not attachment: it is per ROOM, not per socket.
+const PRESENCE_TOLD_PREFIX: &str = "presence_told:";
 
 /// Trailing debounce window for the peer-left push. Must comfortably
 /// exceed the watchdog's self-heal gap (~1-2s) while adding only a small
@@ -410,6 +417,9 @@ impl DurableObject for MessageHub {
         //     in ?room right now (routed here by lib.rs /presence).
         if req.method() == Method::Post && path == "/internal/peer-left" {
             return self.handle_peer_left(&mut req).await;
+        }
+        if req.method() == Method::Post && path == "/internal/peer-joined" {
+            return self.handle_peer_joined(&mut req).await;
         }
         if req.method() == Method::Get && path == "/internal/presence" {
             return self.handle_presence(&req).await;
@@ -901,6 +911,17 @@ impl MessageHub {
                 ) {
                     console_log!("MessageHub: join hello emit failed (non-fatal): {}", e);
                 }
+                // P2 (bsv-low event-driven client, 2026-09-02): presence is an
+                // EVENT, never a poll. The joining socket receives a `presence`
+                // snapshot of the counterparty (asked ONCE, hub-to-hub, on this
+                // join — a reconnect re-joins and therefore re-syncs by itself),
+                // and the counterparty's hub is told we ARRIVED (`peerJoined`,
+                // the mirror of `peerLeft`). Both best-effort; never fail the join.
+                let snapshot = self.presence_snapshot(&room_id).await;
+                if let Err(e) = emit(ws, "presence", &snapshot) {
+                    console_log!("MessageHub: presence snapshot emit failed (non-fatal): {}", e);
+                }
+                self.push_peer_joined(&room_id, &attachment.identity_key).await;
             }
             ClientEvent::LeaveRoom { room_id } => {
                 if let Err(reason) = validate_room_owned(&attachment.identity_key, &room_id) {
@@ -1179,10 +1200,26 @@ impl MessageHub {
                 .await;
                 // Advisory heartbeat: a join is a high-signal room touch.
                 self.stamp_last_seen(&room_id).await;
-                vec![OutboundEvent::new(
-                    "joinedRoom",
-                    json!({ "roomId": room_id }),
-                )]
+                // P2 (2026-09-02): the socket.io path gets what the raw path
+                // gets — the join hello (#410; it was raw-WS only, so LOW's
+                // socket.io seats never received it and played http-first
+                // until the opponent's first envelope), the `presence`
+                // snapshot, and the counterparty's `peerJoined`.
+                let snapshot = self.presence_snapshot(&room_id).await;
+                self.push_peer_joined(&room_id, &identity_key).await;
+                vec![
+                    OutboundEvent::new("joinedRoom", json!({ "roomId": room_id })),
+                    OutboundEvent::new(
+                        "sendMessage",
+                        json!({
+                            "roomId": room_id,
+                            "sender": "relay-hello",
+                            "messageId": "ws-hello",
+                            "body": "ws-hello",
+                        }),
+                    ),
+                    OutboundEvent::new("presence", snapshot),
+                ]
             }
             "leaveRoom" => {
                 let room_id = match data.as_str() {
@@ -1854,6 +1891,12 @@ impl MessageHub {
             Ok(b) => b,
             Err(e) => return Response::error(format!("invalid peer-left body: {e}"), 400),
         };
+        // Told-state dedupe: the owner hears "left" once per departure.
+        let (emit_it, next) = told_transition(self.read_told(&body.room_id).await, false);
+        if !emit_it {
+            return Response::from_json(&json!({ "delivered": 0, "deduped": true }));
+        }
+        self.write_told(&body.room_id, next).await;
         let mut delivered = 0u32;
         for ws in self.state.get_websockets() {
             let Ok(Some(a)) = ws.deserialize_attachment::<SocketAttachment>() else {
@@ -1945,6 +1988,174 @@ impl MessageHub {
     /// clients whose WS dropped (a caller must know the full room id —
     /// for LOW that embeds the 64-hex gameId, so presence is only
     /// readable by someone already in the game). UX-only.
+    async fn read_told(&self, room: &str) -> Option<ToldPresence> {
+        let v: Option<String> = self
+            .state
+            .storage()
+            .get(&format!("{PRESENCE_TOLD_PREFIX}{room}"))
+            .await
+            .ok()
+            .flatten();
+        told_from_str(v.as_deref())
+    }
+
+    async fn write_told(&self, room: &str, told: ToldPresence) {
+        if let Err(e) = self
+            .state
+            .storage()
+            .put(&format!("{PRESENCE_TOLD_PREFIX}{room}"), told.as_str())
+            .await
+        {
+            console_log!("MessageHub: presence_told put failed for {room}: {e}");
+        }
+    }
+
+    /// `/internal/peer-joined` — the counterparty's hub says they ARRIVED in
+    /// the shared conversation. Mirror of `handle_peer_left`: fan `peerJoined`
+    /// to this owner's sessions (raw sockets joined to the room; socket.io
+    /// sessions via the broadcast bridge, room-suffixed client-side). Deduped
+    /// by the told-state so a second tab / a flap emits nothing. UX-only.
+    async fn handle_peer_joined(&self, req: &mut Request) -> Result<Response> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PeerJoinedBody {
+            room_id: String,
+            joiner: String,
+        }
+        let body: PeerJoinedBody = match req.json().await {
+            Ok(b) => b,
+            Err(e) => return Response::error(format!("invalid peer-joined body: {e}"), 400),
+        };
+        let (emit_it, next) = told_transition(self.read_told(&body.room_id).await, true);
+        if !emit_it {
+            return Response::from_json(&json!({ "delivered": 0, "deduped": true }));
+        }
+        self.write_told(&body.room_id, next).await;
+        let mut delivered = 0u32;
+        for ws in self.state.get_websockets() {
+            let Ok(Some(a)) = ws.deserialize_attachment::<SocketAttachment>() else {
+                continue;
+            };
+            if !a.joined_rooms.iter().any(|r| r == &body.room_id) {
+                continue;
+            }
+            if emit(
+                &ws,
+                "peerJoined",
+                &json!({ "roomId": body.room_id, "identityKey": body.joiner }),
+            )
+            .is_ok()
+            {
+                delivered += 1;
+            }
+        }
+        let entries = self.list_socketio_subscribers().await;
+        if !entries.is_empty() {
+            if let Ok(ns) = self.env.durable_object("ENGINEIO_SESSION") {
+                for entry in entries {
+                    let Ok(stub) = ns.id_from_name(&entry.sid).and_then(|id| id.get_stub()) else {
+                        continue;
+                    };
+                    let payload = json!({
+                        "roomId": body.room_id,
+                        "sender": body.joiner,
+                        "messageId": format!("peer-joined-{}", Date::now().as_millis()),
+                        "body": {},
+                        "event": "peerJoined",
+                    })
+                    .to_string();
+                    let headers = Headers::new();
+                    let _ = headers.set("content-type", "application/json");
+                    let mut init = RequestInit::new();
+                    init.with_method(Method::Post)
+                        .with_headers(headers)
+                        .with_body(Some(payload.into()));
+                    let Ok(req) = Request::new_with_init(
+                        "https://do.local/internal/socketio-broadcast",
+                        &init,
+                    ) else {
+                        continue;
+                    };
+                    if stub.fetch_with_request(req).await.is_ok() {
+                        delivered += 1;
+                    }
+                }
+            }
+        }
+        Response::from_json(&json!({ "delivered": delivered }))
+    }
+
+    /// Cross-DO `/internal/peer-joined` push to the room's known counterparty
+    /// (mirror of `push_peer_left`). No-ops when no peer is learned yet — the
+    /// first envelope teaches it, and an envelope is itself proof of presence.
+    async fn push_peer_joined(&self, room: &str, joiner: &str) {
+        let key = format!("{PEER_BY_ROOM_PREFIX}{room}");
+        let peer: Option<String> = self.state.storage().get(&key).await.ok().flatten();
+        let Some(peer) = peer else { return };
+        let Some(peer_room) = peer_room(&peer, room) else {
+            return;
+        };
+        let Ok(namespace) = self.env.durable_object("MESSAGE_HUB") else {
+            return;
+        };
+        let Ok(stub) = namespace.id_from_name(&peer).and_then(|id| id.get_stub()) else {
+            return;
+        };
+        let payload = json!({ "roomId": peer_room, "joiner": joiner }).to_string();
+        let headers = Headers::new();
+        let _ = headers.set("content-type", "application/json");
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(payload.into()));
+        let Ok(req) = Request::new_with_init("https://do.local/internal/peer-joined", &init) else {
+            return;
+        };
+        match stub.fetch_with_request(req).await {
+            Ok(_) => console_log!("MessageHub: peerJoined {} → {} (room {})", joiner, peer, peer_room),
+            Err(e) => console_log!("MessageHub: peerJoined notify failed: {e}"),
+        }
+    }
+
+    /// The `presence` snapshot for a JOINING socket: the counterparty's live
+    /// occupancy asked ONCE, hub-to-hub, at join time. Unknown peer (no
+    /// envelope exchanged yet) ⇒ `identityKey: null, present: null` — an
+    /// explicit "nothing learned", never a guessed absence. Records the
+    /// told-state so the following `peerJoined`/`peerLeft` dedupe against
+    /// what the owner has actually seen.
+    async fn presence_snapshot(&self, room: &str) -> Value {
+        let key = format!("{PEER_BY_ROOM_PREFIX}{room}");
+        let peer: Option<String> = self.state.storage().get(&key).await.ok().flatten();
+        let Some(peer) = peer else {
+            return presence_snapshot_json(room, None, None, None, None);
+        };
+        let Some(peer_room) = peer_room(&peer, room) else {
+            return presence_snapshot_json(room, None, None, None, None);
+        };
+        let read = async {
+            let ns = self.env.durable_object("MESSAGE_HUB").ok()?;
+            let stub = ns.id_from_name(&peer).ok()?.get_stub().ok()?;
+            let url = format!("https://do.local/internal/presence?room={peer_room}");
+            let mut resp = stub.fetch_with_str(&url).await.ok()?;
+            if resp.status_code() != 200 {
+                return None;
+            }
+            resp.json::<Value>().await.ok()
+        }
+        .await;
+        let Some(v) = read else {
+            return presence_snapshot_json(room, Some(&peer), None, None, None);
+        };
+        let present = v.get("present").and_then(Value::as_bool);
+        let last_seen = v.get("lastSeenMs").and_then(Value::as_u64);
+        let rejoin_deadline = v.get("rejoinDeadlineMs").and_then(Value::as_u64);
+        if let Some(p) = present {
+            let (_, next) = told_transition(self.read_told(room).await, p);
+            self.write_told(room, next).await;
+        }
+        presence_snapshot_json(room, Some(&peer), present, last_seen, rejoin_deadline)
+    }
+
     async fn handle_presence(&self, req: &Request) -> Result<Response> {
         let url = req.url()?;
         let room = url
@@ -1992,6 +2203,62 @@ impl MessageHub {
 /// when `Some` — an absent value OMITS its field entirely (never serialized
 /// as 0/null, so a reader can't misread it as a real value). All three are
 /// independent.
+/// See `PRESENCE_TOLD_PREFIX`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ToldPresence {
+    Present,
+    Absent,
+}
+
+impl ToldPresence {
+    fn as_str(self) -> &'static str {
+        match self {
+            ToldPresence::Present => "present",
+            ToldPresence::Absent => "absent",
+        }
+    }
+}
+
+fn told_from_str(s: Option<&str>) -> Option<ToldPresence> {
+    match s {
+        Some("present") => Some(ToldPresence::Present),
+        Some("absent") => Some(ToldPresence::Absent),
+        _ => None,
+    }
+}
+
+/// The ONE rule for presence events: the owner hears a change when, and only
+/// when, the observed state differs from what it was last told. The first
+/// observation always counts. Returns `(emit, next_told)`.
+fn told_transition(prev: Option<ToldPresence>, observed_present: bool) -> (bool, ToldPresence) {
+    let next = if observed_present {
+        ToldPresence::Present
+    } else {
+        ToldPresence::Absent
+    };
+    (prev != Some(next), next)
+}
+
+/// The `presence` event body (join-time snapshot). `present: null` with
+/// `identityKey: null` = no counterparty learned; `present: null` with a key =
+/// the peer hub could not be read (a fault, not an absence).
+fn presence_snapshot_json(
+    room: &str,
+    peer: Option<&str>,
+    present: Option<bool>,
+    last_seen_ms: Option<u64>,
+    rejoin_deadline_ms: Option<u64>,
+) -> Value {
+    let mut body = json!({ "roomId": room, "identityKey": peer, "present": present });
+    if let Some(ms) = last_seen_ms {
+        body["lastSeenMs"] = json!(ms);
+    }
+    if let Some(ms) = rejoin_deadline_ms {
+        body["rejoinDeadlineMs"] = json!(ms);
+    }
+    body
+}
+
 fn presence_body_json(
     room: &str,
     present: bool,
@@ -2329,6 +2596,39 @@ fn description_or(body: &Value, default: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn told_transition_emits_exactly_on_change_and_always_on_first_observation() {
+        use ToldPresence::*;
+        assert_eq!(told_transition(None, true), (true, Present));
+        assert_eq!(told_transition(None, false), (true, Absent));
+        assert_eq!(told_transition(Some(Present), true), (false, Present)); // second tab joins: silent
+        assert_eq!(told_transition(Some(Present), false), (true, Absent));
+        assert_eq!(told_transition(Some(Absent), false), (false, Absent)); // duplicate peerLeft: silent
+        assert_eq!(told_transition(Some(Absent), true), (true, Present));
+        assert_eq!(told_from_str(Some("present")), Some(Present));
+        assert_eq!(told_from_str(Some("absent")), Some(Absent));
+        assert_eq!(told_from_str(Some("garbage")), None);
+        assert_eq!(told_from_str(None), None);
+        assert_eq!(told_from_str(Some(Present.as_str())), Some(Present));
+    }
+
+    #[test]
+    fn presence_snapshot_json_distinguishes_unknown_peer_from_unreadable_peer_from_answers() {
+        let unknown = presence_snapshot_json("03aa-low_game_1", None, None, None, None);
+        assert!(unknown["identityKey"].is_null());
+        assert!(unknown["present"].is_null());
+        let unreadable = presence_snapshot_json("03aa-low_game_1", Some("02bb"), None, None, None);
+        assert_eq!(unreadable["identityKey"], "02bb");
+        assert!(unreadable["present"].is_null());
+        assert!(unreadable.get("lastSeenMs").is_none());
+        let seated = presence_snapshot_json("03aa-low_game_1", Some("02bb"), Some(true), Some(5), None);
+        assert_eq!(seated["present"], true);
+        assert_eq!(seated["lastSeenMs"], 5);
+        let gone = presence_snapshot_json("03aa-low_game_1", Some("02bb"), Some(false), Some(5), Some(9));
+        assert_eq!(gone["present"], false);
+        assert_eq!(gone["rejoinDeadlineMs"], 9);
+    }
 
     #[test]
     fn broadcast_box_rooms_stay_ownership_gated_and_marker_matches() {
