@@ -4,6 +4,17 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.10 — 2026-09-03
+
+### The repair believes the ping schedule, not the alarm row
+- LOW run 14 caught the platform's loss in the wild (19:53Z): the re-delivered tick was
+  `canceled`, and `get_alarm()` KEPT ANSWERING the tick's scheduled time while the
+  runtime never fired it. The client's nudge landed 8 s past that time; 0.3.8's 10 s
+  "late grace" read the row as merely late, did nothing, and the socket closed at 45 s.
+  Now a ping overdue by more than 2 s past the interval is the truth whatever the row
+  says (`PING_OVERDUE_GRACE_MS`), the late grace is 2 s, and a client `6` (the nudge)
+  logs its check's outcome so a tail shows the class repaired or not.
+
 ## 0.3.9 — 2026-09-03
 
 ### The fault knob cannot be switched on in production

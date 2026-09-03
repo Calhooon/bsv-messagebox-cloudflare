@@ -69,10 +69,19 @@ const POLLING_TICK_MS: u64 = 25;
 /// Node server defaults so an unmodified `socket.io-client@4.x` accepts
 /// our handshake without tweaks.
 pub(crate) const PING_INTERVAL_MS: u64 = 25_000;
-/// 0.3.8: a pending alarm this much past its scheduled time is treated as
-/// LOST by the repair path (the runtime's ordinary jitter is well under a
-/// second; a tick minutes late has died as surely as no tick at all).
-pub(crate) const ALARM_LATE_GRACE_MS: u64 = 10_000;
+/// 0.3.10: a pending alarm this much past its scheduled time is treated as
+/// LOST by the repair path. LOW run 14 (2026-09-03 19:53Z) showed the
+/// platform's loss LEAVES THE ROW: `get_alarm()` kept answering the tick's
+/// scheduled time while the runtime never fired it, the client's nudge landed
+/// 8 s past that time, and 0.3.8's 10 s grace read it as "merely late" — the
+/// socket closed at 45 s with the nudge wasted. The runtime's real jitter is
+/// sub-second; two seconds is generous.
+pub(crate) const ALARM_LATE_GRACE_MS: u64 = 2_000;
+/// 0.3.10: a ping is OVERDUE once this much more than the interval has passed
+/// since the last one — the schedule is the truth, whatever the alarm row
+/// says (a future alarm with an overdue ping is a chain that drifted; pinging
+/// now and re-arming re-syncs it).
+pub(crate) const PING_OVERDUE_GRACE_MS: u64 = 2_000;
 const PING_TIMEOUT_MS: u64 = 20_000;
 // The server heartbeat ticks every `PING_INTERVAL_MS`; a ping unanswered
 // for `PING_TIMEOUT_MS` is judged dead at the very next tick, and the tick
@@ -443,6 +452,13 @@ pub(crate) fn heartbeat_repair(
     last_ping_at_ms: Option<u64>,
     alarm_at_ms: Option<u64>,
 ) -> HeartbeatRepair {
+    // The SCHEDULE is the truth (0.3.10): a ping overdue by more than the
+    // grace means the tick did not run, whatever the alarm row says.
+    let ping_overdue = last_ping_at_ms
+        .map_or(true, |last| now_ms.saturating_sub(last) >= PING_INTERVAL_MS + PING_OVERDUE_GRACE_MS);
+    if ping_overdue {
+        return HeartbeatRepair::PingNow;
+    }
     if let Some(at) = alarm_at_ms {
         if at.saturating_add(ALARM_LATE_GRACE_MS) >= now_ms {
             return HeartbeatRepair::Armed;
@@ -506,23 +522,24 @@ impl EngineIoSession {
     /// 0.3.8: a wake of ANY kind (an inbound frame, a delivery) re-checks the
     /// heartbeat alarm and repairs a lost chain — see `heartbeat_repair`.
     /// One storage read per wake; the alarm is this DO's only alarm.
-    async fn ensure_heartbeat(&self, ws: &WebSocket) {
+    async fn ensure_heartbeat(&self, ws: &WebSocket) -> Option<HeartbeatRepair> {
         let Ok(Some(mut att)) = ws.deserialize_attachment::<WsAttachment>() else {
-            return;
+            return None;
         };
         if att.sid.is_empty() || !matches!(att.transport, Transport::WebSocket) {
-            return; // the upgrade commit arms the first alarm itself
+            return None; // the upgrade commit arms the first alarm itself
         }
         let now = Date::now().as_millis();
         let alarm_at = match self.state.storage().get_alarm().await {
             Ok(a) => a.and_then(|t| u64::try_from(t).ok()),
             Err(e) => {
                 console_log!("EngineIoSession: heartbeat get_alarm failed: {e}");
-                return;
+                return None;
             }
         };
         let since_last = att.last_ping_at_ms.map_or(0, |l| now.saturating_sub(l));
-        match heartbeat_repair(now, att.last_ping_at_ms, alarm_at) {
+        let decision = heartbeat_repair(now, att.last_ping_at_ms, alarm_at);
+        match decision {
             HeartbeatRepair::Armed => {}
             HeartbeatRepair::ArmIn(ms) => {
                 console_log!(
@@ -553,6 +570,7 @@ impl EngineIoSession {
                 self.arm_heartbeat_alarm().await;
             }
         }
+        Some(decision)
     }
 
     /// Arm (or re-arm) the heartbeat alarm one `PING_INTERVAL_MS` out. The
@@ -691,7 +709,7 @@ impl DurableObject for EngineIoSession {
         // 0.3.8: every inbound frame re-checks the heartbeat alarm BEFORE it
         // is dispatched — a lost chain is repaired by the next thing the
         // client says (its pong, a nudge `6`, any event).
-        self.ensure_heartbeat(&ws).await;
+        let repair = self.ensure_heartbeat(&ws).await;
 
         let text = match message {
             WebSocketIncomingMessage::String(s) => s,
@@ -712,6 +730,12 @@ impl DurableObject for EngineIoSession {
             }
         };
         let was_pong = matches!(pkt, EngineIoPacket::Pong(_));
+        if matches!(pkt, EngineIoPacket::Noop) {
+            // 0.3.10: a client `6` is the heartbeat NUDGE (bsv-low
+            // `heartbeatNudge.ts`: the server ping is 8 s late) — its outcome
+            // is logged so a tail shows the class in the wild, repaired or not.
+            console_log!("EngineIoSession: heartbeat nudge received — check: {repair:?}");
+        }
         self.handle_engineio_packet(pkt, Some(&ws)).await;
         if was_pong {
             self.test_lose_alarm_after_pong(Date::now().as_millis()).await;
@@ -2285,9 +2309,12 @@ mod tests {
         let now = 10_000_000u64;
         // pending, on time / slightly late → armed
         assert_eq!(heartbeat_repair(now, Some(now - 1_000), Some(now + 24_000)), HeartbeatRepair::Armed);
-        assert_eq!(heartbeat_repair(now, Some(now - 30_000), Some(now - ALARM_LATE_GRACE_MS)), HeartbeatRepair::Armed);
+        // a ping 30 s old is OVERDUE (0.3.10) → ping now even with a barely-late row
+        assert_eq!(heartbeat_repair(now, Some(now - 30_000), Some(now - ALARM_LATE_GRACE_MS)), HeartbeatRepair::PingNow);
+        assert_eq!(heartbeat_repair(now, Some(now - 20_000), Some(now - ALARM_LATE_GRACE_MS)), HeartbeatRepair::Armed);
         // an alarm long past due is lost as surely as none
         assert_eq!(heartbeat_repair(now, Some(now - 60_000), Some(now - ALARM_LATE_GRACE_MS - 1)), HeartbeatRepair::PingNow);
+        assert_eq!(heartbeat_repair(now, Some(now - 5_000), Some(now - ALARM_LATE_GRACE_MS - 1)), HeartbeatRepair::ArmIn(PING_INTERVAL_MS - 5_000));
         // none pending, last ping 5 s ago → arm for the remaining 20 s
         assert_eq!(heartbeat_repair(now, Some(now - 5_000), None), HeartbeatRepair::ArmIn(PING_INTERVAL_MS - 5_000));
         // none pending, interval passed → ping now (the run-13 socket at +33 s)
@@ -2295,6 +2322,18 @@ mod tests {
         assert_eq!(heartbeat_repair(now, Some(now - PING_INTERVAL_MS), None), HeartbeatRepair::PingNow);
         // no ping ever recorded (a 0.3.7 attachment) → ping now
         assert_eq!(heartbeat_repair(now, None, None), HeartbeatRepair::PingNow);
+        // LOW run 14 (0.3.10): the platform's loss LEAVES THE ROW — the nudge
+        // lands 33 s after the last ping with the alarm row 8 s past due →
+        // ping now, whatever the row says (0.3.8's 10 s grace read Armed here)
+        assert_eq!(heartbeat_repair(now, Some(now - 33_000), Some(now - 8_000)), HeartbeatRepair::PingNow);
+        // a future alarm with an overdue ping is a drifted chain → ping now
+        assert_eq!(heartbeat_repair(now, Some(now - 30_000), Some(now + 10_000)), HeartbeatRepair::PingNow);
+        // just inside the overdue grace, row 1 s late → armed (the runtime's jitter)
+        assert_eq!(heartbeat_repair(now, Some(now - 26_000), Some(now - 1_000)), HeartbeatRepair::Armed);
+        // exactly at the overdue grace → ping now
+        assert_eq!(heartbeat_repair(now, Some(now - (PING_INTERVAL_MS + PING_OVERDUE_GRACE_MS)), Some(now - 1_000)), HeartbeatRepair::PingNow);
+        // the nudge (interval + 8 s) is past the overdue grace, before the 45 s cliff
+        assert!(8_000 > PING_OVERDUE_GRACE_MS);
         // the repair's ping-now lands before the client's 45 s cliff when the
         // client nudges at interval + 8 s: 33 s < 45 s
         assert!(PING_INTERVAL_MS + 8_000 < PING_INTERVAL_MS + PING_TIMEOUT_MS);
