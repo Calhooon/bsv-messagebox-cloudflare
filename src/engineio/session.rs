@@ -456,6 +456,18 @@ pub(crate) fn heartbeat_repair(
     }
 }
 
+/// A TEST-ONLY knob's effective `n` (0 = off): honored only when the deploy's
+/// beta marker is present and names a beta resource — `R2_BUCKET_NAME`
+/// containing `beta` (prod's bucket does not) — so a `secret put` of the knob's
+/// name on the production worker does nothing.
+pub(crate) fn test_knob_n(beta_marker: Option<&str>, value: Option<&str>) -> u64 {
+    let marker_ok = beta_marker.map_or(false, |m| m.contains("beta"));
+    if !marker_ok {
+        return 0;
+    }
+    value.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+}
+
 /// The broadcast-registry entry is refreshed by TIME (0.3.8), never by a
 /// ping count: an unknown last refresh is due (the first tick after a deploy
 /// re-registers once — harmless).
@@ -475,12 +487,13 @@ impl EngineIoSession {
     /// later repaired that every time — belt one proven, fault unfaithful.)
     /// Never set in a production config; absent or 0 = off. Logs on every loss.
     async fn test_lose_alarm_after_pong(&self, now_ms: u64) {
-        let n = self
-            .env
-            .var("HEARTBEAT_TEST_LOSE_ALARM_AFTER_PONG_EVERY")
-            .ok()
-            .and_then(|v| v.to_string().trim().parse::<u64>().ok())
-            .unwrap_or(0);
+        // Honored ONLY on a deploy that carries the beta marker (the beta R2
+        // bucket name): a knob read through `env.var` is also settable by
+        // `wrangler secret put` or a dashboard edit on the PRODUCTION worker,
+        // so without the marker the name is inert whatever its value.
+        let marker = self.env.var("R2_BUCKET_NAME").ok().map(|v| v.to_string());
+        let value = self.env.var("HEARTBEAT_TEST_LOSE_ALARM_AFTER_PONG_EVERY").ok().map(|v| v.to_string());
+        let n = test_knob_n(marker.as_deref(), value.as_deref());
         if n == 0 || (now_ms / PING_INTERVAL_MS) % n != 0 {
             return;
         }
@@ -2239,6 +2252,16 @@ mod tests {
         let old: WsAttachment = serde_json::from_str(r#"{"sid":"abc","pings_since_registry_refresh":5}"#).unwrap();
         assert!(SessionState::from_attachment(&old).registry_refreshed_at_ms.is_none());
         assert!(SessionState::from_attachment(&old).last_ping_at_ms.is_none());
+    }
+
+    /// 0.3.8 (gate): the fault knob is inert without the beta marker, however set.
+    #[test]
+    fn the_test_knob_is_inert_without_the_beta_marker() {
+        assert_eq!(test_knob_n(None, Some("3")), 0);
+        assert_eq!(test_knob_n(Some("low-relay-beefs"), Some("3")), 0, "prod's bucket: inert");
+        assert_eq!(test_knob_n(Some("low-relay-beefs-beta"), Some("3")), 3);
+        assert_eq!(test_knob_n(Some("low-relay-beefs-beta"), Some("x")), 0);
+        assert_eq!(test_knob_n(Some("low-relay-beefs-beta"), None), 0);
     }
 
     /// 0.3.8: the refresh is judged by time — due when unknown, due at the

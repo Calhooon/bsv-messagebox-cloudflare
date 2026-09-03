@@ -4,6 +4,15 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.9 — 2026-09-03
+
+### The fault knob cannot be switched on in production
+- `HEARTBEAT_TEST_LOSE_ALARM_AFTER_PONG_EVERY` is read through `env.var`, which a
+  `wrangler secret put` or a dashboard edit on the PRODUCTION worker can also set — no
+  deploy, no config diff. It is now honored only on a deploy whose `R2_BUCKET_NAME`
+  names a beta bucket (`test_knob_n`, tested): on prod the name is inert whatever its
+  value. Found by the delta-verify round on the sibling tower change.
+
 ## 0.3.8 — 2026-09-03
 
 ### The heartbeat survives a lost alarm (Cloudflare at-least-once, in practice not)
