@@ -4,6 +4,17 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.7 — 2026-09-03
+
+### The heartbeat refresh no longer closes the socket it refreshes
+- The alarm's Ping arm persisted its copy of the attachment AFTER awaiting the
+  registry refresh. The client's pong for that very ping lands during the await and
+  persists its own clear of `awaiting_pong_since_ms`; the late write erased it, and the
+  next alarm judged the ping unanswered and closed a live socket — once per refresh
+  (every 8th ping, ≈200 s after each join; LOW run 12's broadcast subscriber saw
+  "transport close" at +213 s and +200 s). The arm now persists first and refreshes
+  after; nothing is written to the attachment after the await. Source-pinned.
+
 ## 0.3.6 — 2026-09-03
 
 ### Broadcast subscribers stay subscribed (the second half of 0.3.5)

@@ -645,9 +645,18 @@ impl DurableObject for EngineIoSession {
                                     refresh = att.auth.verified_identity_key().map(str::to_string);
                                 }
                             }
-                            if let Some(identity) = refresh {
-                                crate::broadcast_registry::register_identity(&self.env, &identity).await;
-                            }
+                            // PERSIST FIRST, REFRESH AFTER (LOW run 12, 2026-09-03):
+                            // the registry refresh is an `await` into another DO,
+                            // and the client's PONG for this very ping lands
+                            // during it. The pong handler clears
+                            // `awaiting_pong_since_ms` and persists; if this arm
+                            // then wrote its pre-await copy of `att` back, the
+                            // pong was erased, the next alarm judged the ping
+                            // unanswered and closed a perfectly live socket —
+                            // once per refresh (every 8th ping), as run 12's
+                            // broadcast subscriber showed ("transport close"
+                            // 200 s after each join). Nothing may be written to
+                            // the attachment after the await.
                             if let Err(e) = ws.serialize_attachment(&att) {
                                 console_log!(
                                     "EngineIoSession: heartbeat attachment persist failed: {e}"
@@ -659,6 +668,9 @@ impl DurableObject for EngineIoSession {
                                 // `to_attachment()` (any persisted mutation,
                                 // e.g. the pong) must not clobber the count.
                                 state.pings_since_registry_refresh = att.pings_since_registry_refresh;
+                            }
+                            if let Some(identity) = refresh {
+                                crate::broadcast_registry::register_identity(&self.env, &identity).await;
                             }
                         }
                         Err(e) => {
@@ -2086,6 +2098,27 @@ mod tests {
         assert!(record_room_membership(&mut rooms, "leaveRoom", &room, false));
         assert!(!record_room_membership(&mut rooms, "leaveRoom", &room, false));
         assert!(rooms.is_empty());
+    }
+
+    /// LOW run 12 (2026-09-03): the alarm's Ping arm must persist the
+    /// attachment BEFORE its registry-refresh `await`. The pong for this ping
+    /// lands during that await and persists its own clear; a write of the
+    /// pre-await copy afterwards erased the pong, and the next alarm closed a
+    /// live socket ("ping timeout") once per refresh. Source pin, like the
+    /// teardown pin above.
+    #[test]
+    fn the_ping_arm_persists_the_attachment_before_the_refresh_await() {
+        let src = include_str!("session.rs");
+        let start = src.find("HeartbeatAction::Ping => {").expect("the Ping arm");
+        let end = src[start..].find("Err(e) => {").expect("the Ping arm's send-failed branch") + start;
+        let arm = &src[start..end];
+        let persist = arm.find("ws.serialize_attachment(&att)").expect("the arm persists the attachment");
+        let refresh = arm.find("register_identity(&self.env, &identity).await").expect("the arm refreshes the registry");
+        assert!(persist < refresh, "persist BEFORE the refresh await — nothing may be written to the attachment after it");
+        assert_eq!(arm.matches("ws.serialize_attachment(&att)").count(), 1, "exactly one persist in the arm");
+        let after = &arm[refresh..];
+        assert!(!after.contains("serialize_attachment"), "no attachment write after the await");
+        assert!(!after.contains("borrow_mut()"), "no in-memory write after the await either");
     }
 
     /// The routing block must record membership AFTER the hub answered (its
