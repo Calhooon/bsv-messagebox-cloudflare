@@ -69,6 +69,10 @@ const POLLING_TICK_MS: u64 = 25;
 /// Node server defaults so an unmodified `socket.io-client@4.x` accepts
 /// our handshake without tweaks.
 pub(crate) const PING_INTERVAL_MS: u64 = 25_000;
+/// 0.3.8: a pending alarm this much past its scheduled time is treated as
+/// LOST by the repair path (the runtime's ordinary jitter is well under a
+/// second; a tick minutes late has died as surely as no tick at all).
+pub(crate) const ALARM_LATE_GRACE_MS: u64 = 10_000;
 const PING_TIMEOUT_MS: u64 = 20_000;
 // The server heartbeat ticks every `PING_INTERVAL_MS`; a ping unanswered
 // for `PING_TIMEOUT_MS` is judged dead at the very next tick, and the tick
@@ -143,13 +147,15 @@ struct SessionState {
     authenticated_emitted: bool,
     /// See `WsAttachment::awaiting_pong_since_ms`.
     awaiting_pong_since_ms: Option<u64>,
-    /// See `WsAttachment::pings_since_registry_refresh`. Carried here so
+    /// See `WsAttachment::last_ping_at_ms`.
+    last_ping_at_ms: Option<u64>,
+    /// See `WsAttachment::registry_refreshed_at_ms`. Carried here so
     /// `to_attachment()` (run on every persisted mutation, e.g. each pong)
-    /// preserves the heartbeat's count instead of resetting it — LOW run 10
-    /// (2026-09-03): a hard `0` here meant the registry entry was never
-    /// refreshed and every broadcast subscriber went deaf 30 min after its
-    /// last join while its socket kept answering pings.
-    pings_since_registry_refresh: u32,
+    /// preserves it — LOW run 10 (2026-09-03) lost the heartbeat's refresh
+    /// state exactly this way (a hard reset in `to_attachment`), and every
+    /// broadcast subscriber went deaf 30 min after its last join while its
+    /// socket kept answering pings.
+    registry_refreshed_at_ms: Option<u64>,
 }
 
 impl SessionState {
@@ -164,7 +170,8 @@ impl SessionState {
             joined_rooms: Vec::new(),
             authenticated_emitted: false,
             awaiting_pong_since_ms: None,
-            pings_since_registry_refresh: 0,
+            last_ping_at_ms: None,
+            registry_refreshed_at_ms: None,
         }
     }
 
@@ -184,7 +191,8 @@ impl SessionState {
             joined_rooms: att.joined_rooms.clone(),
             authenticated_emitted: att.authenticated_emitted,
             awaiting_pong_since_ms: att.awaiting_pong_since_ms,
-            pings_since_registry_refresh: att.pings_since_registry_refresh,
+            last_ping_at_ms: att.last_ping_at_ms,
+            registry_refreshed_at_ms: att.registry_refreshed_at_ms,
         }
     }
 
@@ -200,14 +208,14 @@ impl SessionState {
             joined_rooms: self.joined_rooms.clone(),
             authenticated_emitted: self.authenticated_emitted,
             awaiting_pong_since_ms: self.awaiting_pong_since_ms,
-            // LOW run 10 (2026-09-03): this was a hard `0`. Every pong
-            // re-persists the attachment through here, so the heartbeat's
-            // counter was reset before it could ever reach
-            // REFRESH_EVERY_PINGS — the registry entry was NEVER refreshed
-            // and every broadcast subscriber went deaf exactly 30 min after
-            // its last join (a live, ping-answering socket that received
-            // nothing). The counter is session state like the rest.
-            pings_since_registry_refresh: self.pings_since_registry_refresh,
+            // LOW run 10 (2026-09-03): the heartbeat's refresh state was a
+            // hard reset here. Every pong re-persists the attachment through
+            // this snapshot, so the registry entry was NEVER refreshed and
+            // every broadcast subscriber went deaf exactly 30 min after its
+            // last join (a live, ping-answering socket that received
+            // nothing). Heartbeat state is session state like the rest.
+            last_ping_at_ms: self.last_ping_at_ms,
+            registry_refreshed_at_ms: self.registry_refreshed_at_ms,
         }
     }
 
@@ -272,13 +280,20 @@ struct WsAttachment {
     /// judge the socket without `inner`.
     #[serde(default)]
     awaiting_pong_since_ms: Option<u64>,
-    /// Server pings sent since this socket's broadcast-registry entry was
-    /// last refreshed (2026-09-03): a socket holding a `broadcast-*` room
-    /// refreshes it every `REFRESH_EVERY_PINGS` pings, so the subscription
-    /// lives exactly as long as the socket (the registry's window was a
-    /// 10-minute assumption from the pre-heartbeat world).
+    /// When the last server `2` ping went out (0.3.8). The heartbeat REPAIR
+    /// (`ensure_heartbeat`) judges from it whether a socket whose alarm has
+    /// vanished is owed a ping now or an alarm later.
     #[serde(default)]
-    pings_since_registry_refresh: u32,
+    last_ping_at_ms: Option<u64>,
+    /// When this socket's broadcast-registry entry was last refreshed
+    /// (0.3.8 — replaces the 0.3.5 ping COUNTER, whose clobber and ordering
+    /// bugs cost three releases in one day). A socket holding a
+    /// `broadcast-*` room refreshes every `REGISTRY_REFRESH_EVERY_MS`, judged
+    /// by TIME from whichever tick runs, so the subscription lives exactly as
+    /// long as the socket and there is no count to reset (the registry's
+    /// window was a 10-minute assumption from the pre-heartbeat world).
+    #[serde(default)]
+    registry_refreshed_at_ms: Option<u64>,
 }
 
 /// Record a `joinRoom` / `leaveRoom` in the SESSION's own room list — the list
@@ -404,7 +419,129 @@ fn heartbeat_on_alarm(
     }
 }
 
+/// What a wake that finds no heartbeat alarm pending owes the socket (0.3.8).
+/// Cloudflare's alarm is at-least-once on paper, but LOW runs 12 and 13
+/// (2026-09-03) each recorded a COMPLETED tick re-delivered ~300 ms later as
+/// `canceled` (0 ms of wall time) with no alarm left behind: the server
+/// stopped pinging and the client closed a perfectly live socket 45 s later
+/// ("ping timeout"), once per ~100 ticks. The alarm chain must not be the
+/// heartbeat's only driver: every inbound frame and every delivery re-checks
+/// it (`ensure_heartbeat`), and the client nudges when the server is late.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HeartbeatRepair {
+    /// An alarm is pending (or only slightly late): nothing to do.
+    Armed,
+    /// The next ping is overdue: ping now, then arm a full interval out.
+    PingNow,
+    /// The next ping is not yet due: arm for the remainder.
+    ArmIn(u64),
+}
+
+/// `alarm_at_ms` is the pending alarm's scheduled time, if the storage holds one.
+pub(crate) fn heartbeat_repair(
+    now_ms: u64,
+    last_ping_at_ms: Option<u64>,
+    alarm_at_ms: Option<u64>,
+) -> HeartbeatRepair {
+    if let Some(at) = alarm_at_ms {
+        if at.saturating_add(ALARM_LATE_GRACE_MS) >= now_ms {
+            return HeartbeatRepair::Armed;
+        }
+    }
+    match last_ping_at_ms {
+        Some(last) if now_ms.saturating_sub(last) < PING_INTERVAL_MS => {
+            HeartbeatRepair::ArmIn(last + PING_INTERVAL_MS - now_ms)
+        }
+        _ => HeartbeatRepair::PingNow,
+    }
+}
+
+/// The broadcast-registry entry is refreshed by TIME (0.3.8), never by a
+/// ping count: an unknown last refresh is due (the first tick after a deploy
+/// re-registers once — harmless).
+pub(crate) fn registry_refresh_due(now_ms: u64, refreshed_at_ms: Option<u64>) -> bool {
+    refreshed_at_ms.map_or(true, |t| {
+        now_ms.saturating_sub(t) >= crate::broadcast_registry::REGISTRY_REFRESH_EVERY_MS
+    })
+}
+
 impl EngineIoSession {
+    /// TEST-ONLY fault injector (0.3.8): `HEARTBEAT_TEST_LOSE_ALARM_AFTER_PONG_EVERY=<n>`
+    /// deletes the heartbeat alarm right AFTER every n-th tick's pong has been
+    /// handled — the platform's lost-alarm class (LOW runs 12/13) with its REAL
+    /// timing: the loss lands ~300 ms after the tick, i.e. after the pong, so
+    /// no inbound frame follows to repair it and only the client's nudge can.
+    /// (A first cut skipped the arm inside the alarm handler; the pong 40 ms
+    /// later repaired that every time — belt one proven, fault unfaithful.)
+    /// Never set in a production config; absent or 0 = off. Logs on every loss.
+    async fn test_lose_alarm_after_pong(&self, now_ms: u64) {
+        let n = self
+            .env
+            .var("HEARTBEAT_TEST_LOSE_ALARM_AFTER_PONG_EVERY")
+            .ok()
+            .and_then(|v| v.to_string().trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if n == 0 || (now_ms / PING_INTERVAL_MS) % n != 0 {
+            return;
+        }
+        console_log!(
+            "EngineIoSession: TEST KNOB HEARTBEAT_TEST_LOSE_ALARM_AFTER_PONG_EVERY={n} — deleting the heartbeat alarm after this pong (fault injection)"
+        );
+        let _ = self.state.storage().delete_alarm().await;
+    }
+
+    /// 0.3.8: a wake of ANY kind (an inbound frame, a delivery) re-checks the
+    /// heartbeat alarm and repairs a lost chain — see `heartbeat_repair`.
+    /// One storage read per wake; the alarm is this DO's only alarm.
+    async fn ensure_heartbeat(&self, ws: &WebSocket) {
+        let Ok(Some(mut att)) = ws.deserialize_attachment::<WsAttachment>() else {
+            return;
+        };
+        if att.sid.is_empty() || !matches!(att.transport, Transport::WebSocket) {
+            return; // the upgrade commit arms the first alarm itself
+        }
+        let now = Date::now().as_millis();
+        let alarm_at = match self.state.storage().get_alarm().await {
+            Ok(a) => a.and_then(|t| u64::try_from(t).ok()),
+            Err(e) => {
+                console_log!("EngineIoSession: heartbeat get_alarm failed: {e}");
+                return;
+            }
+        };
+        let since_last = att.last_ping_at_ms.map_or(0, |l| now.saturating_sub(l));
+        match heartbeat_repair(now, att.last_ping_at_ms, alarm_at) {
+            HeartbeatRepair::Armed => {}
+            HeartbeatRepair::ArmIn(ms) => {
+                console_log!(
+                    "EngineIoSession: heartbeat REPAIRED sid={} — no alarm pending (last ping {since_last} ms ago, alarm_at={alarm_at:?}); arming in {ms} ms",
+                    att.sid
+                );
+                if let Err(e) = self.state.storage().set_alarm(Duration::from_millis(ms)).await {
+                    console_log!("EngineIoSession: heartbeat repair set_alarm failed: {e}");
+                }
+            }
+            HeartbeatRepair::PingNow => {
+                console_log!(
+                    "EngineIoSession: heartbeat REPAIRED sid={} — no alarm pending (last ping {since_last} ms ago, alarm_at={alarm_at:?}); pinging now",
+                    att.sid
+                );
+                let ping = EngineIoPacket::Ping(String::new()).encode();
+                if ws.send_with_str(&ping).is_ok() {
+                    att.awaiting_pong_since_ms = Some(now);
+                    att.last_ping_at_ms = Some(now);
+                    if let Err(e) = ws.serialize_attachment(&att) {
+                        console_log!("EngineIoSession: heartbeat repair attachment persist failed: {e}");
+                    }
+                    if let Some(state) = self.inner.borrow_mut().as_mut() {
+                        state.awaiting_pong_since_ms = Some(now);
+                        state.last_ping_at_ms = Some(now);
+                    }
+                }
+                self.arm_heartbeat_alarm().await;
+            }
+        }
+    }
+
     /// Arm (or re-arm) the heartbeat alarm one `PING_INTERVAL_MS` out. The
     /// heartbeat is this DO's only alarm, so replacing is always right.
     async fn arm_heartbeat_alarm(&self) {
@@ -538,6 +675,11 @@ impl DurableObject for EngineIoSession {
             );
         }
 
+        // 0.3.8: every inbound frame re-checks the heartbeat alarm BEFORE it
+        // is dispatched — a lost chain is repaired by the next thing the
+        // client says (its pong, a nudge `6`, any event).
+        self.ensure_heartbeat(&ws).await;
+
         let text = match message {
             WebSocketIncomingMessage::String(s) => s,
             WebSocketIncomingMessage::Binary(_) => {
@@ -556,7 +698,11 @@ impl DurableObject for EngineIoSession {
                 return Ok(());
             }
         };
+        let was_pong = matches!(pkt, EngineIoPacket::Pong(_));
         self.handle_engineio_packet(pkt, Some(&ws)).await;
+        if was_pong {
+            self.test_lose_alarm_after_pong(Date::now().as_millis()).await;
+        }
         Ok(())
     }
 
@@ -601,6 +747,12 @@ impl DurableObject for EngineIoSession {
         let sockets = self.state.get_websockets();
         let now = Date::now().as_millis();
         let mut any_attached = false;
+        // ARM FIRST (0.3.8): the next tick is scheduled before any await in
+        // this handler, so a re-delivery or reset mid-handler never finds
+        // nothing scheduled; the trailing arm below re-arms after the work.
+        if !sockets.is_empty() {
+            self.arm_heartbeat_alarm().await;
+        }
         for ws in sockets {
             let Ok(Some(mut att)) = ws.deserialize_attachment::<WsAttachment>() else {
                 continue;
@@ -635,15 +787,16 @@ impl DurableObject for EngineIoSession {
                     match ws.send_with_str(&ping) {
                         Ok(()) => {
                             att.awaiting_pong_since_ms = Some(now);
+                            att.last_ping_at_ms = Some(now);
                             // A live socket holding a broadcast room keeps its
-                            // registry entry fresh from the heartbeat.
+                            // registry entry fresh from the heartbeat — by TIME
+                            // (0.3.8), never by a count.
                             let mut refresh: Option<String> = None;
-                            if att.joined_rooms.iter().any(|r| r.contains(crate::message_hub::BROADCAST_BOX_MARKER)) {
-                                att.pings_since_registry_refresh = att.pings_since_registry_refresh.saturating_add(1);
-                                if att.pings_since_registry_refresh >= crate::broadcast_registry::REFRESH_EVERY_PINGS {
-                                    att.pings_since_registry_refresh = 0;
-                                    refresh = att.auth.verified_identity_key().map(str::to_string);
-                                }
+                            if att.joined_rooms.iter().any(|r| r.contains(crate::message_hub::BROADCAST_BOX_MARKER))
+                                && registry_refresh_due(now, att.registry_refreshed_at_ms)
+                            {
+                                att.registry_refreshed_at_ms = Some(now);
+                                refresh = att.auth.verified_identity_key().map(str::to_string);
                             }
                             // PERSIST FIRST, REFRESH AFTER (LOW run 12, 2026-09-03):
                             // the registry refresh is an `await` into another DO,
@@ -666,8 +819,9 @@ impl DurableObject for EngineIoSession {
                                 state.awaiting_pong_since_ms = Some(now);
                                 // Keep the in-memory copy in step: the next
                                 // `to_attachment()` (any persisted mutation,
-                                // e.g. the pong) must not clobber the count.
-                                state.pings_since_registry_refresh = att.pings_since_registry_refresh;
+                                // e.g. the pong) must not clobber these.
+                                state.last_ping_at_ms = att.last_ping_at_ms;
+                                state.registry_refreshed_at_ms = att.registry_refreshed_at_ms;
                             }
                             if let Some(identity) = refresh {
                                 crate::broadcast_registry::register_identity(&self.env, &identity).await;
@@ -1369,7 +1523,17 @@ impl EngineIoSession {
                 // `record_room_membership`.
                 let hub_confirmed_join = outbound.iter().any(|ev| ev.event_name == "joinedRoom");
                 let rooms_changed = match self.inner.borrow_mut().as_mut() {
-                    Some(s) => record_room_membership(&mut s.joined_rooms, &name, &data, hub_confirmed_join),
+                    Some(s) => {
+                        let changed = record_room_membership(&mut s.joined_rooms, &name, &data, hub_confirmed_join);
+                        // The hub registered the identity at this join: the
+                        // registry entry is fresh as of now (0.3.8 time-based
+                        // refresh), so the heartbeat re-registers 175 s later,
+                        // not on its first tick.
+                        if changed && hub_confirmed_join && name == "joinRoom" {
+                            s.registry_refreshed_at_ms = Some(Date::now().as_millis());
+                        }
+                        changed
+                    }
                     None => false,
                 };
                 if rooms_changed {
@@ -1788,6 +1952,11 @@ impl EngineIoSession {
             }),
         };
         self.emit_signed_general(&ev, &snap_state, &wallet, "/", None);
+        // 0.3.8: a delivery is a wake too — repair a lost heartbeat chain on
+        // every attached socket (see `ensure_heartbeat`).
+        for ws in self.state.get_websockets() {
+            self.ensure_heartbeat(&ws).await;
+        }
         let t_done = Date::now().as_millis();
         console_log!(
             "TRACE_PHD broadcast.engineio.out sid={} msgId={} t={} dt_ms={}",
@@ -2046,27 +2215,88 @@ mod tests {
         assert!(s.to_attachment().awaiting_pong_since_ms.is_none());
     }
 
-    /// LOW run 10 (2026-09-03): the heartbeat's registry-refresh counter must
-    /// SURVIVE the round trip every persisted mutation makes — the pong
-    /// handler rehydrates `SessionState` from the attachment and writes it
-    /// back through `to_attachment()`. A hard `0` there reset the count on
-    /// every pong, so `REFRESH_EVERY_PINGS` was never reached, the registry
-    /// entry was never refreshed, and a live socket went deaf to every
-    /// broadcast 30 minutes after its last join (seat A missed blocks 965143
-    /// and 965144 while answering every ping).
+    /// LOW run 10 (2026-09-03): the heartbeat's refresh state must SURVIVE the
+    /// round trip every persisted mutation makes — the pong handler rehydrates
+    /// `SessionState` from the attachment and writes it back through
+    /// `to_attachment()`. A hard reset there meant the registry entry was never
+    /// refreshed and a live socket went deaf to every broadcast 30 minutes
+    /// after its last join (seat A missed blocks 965143 and 965144 while
+    /// answering every ping). 0.3.8 keeps TIMESTAMPS, not a count.
     #[test]
-    fn the_registry_refresh_counter_survives_the_attachment_round_trip() {
+    fn the_heartbeat_timestamps_survive_the_attachment_round_trip() {
         let v: WsAttachment = serde_json::from_str(
-            r#"{"sid":"abc","connected":true,"joined_rooms":["02aa-broadcast-low-tip"],"pings_since_registry_refresh":5}"#,
+            r#"{"sid":"abc","connected":true,"joined_rooms":["02aa-broadcast-low-tip"],"last_ping_at_ms":1000,"registry_refreshed_at_ms":500}"#,
         )
         .unwrap();
         let s = SessionState::from_attachment(&v);
-        assert_eq!(s.pings_since_registry_refresh, 5);
-        assert_eq!(s.to_attachment().pings_since_registry_refresh, 5, "a pong must not reset the count");
-        // A fresh session starts at 0 and an old attachment without the field reads 0.
-        assert_eq!(SessionState::new("x".into()).to_attachment().pings_since_registry_refresh, 0);
-        let old: WsAttachment = serde_json::from_str(r#"{"sid":"abc"}"#).unwrap();
-        assert_eq!(SessionState::from_attachment(&old).pings_since_registry_refresh, 0);
+        assert_eq!(s.last_ping_at_ms, Some(1000));
+        assert_eq!(s.registry_refreshed_at_ms, Some(500));
+        let back = s.to_attachment();
+        assert_eq!(back.last_ping_at_ms, Some(1000), "a pong must not reset the last-ping stamp");
+        assert_eq!(back.registry_refreshed_at_ms, Some(500), "a pong must not reset the refresh stamp");
+        // A fresh session and a 0.3.7 attachment (the old counter field, no stamps) read None.
+        assert!(SessionState::new("x".into()).to_attachment().registry_refreshed_at_ms.is_none());
+        let old: WsAttachment = serde_json::from_str(r#"{"sid":"abc","pings_since_registry_refresh":5}"#).unwrap();
+        assert!(SessionState::from_attachment(&old).registry_refreshed_at_ms.is_none());
+        assert!(SessionState::from_attachment(&old).last_ping_at_ms.is_none());
+    }
+
+    /// 0.3.8: the refresh is judged by time — due when unknown, due at the
+    /// interval, not before.
+    #[test]
+    fn the_registry_refresh_is_due_by_time_never_by_count() {
+        let every = crate::broadcast_registry::REGISTRY_REFRESH_EVERY_MS;
+        assert!(registry_refresh_due(1_000_000, None), "an unknown last refresh is due");
+        assert!(!registry_refresh_due(1_000_000, Some(1_000_000 - every + 1)));
+        assert!(registry_refresh_due(1_000_000, Some(1_000_000 - every)));
+        assert!(registry_refresh_due(1_000_000, Some(0)));
+        assert!(!registry_refresh_due(100, Some(1_000)), "a clock that went backwards is not due");
+    }
+
+    /// 0.3.8: the repair decision — LOW runs 12/13's lost-alarm class. A
+    /// pending alarm (even a little late) means nothing to do; a missing or
+    /// long-lost one is repaired for the remainder of the interval, or with a
+    /// ping now once the interval has passed.
+    #[test]
+    fn heartbeat_repair_covers_the_lost_alarm_class() {
+        let now = 10_000_000u64;
+        // pending, on time / slightly late → armed
+        assert_eq!(heartbeat_repair(now, Some(now - 1_000), Some(now + 24_000)), HeartbeatRepair::Armed);
+        assert_eq!(heartbeat_repair(now, Some(now - 30_000), Some(now - ALARM_LATE_GRACE_MS)), HeartbeatRepair::Armed);
+        // an alarm long past due is lost as surely as none
+        assert_eq!(heartbeat_repair(now, Some(now - 60_000), Some(now - ALARM_LATE_GRACE_MS - 1)), HeartbeatRepair::PingNow);
+        // none pending, last ping 5 s ago → arm for the remaining 20 s
+        assert_eq!(heartbeat_repair(now, Some(now - 5_000), None), HeartbeatRepair::ArmIn(PING_INTERVAL_MS - 5_000));
+        // none pending, interval passed → ping now (the run-13 socket at +33 s)
+        assert_eq!(heartbeat_repair(now, Some(now - 33_000), None), HeartbeatRepair::PingNow);
+        assert_eq!(heartbeat_repair(now, Some(now - PING_INTERVAL_MS), None), HeartbeatRepair::PingNow);
+        // no ping ever recorded (a 0.3.7 attachment) → ping now
+        assert_eq!(heartbeat_repair(now, None, None), HeartbeatRepair::PingNow);
+        // the repair's ping-now lands before the client's 45 s cliff when the
+        // client nudges at interval + 8 s: 33 s < 45 s
+        assert!(PING_INTERVAL_MS + 8_000 < PING_INTERVAL_MS + PING_TIMEOUT_MS);
+    }
+
+    /// 0.3.8 source pins: the alarm arms FIRST (before the socket loop and
+    /// any await), and every inbound frame repairs before it is dispatched.
+    #[test]
+    fn the_alarm_arms_first_and_every_inbound_frame_repairs_the_heartbeat() {
+        let src = include_str!("session.rs");
+        let a = src.find("async fn alarm(&self) -> Result<Response> {").expect("the alarm handler");
+        let body = &src[a..a + src[a..].find("Response::ok(\"heartbeat\")").expect("the alarm's end")];
+        let first_arm = body.find("self.arm_heartbeat_alarm().await;").expect("an arm in the alarm");
+        let loop_start = body.find("for ws in sockets {").expect("the socket loop");
+        assert!(first_arm < loop_start, "the alarm must arm BEFORE the socket loop (and its awaits)");
+        assert!(body.matches("self.arm_heartbeat_alarm().await;").count() >= 2, "and re-arm after the work");
+        let m = src.find("async fn websocket_message(").expect("the ws message handler");
+        let mbody = &src[m..m + src[m..].find("async fn websocket_close(").expect("the next handler")];
+        let repair = mbody.find("self.ensure_heartbeat(&ws).await;").expect("the repair call");
+        let dispatch = mbody.find("self.handle_engineio_packet(pkt, Some(&ws)).await;").expect("the dispatch");
+        assert!(repair < dispatch, "repair BEFORE dispatch");
+        // the broadcast delivery path repairs too
+        let b = src.find("async fn handle_socketio_broadcast(").expect("the broadcast handler");
+        let bbody = &src[b..b + src[b..].find("\n    }\n").expect("its end")];
+        assert!(bbody.contains("self.ensure_heartbeat(&ws).await;"), "a delivery repairs the heartbeat");
     }
 
     /// LOW run 11 (2026-09-03): the alarm's refresh gate reads the SESSION's

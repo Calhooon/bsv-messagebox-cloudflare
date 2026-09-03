@@ -4,6 +4,33 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.8 — 2026-09-03
+
+### The heartbeat survives a lost alarm (Cloudflare at-least-once, in practice not)
+- Two LOW runs (12 and 13) each recorded a COMPLETED heartbeat tick re-delivered
+  ~300 ms later as `canceled` (0 ms of wall time) with no alarm left behind — about one
+  tick in a hundred. The server stopped pinging and the client closed a live socket 45 s
+  later ("ping timeout"). The alarm chain is no longer the heartbeat's only driver:
+  - `alarm()` arms the next tick FIRST (before the socket loop and its awaits) and again
+    after the work.
+  - `ensure_heartbeat`: every inbound frame (before dispatch) and every delivery
+    re-reads the alarm; a missing or long-lost one is repaired — a ping now when the
+    interval has passed, an alarm for the remainder otherwise (`heartbeat_repair`,
+    table-tested; source-pinned).
+  - The client half (bsv-low `heartbeatNudge.ts`): when the server ping is 8 s late the
+    client sends ONE engine.io `noop`, which is the inbound frame that triggers the
+    repair — 33 s < the 45 s cliff, zero frames in the healthy case.
+- The broadcast-registry refresh is judged by TIME (`registry_refreshed_at_ms`,
+  `REGISTRY_REFRESH_EVERY_MS` = 175 s), replacing the 0.3.5 ping counter whose clobber
+  and ordering bugs cost three releases in one day. A confirmed `joinRoom` stamps the
+  refresh (the hub registered at join), so the first tick does not re-register.
+- TEST-ONLY fault injector `HEARTBEAT_TEST_LOSE_ALARM_AFTER_PONG_EVERY=<n>` (env var;
+  absent/0 = off; never in a production config): after every n-th tick's pong the alarm
+  is deleted — the platform's loss with its real timing (after the pong, so nothing
+  inbound follows) — so the repair is proven red→green against a deployed relay. (A
+  first cut skipped the arm inside the alarm handler; the pong 40 ms later repaired it
+  every time on beta — belt one proven, fault unfaithful.)
+
 ## 0.3.7 — 2026-09-03
 
 ### The heartbeat refresh no longer closes the socket it refreshes
