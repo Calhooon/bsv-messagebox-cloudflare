@@ -4,6 +4,15 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.11 — 2026-09-03
+
+### A fresh socket is not "overdue"
+- 0.3.10's overdue rule treated a socket with NO ping yet as overdue, so the first inbound
+  frame after the upgrade (the CONNECT) logged `heartbeat REPAIRED … pinging now` and sent
+  an early ping on every join (LOW run 15: four lines at join). Harmless to liveness,
+  noise in the one signal that counts repairs. The upgrade commit now stamps the
+  heartbeat epoch (`last_ping_at_ms`), and a missing stamp with a pending alarm is Armed.
+
 ## 0.3.10 — 2026-09-03
 
 ### The repair believes the ping schedule, not the alarm row

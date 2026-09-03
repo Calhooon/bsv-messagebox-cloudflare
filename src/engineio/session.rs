@@ -453,9 +453,13 @@ pub(crate) fn heartbeat_repair(
     alarm_at_ms: Option<u64>,
 ) -> HeartbeatRepair {
     // The SCHEDULE is the truth (0.3.10): a ping overdue by more than the
-    // grace means the tick did not run, whatever the alarm row says.
+    // grace means the tick did not run, whatever the alarm row says. A socket
+    // with NO ping yet is not overdue (0.3.11: a fresh upgrade has its first
+    // alarm pending and no ping — LOW run 15 logged a spurious "REPAIRED …
+    // pinging now" per socket at join); a pre-0.3.8 attachment with no ping
+    // and no alarm still falls through to `PingNow` below.
     let ping_overdue = last_ping_at_ms
-        .map_or(true, |last| now_ms.saturating_sub(last) >= PING_INTERVAL_MS + PING_OVERDUE_GRACE_MS);
+        .map_or(false, |last| now_ms.saturating_sub(last) >= PING_INTERVAL_MS + PING_OVERDUE_GRACE_MS);
     if ping_overdue {
         return HeartbeatRepair::PingNow;
     }
@@ -1172,6 +1176,10 @@ impl EngineIoSession {
                 if let Some(state) = self.inner.borrow_mut().as_mut() {
                     state.transport = Transport::WebSocket;
                     state.awaiting_pong_since_ms = None;
+                    // 0.3.11: the heartbeat's schedule starts HERE — the first
+                    // ping is one interval out, and the repair's "overdue"
+                    // arithmetic (`heartbeat_repair`) counts from this stamp.
+                    state.last_ping_at_ms = Some(Date::now().as_millis());
                 }
                 self.persist_to_ws_attachment();
                 // The server heartbeat starts with the upgrade (Engine.IO v4:
@@ -2322,6 +2330,8 @@ mod tests {
         assert_eq!(heartbeat_repair(now, Some(now - PING_INTERVAL_MS), None), HeartbeatRepair::PingNow);
         // no ping ever recorded (a 0.3.7 attachment) → ping now
         assert_eq!(heartbeat_repair(now, None, None), HeartbeatRepair::PingNow);
+        // 0.3.11: a FRESH socket (no ping yet, first alarm pending) is armed, not repaired
+        assert_eq!(heartbeat_repair(now, None, Some(now + 24_000)), HeartbeatRepair::Armed);
         // LOW run 14 (0.3.10): the platform's loss LEAVES THE ROW — the nudge
         // lands 33 s after the last ping with the alarm row 8 s past due →
         // ping now, whatever the row says (0.3.8's 10 s grace read Armed here)
