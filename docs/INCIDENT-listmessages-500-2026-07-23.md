@@ -39,9 +39,9 @@
 14:59:56.271Z  relay.send ok 310ms — shuffle_pass #1     (POST /sendMessage)
 14:59:56.812Z  relay.send ok 307ms — remask_pass  #1     (POST /sendMessage)
 14:59:57.299Z  relay.send ok 299ms — deal_keys    #1     (POST /sendMessage)
-14:59:57.705Z  HTTP 500  https://low-relay.dev-a3e.workers.dev/listMessages
+14:59:57.705Z  HTTP 500  https://<your-relay>.workers.dev/listMessages
 14:59:58.055Z  node-transition → felt-dealt_discard
-14:59:58.080Z  HTTP 500  https://low-relay.dev-a3e.workers.dev/listMessages
+14:59:58.080Z  HTTP 500  https://<your-relay>.workers.dev/listMessages
 ```
 
 Three `/sendMessage` POSTs fire in ~1 s (the `deal_keys` handoff is a burst of

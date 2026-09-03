@@ -4,6 +4,13 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.4 — 2026-09-03
+
+### Public-tree hygiene, enforced
+- `scripts/release-public.sh` rewrites every account `workers.dev` host to a placeholder and
+  REFUSES to publish while one survives (0.3.3 scrubbed the test defaults by hand and left
+  the host in older reports and scripts; the export is now the gate, not a sweep).
+
 ## 0.3.3 — 2026-09-03
 
 ### Public-tree hygiene

@@ -6,7 +6,7 @@ Hibernation is working on prod. A `MessageHub` Durable Object that idles for 60 
 
 ## Test artifact
 
-`tests/e2e_ws_hibernation_prod.py` — Python script, ~190 lines. Connects via signed BRC-31 to `wss://rust-message-box.dev-a3e.workers.dev/ws`, primes DO state with a `joinRoom`, idles 60 s with no frames in either direction, then sends another `joinRoom` and asserts the response arrives.
+`tests/e2e_ws_hibernation_prod.py` — Python script, ~190 lines. Connects via signed BRC-31 to `wss://<your-relay>.workers.dev/ws`, primes DO state with a `joinRoom`, idles 60 s with no frames in either direction, then sends another `joinRoom` and asserts the response arrives.
 
 ```
 [PASS] 0. Built signed BRC-31 headers for prod /ws

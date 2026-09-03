@@ -2,8 +2,8 @@
 //!
 //! Usage:
 //!   cargo run --release --bin load_gen -- \
-//!     --server https://rust-message-box.dev-a3e.workers.dev \
-//!     --ws wss://rust-message-box.dev-a3e.workers.dev/ws \
+//!     --server https://<your-relay>.workers.dev \
+//!     --ws wss://<your-relay>.workers.dev/ws \
 //!     --n 10 --soak-secs 30 \
 //!     --concurrent-handshakes 64 --concurrent-upgrades 256
 //!
@@ -31,9 +31,9 @@ struct Cli {
 enum Cmd {
     /// Run a single load wave: handshake → upgrade → soak → drop.
     Run {
-        #[arg(long, default_value = "https://rust-message-box.dev-a3e.workers.dev")]
+        #[arg(long, default_value = "https://<your-relay>.workers.dev")]
         server: String,
-        #[arg(long, default_value = "wss://rust-message-box.dev-a3e.workers.dev/ws")]
+        #[arg(long, default_value = "wss://<your-relay>.workers.dev/ws")]
         ws: String,
         #[arg(long, default_value_t = 10)]
         n: usize,

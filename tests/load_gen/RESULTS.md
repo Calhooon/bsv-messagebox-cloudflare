@@ -31,7 +31,7 @@ tests/load_gen/
     analytics.rs     # CF GraphQL DO billing query over a window
 ```
 
-## Wave results (against `wss://rust-message-box.dev-a3e.workers.dev/ws`)
+## Wave results (against `wss://<your-relay>.workers.dev/ws`)
 
 | n | handshake p50 / p99 / max | upgrade p50 / p99 / max | greeting p99 | peak concurrent | upgrade fail | held full soak | dropped during |
 |---:|---|---|---:|---:|---:|---:|---:|

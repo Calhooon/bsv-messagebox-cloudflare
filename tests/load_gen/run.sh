@@ -16,8 +16,8 @@ cd "$(dirname "$0")"
 BIN="./target/release/load_gen"
 [ -x "$BIN" ] || cargo build --release
 
-SERVER="${SERVER:-https://rust-message-box.dev-a3e.workers.dev}"
-WS="${WS:-wss://rust-message-box.dev-a3e.workers.dev/ws}"
+SERVER="${SERVER:-https://<your-relay>.workers.dev}"
+WS="${WS:-wss://<your-relay>.workers.dev/ws}"
 SOAK="${SOAK:-60}"
 
 if [ -n "${N:-}" ]; then
