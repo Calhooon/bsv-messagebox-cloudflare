@@ -86,6 +86,94 @@ const SOCKETIO_SUB_PREFIX: &str = "socketio_sub:";
 /// room, this is who gets the cross-DO `peerLeft`. Presence-only:
 /// nothing here ever gates message delivery or auth.
 const PEER_BY_ROOM_PREFIX: &str = "peer_by_room:";
+/// DO-storage key prefix for a departure nobody was there to receive
+/// (bsv-low 2026-09-05): delivered on the identity's next register / room join.
+const PARKED_LEFT_PREFIX: &str = "parkedleft:";
+/// A parked departure older than this is not news any more (the felt's own
+/// ladder has long since decided) — dropped on delivery.
+pub(crate) const PARKED_PEER_LEFT_TTL_MS: u64 = 3 * 60 * 1000;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ParkedPeerLeft {
+    leaver: String,
+    at_ms: u64,
+}
+/// 0.3.16 (bsv-low 2026-09-05, `dealtLeaveNotifyRejoin`): the ARRIVAL mirror of
+/// the parked departure. The stayer's socket died on a heartbeat timeout in the
+/// very seconds its opponent rejoined — `peerJoined` was pushed to a dying
+/// socket, nobody received it, and the told-state still flipped to Present, so
+/// every later arrival push was deduped away. A `peerJoined` that reached NO
+/// session is parked under `parkedjoined:<room>` and delivered on this
+/// identity's next register / room join, exactly like a parked departure.
+const PARKED_JOINED_PREFIX: &str = "parkedjoined:";
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ParkedPeerJoined {
+    joiner: String,
+    at_ms: u64,
+}
+/// PURE: is a parked presence event (departure or arrival) still worth delivering?
+pub(crate) fn parked_peer_left_is_fresh(parked_at_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(parked_at_ms) <= PARKED_PEER_LEFT_TTL_MS
+}
+/// Which parked presence event a (re)joining session is owed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParkedChoice {
+    Nothing,
+    Left,
+    Joined,
+}
+/// PURE (0.3.16): decide between a parked departure and a parked arrival for one
+/// room. The TOLD-STATE is the truth about the peer's LAST observed presence:
+/// told=Present drops a parked departure (0.3.15's rule — the peer came back),
+/// told=Absent drops a parked arrival (the peer left again; that departure has
+/// its own path). A stale event (past the TTL) is never news. When both still
+/// stand (no told-state at all), the NEWER one is delivered.
+pub(crate) fn parked_presence_choice(
+    left_at_ms: Option<u64>,
+    joined_at_ms: Option<u64>,
+    told: Option<ToldPresence>,
+    now_ms: u64,
+) -> ParkedChoice {
+    let left = left_at_ms
+        .filter(|at| parked_peer_left_is_fresh(*at, now_ms))
+        .filter(|_| !matches!(told, Some(ToldPresence::Present)));
+    let joined = joined_at_ms
+        .filter(|at| parked_peer_left_is_fresh(*at, now_ms))
+        .filter(|_| !matches!(told, Some(ToldPresence::Absent)));
+    match (left, joined) {
+        (None, None) => ParkedChoice::Nothing,
+        (Some(_), None) => ParkedChoice::Left,
+        (None, Some(_)) => ParkedChoice::Joined,
+        (Some(l), Some(j)) => {
+            if j >= l {
+                ParkedChoice::Joined
+            } else {
+                ParkedChoice::Left
+            }
+        }
+    }
+}
+
+/// PURE: should a departure from `room` arm the peer-left machinery? A LOBBY
+/// room (`<host>-low_lobby_<gid>`) signals a departure ONLY on a socket CLOSE
+/// (a crash — the class-L "quiet lobby learns of a dead host" case). A CLEAN
+/// leaveRoom of a lobby room is a match or a cancel: the advert lifecycle
+/// (overlay `lobby` event) owns it, and fanning a `host-left` there would be a
+/// FALSE "host away" on every normal match — the full18 run 2 P6 over-fan-out.
+/// A GAME room always signals (a deliberate leave should tell the peer; the
+/// crash-into-empty case is handled by the parked-departure delivery).
+pub(crate) fn departure_signals(room: &str, via_close: bool) -> bool {
+    // 0.3.15 (bsv-low full18 validation, 2026-09-05): a DEPARTURE IS A SOCKET
+    // CLOSE — for EVERY room. A client-initiated `leaveRoom` on a game room is
+    // a room HOP (the felt's inbound watchdog leaves + re-joins to recover a
+    // dropped envelope); under load the re-join took longer than the 4 s
+    // debounce, the occupancy re-check found the room empty, and the peer was
+    // told "opponent lost connection" about a seat that never left. Every real
+    // departure closes the socket (tab close, crash, heartbeat timeout — the
+    // #225/W6 teardown) or is an explicit app-level GOODBYE message, so a room
+    // hop never needs to signal. `room` stays in the signature for the pin.
+    let _ = room;
+    via_close
+}
 
 /// DO-storage key prefix for a room's last-seen heartbeat
 /// (`lastseen:<room>` → `u64` epoch-millis of the most recent
@@ -918,6 +1006,7 @@ impl MessageHub {
                     std::slice::from_ref(&room_id),
                     Some(ws),
                     None,
+                    false, // an explicit leaveRoom is a CLEAN departure (match/cancel)
                 )
                 .await;
             }
@@ -1227,6 +1316,7 @@ impl MessageHub {
                     std::slice::from_ref(&room_id),
                     None,
                     Some(&sid),
+                    false, // an explicit leaveRoom is a CLEAN departure (match/cancel)
                 )
                 .await;
                 vec![OutboundEvent::new("leftRoom", json!({ "roomId": room_id }))]
@@ -1327,6 +1417,7 @@ impl MessageHub {
         // lose membership it previously joined.
         let existing: Option<SocketIoRegistryEntry> =
             self.state.storage().get(&key).await.ok().flatten();
+        let rooms_now: Vec<String> = existing.as_ref().map(|e| e.joined_rooms.clone()).unwrap_or_default();
         let entry = SocketIoRegistryEntry {
             sid: body.sid.clone(),
             registered_at_ms: Date::now().as_millis(),
@@ -1339,6 +1430,9 @@ impl MessageHub {
                 e
             );
             return Response::error("storage put failed", 500);
+        }
+        if !rooms_now.is_empty() {
+            self.deliver_parked_presence(&body.sid, &rooms_now).await;
         }
         Response::from_json(&json!({ "status": "ok" }))
     }
@@ -1383,11 +1477,16 @@ impl MessageHub {
                 return;
             }
         };
+        let before: Vec<String> = entry.joined_rooms.clone();
         mutate(&mut entry.joined_rooms);
+        let added: Vec<String> = entry.joined_rooms.iter().filter(|r| !before.contains(r)).cloned().collect();
         if let Err(e) = self.state.storage().put(&key, entry).await {
             console_log!(
                 "MessageHub: update_socketio_rooms: storage put failed for sid={sid}: {e}"
             );
+        }
+        if !added.is_empty() {
+            self.deliver_parked_presence(sid, &added).await;
         }
     }
 
@@ -1415,6 +1514,7 @@ impl MessageHub {
                         &entry.joined_rooms,
                         None,
                         Some(&entry.sid),
+                        true, // a socket.io disconnect (tab close / crash) — the class-L signal
                     )
                     .await;
                 }
@@ -1569,7 +1669,7 @@ impl MessageHub {
         // peerLeft push — which the LOW client's verify-not-a-flap
         // presence check absorbs by design.
         let _ = ws.serialize_attachment(&latched);
-        self.maybe_notify_peer_left(&leaver, &rooms, Some(ws), None)
+        self.maybe_notify_peer_left(&leaver, &rooms, Some(ws), None, true) // a WS close — the class-L signal
             .await;
     }
 
@@ -1591,8 +1691,14 @@ impl MessageHub {
         rooms: &[String],
         departing_ws: Option<&WebSocket>,
         departing_sid: Option<&str>,
+        via_close: bool,
     ) {
         for room in rooms {
+            // A CLEAN leave of a lobby room (matched / cancelled) fans nothing —
+            // only a socket CLOSE (crash) signals a waiting host's departure.
+            if !departure_signals(room, via_close) {
+                continue;
+            }
             // Final heartbeat (#225): the departing session was verifiably
             // here until NOW — stamp `lastseen:<room>` at departure time so
             // the peer's `/presence` carries an honest "was here until T"
@@ -1664,6 +1770,25 @@ impl MessageHub {
     /// client's verify-not-a-flap presence check, same bound as the
     /// close/error double-fire latch.
     async fn push_peer_left(&self, room: &str, leaver: &str) {
+        // bsv-low 2026-09-05 (full18 class L): a WAITING host's lobby room has
+        // no counterparty — its watchers are the whole lobby. A confirmed
+        // departure (the debounce already ruled out a flap) fans a `lobby`
+        // event into every subscriber's `broadcast-low-lobby` box; the
+        // watcher re-probes presence and its own confirm window decides.
+        if crate::is_lobby_room(room) {
+            if let Some(body) = crate::lobby_departure_body(room, leaver, Date::now().as_millis()) {
+                let (subscribers, pushed) =
+                    crate::fan_out_broadcast(&self.env, crate::LOBBY_BROADCAST_BOX, &body).await;
+                console_log!(
+                    "MessageHub: lobby host-left {} (room {}) → {} of {} lobby subscribers",
+                    leaver,
+                    room,
+                    pushed,
+                    subscribers
+                );
+            }
+            return;
+        }
         let key = format!("{PEER_BY_ROOM_PREFIX}{room}");
         let peer: Option<String> = self.state.storage().get(&key).await.ok().flatten();
         let Some(peer) = peer else { return };
@@ -1928,7 +2053,82 @@ impl MessageHub {
                 }
             }
         }
+        if delivered == 0 {
+            // bsv-low 2026-09-05 (full18 run 2, survivorLooksOnly): the counterparty's
+            // hub pushed the departure while THIS identity's only session was between a
+            // leave and a re-join (the felt's inbound watchdog re-listens) — nobody
+            // received it, the told-state still flipped to "absent", and every later
+            // push was deduped: the open seat never heard the event. PARK it; the next
+            // register / room join of this identity delivers it (bounded by
+            // PARKED_PEER_LEFT_TTL_MS — a stale departure is not news).
+            let parked = ParkedPeerLeft { leaver: body.leaver.clone(), at_ms: Date::now().as_millis() };
+            if let Err(e) = self.state.storage().put(&format!("{PARKED_LEFT_PREFIX}{}", body.room_id), parked).await {
+                console_log!("MessageHub: parkedleft put failed for {}: {e}", body.room_id);
+            } else {
+                console_log!("MessageHub: peerLeft for {} PARKED (no session to deliver to)", body.room_id);
+            }
+        }
         Response::from_json(&json!({ "delivered": delivered }))
+    }
+
+    /// Deliver the parked presence event (a departure, 0.3.13 — or an arrival,
+    /// 0.3.16) each of `rooms` owes the socket.io session `sid` that just
+    /// registered / joined, then clear both parked keys for the room. The choice
+    /// is `parked_presence_choice` (pure): the told-state decides which one still
+    /// stands, the TTL drops stale news, the newer wins a tie.
+    async fn deliver_parked_presence(&self, sid: &str, rooms: &[String]) {
+        let now_ms = Date::now().as_millis();
+        for room in rooms {
+            let left_key = format!("{PARKED_LEFT_PREFIX}{room}");
+            let joined_key = format!("{PARKED_JOINED_PREFIX}{room}");
+            let left: Option<ParkedPeerLeft> = self.state.storage().get(&left_key).await.ok().flatten();
+            let joined: Option<ParkedPeerJoined> = self.state.storage().get(&joined_key).await.ok().flatten();
+            if left.is_none() && joined.is_none() {
+                continue;
+            }
+            let _ = self.state.storage().delete(&left_key).await;
+            let _ = self.state.storage().delete(&joined_key).await;
+            let told = self.read_told(room).await;
+            let choice = parked_presence_choice(left.as_ref().map(|p| p.at_ms), joined.as_ref().map(|p| p.at_ms), told, now_ms);
+            let (event, sender, at_ms) = match choice {
+                ParkedChoice::Nothing => {
+                    console_log!(
+                        "MessageHub: parked presence for {room} dropped (left={} joined={} told={:?}) — stale or superseded",
+                        left.is_some(),
+                        joined.is_some(),
+                        told
+                    );
+                    continue;
+                }
+                ParkedChoice::Left => {
+                    let p = left.expect("chosen");
+                    ("peerLeft", p.leaver, p.at_ms)
+                }
+                ParkedChoice::Joined => {
+                    let p = joined.expect("chosen");
+                    ("peerJoined", p.joiner, p.at_ms)
+                }
+            };
+            let Ok(ns) = self.env.durable_object("ENGINEIO_SESSION") else { continue };
+            let Ok(stub) = ns.id_from_name(sid).and_then(|id| id.get_stub()) else { continue };
+            let payload = json!({
+                "roomId": room,
+                "sender": sender,
+                "messageId": format!("{}-{}", if event == "peerLeft" { "peer-left" } else { "peer-joined" }, now_ms),
+                "body": {},
+                "event": event,
+            })
+            .to_string();
+            let headers = Headers::new();
+            let _ = headers.set("content-type", "application/json");
+            let mut init = RequestInit::new();
+            init.with_method(Method::Post).with_headers(headers).with_body(Some(payload.into()));
+            let Ok(req) = Request::new_with_init("https://do.local/internal/socketio-broadcast", &init) else { continue };
+            match stub.fetch_with_request(req).await {
+                Ok(_) => console_log!("MessageHub: parked {event} for {room} delivered to sid={sid} ({}ms late)", now_ms.saturating_sub(at_ms)),
+                Err(e) => console_log!("MessageHub: parked {event} delivery failed for {room}: {e}"),
+            }
+        }
     }
 
     /// `/internal/rejoin-deadline?room=<roomId>` (body `{deadlineMs:<u64>}`)
@@ -1957,7 +2157,17 @@ impl MessageHub {
             Err(e) => return Response::error(format!("invalid rejoin-deadline body: {e}"), 400),
         };
         self.stamp_rejoin_deadline(&room, body.deadline_ms).await;
-        Response::from_json(&json!({ "status": "success" }))
+        // bsv-low 2026-09-05: name the room's remembered COUNTERPARTY (the
+        // seat that posted into this room) so the worker can file the tier-2
+        // `ladder` event into its `low_events` box. Advisory: absent ⇒ null.
+        let peer: Option<String> = self
+            .state
+            .storage()
+            .get(&format!("{PEER_BY_ROOM_PREFIX}{room}"))
+            .await
+            .ok()
+            .flatten();
+        Response::from_json(&json!({ "status": "success", "peer": peer }))
     }
 
     /// `/internal/presence?room=<roomId>` — is any live session of this
@@ -2057,6 +2267,20 @@ impl MessageHub {
                         delivered += 1;
                     }
                 }
+            }
+        }
+        if delivered == 0 {
+            // 0.3.16 (bsv-low 2026-09-05, dealtLeaveNotifyRejoin): the counterparty
+            // rejoined while THIS identity's only session was dead (a heartbeat
+            // timeout, a reconnect in flight) — nobody received the arrival and the
+            // told-state already says Present, so it would never be re-pushed. PARK
+            // it; the next register / room join of this identity delivers it
+            // (bounded by the same TTL; dropped if the peer left again meanwhile).
+            let parked = ParkedPeerJoined { joiner: body.joiner.clone(), at_ms: Date::now().as_millis() };
+            if let Err(e) = self.state.storage().put(&format!("{PARKED_JOINED_PREFIX}{}", body.room_id), parked).await {
+                console_log!("MessageHub: parkedjoined put failed for {}: {e}", body.room_id);
+            } else {
+                console_log!("MessageHub: peerJoined for {} PARKED (no session to deliver to)", body.room_id);
             }
         }
         Response::from_json(&json!({ "delivered": delivered }))
@@ -3484,5 +3708,60 @@ mod tests {
             sim.pushes
         );
         assert_eq!(sim.pushes[0].0, room_a);
+    }
+}
+
+#[cfg(test)]
+mod parked_peer_left_tests {
+    use super::*;
+
+    #[test]
+    fn a_parked_departure_is_fresh_inside_the_ttl_and_stale_past_it() {
+        assert!(parked_peer_left_is_fresh(1_000, 1_000));
+        assert!(parked_peer_left_is_fresh(1_000, 1_000 + PARKED_PEER_LEFT_TTL_MS));
+        assert!(!parked_peer_left_is_fresh(1_000, 1_000 + PARKED_PEER_LEFT_TTL_MS + 1));
+        assert!(parked_peer_left_is_fresh(5_000, 1_000)); // a clock that went backwards never drops news
+    }
+
+    #[test]
+    fn a_parked_arrival_is_delivered_unless_the_peer_left_again_or_it_went_stale() {
+        use ParkedChoice::*;
+        use ToldPresence::*;
+        let now = 1_000_000; // comfortably past the TTL so the stale case cannot underflow
+        // the dealtLeaveNotifyRejoin shape: the arrival parked, told=Present, nothing else parked
+        assert_eq!(parked_presence_choice(None, Some(now - 5_000), Some(Present), now), Joined);
+        // the peer left AGAIN after arriving: the arrival is not news any more
+        assert_eq!(parked_presence_choice(None, Some(now - 5_000), Some(Absent), now), Nothing);
+        // stale past the TTL
+        assert_eq!(parked_presence_choice(None, Some(now - PARKED_PEER_LEFT_TTL_MS - 1), Some(Present), now), Nothing);
+        // 0.3.15's rule kept: a parked departure is dropped once the peer came back
+        assert_eq!(parked_presence_choice(Some(now - 5_000), None, Some(Present), now), Nothing);
+        assert_eq!(parked_presence_choice(Some(now - 5_000), None, Some(Absent), now), Left);
+        // both parked, no told-state at all: the newer one is the news
+        assert_eq!(parked_presence_choice(Some(now - 9_000), Some(now - 5_000), None, now), Joined);
+        assert_eq!(parked_presence_choice(Some(now - 5_000), Some(now - 9_000), None, now), Left);
+        // nothing parked
+        assert_eq!(parked_presence_choice(None, None, Some(Present), now), Nothing);
+    }
+}
+
+#[cfg(test)]
+mod departure_signals_tests {
+    use super::*;
+
+    const OWNER: &str = "02d09d2feb33d5a17f426fd3d0c5c1a45c87961ece4c095fd111d37c7b2b0b4090";
+    const GID: &str = "1a3f5099ce9c7bb1751339a9ff5933f56921278eb3228e0b00992b98b1747a55";
+
+    #[test]
+    fn a_clean_leave_of_any_room_signals_nothing_but_a_socket_close_does() {
+        let lobby = format!("{OWNER}-low_lobby_{GID}");
+        let game = format!("{OWNER}-low_game_{GID}");
+        // EVERY room: only a socket CLOSE (crash / heartbeat timeout) signals.
+        // A clean leaveRoom is a room HOP (a lobby match/cancel, the felt's
+        // watchdog re-listen) and never a departure — 0.3.15.
+        assert!(!departure_signals(&lobby, false));
+        assert!(departure_signals(&lobby, true));
+        assert!(!departure_signals(&game, false));
+        assert!(departure_signals(&game, true));
     }
 }
