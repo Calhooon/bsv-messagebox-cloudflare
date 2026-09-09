@@ -1,6 +1,6 @@
 [package]
 name = "rust-message-box"
-version = "0.3.16"
+version = "0.3.20"
 edition = "2021"
 
 [lib]
@@ -39,6 +39,9 @@ bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction", "wasm"]
 tokio = { version = "1", features = ["rt", "macros"] }
 # Test-only RNG for generating ephemeral RSA test keys. Not used at runtime.
 rand = "0.8"
+# Dev-only: the ack statements are planned and executed on a real SQLite with the
+# real migrations (retention.rs tests). Never compiled into the worker.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # 2026-07-23 (#249): the 429-fix (lazy + best-effort BRC-31 session-liveness
 # touch) is NOW in PUBLISHED bsv-middleware-cloudflare 0.3.0 — the dep above is

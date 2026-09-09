@@ -8,7 +8,6 @@ use bsv_middleware_cloudflare::{
 use serde_json::json;
 use worker::*;
 
-
 mod broadcast_registry;
 pub use broadcast_registry::BroadcastRegistry;
 mod api_docs;
@@ -159,7 +158,10 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // push and FCM all unchanged). No handshake per event: the bearer IS the
     // producer's credential, exactly as on `/broadcast`.
     if req.method() == Method::Post && req.path() == "/push" {
-        let expected = env.secret("BROADCAST_TOKEN").map(|s| s.to_string()).unwrap_or_default();
+        let expected = env
+            .secret("BROADCAST_TOKEN")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         let got = req
             .headers()
             .get("Authorization")?
@@ -182,7 +184,10 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         return Response::from_json(&body).map(|r| r.with_status(status));
     }
     if req.method() == Method::Post && req.path() == "/broadcast" {
-        let expected = env.secret("BROADCAST_TOKEN").map(|s| s.to_string()).unwrap_or_default();
+        let expected = env
+            .secret("BROADCAST_TOKEN")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         let got = req
             .headers()
             .get("Authorization")?
@@ -211,9 +216,10 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
             return Response::error("box must be broadcast-*", 400);
         }
         let (subscribers, pushed) = fan_out_broadcast(&env, &b.box_name, &b.body).await;
-        return Response::from_json(&serde_json::json!({ "subscribers": subscribers, "pushed": pushed }));
+        return Response::from_json(
+            &serde_json::json!({ "subscribers": subscribers, "pushed": pushed }),
+        );
     }
-
 
     if req.path() == "/ws" && is_websocket_upgrade(&req) {
         return route_websocket_upgrade(req, &env, &auth_options).await;
@@ -290,7 +296,25 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
             200,
         ),
         (Method::Post, "/sendMessage") => {
-            handle_send_message(&request_body, identity_key, &env, &store).await
+            // 0.3.19 (bsv-low loop-10 promotion, the tower review's HIGH-1,
+            // 2026-09-09): the FIRST-PARTY boxes (`low_events`, `broadcast-*`)
+            // are written only through the bearer-gated `/push` and
+            // `/broadcast` — an authenticated end user could otherwise file a
+            // forged tower `case` event into a seat's box. Refused here, at
+            // the door, before validation (the reference server has no such
+            // box; a divergence by design, recorded in bsv-low's register).
+            if let Some((status, code, description)) =
+                serde_json::from_slice::<serde_json::Value>(&request_body)
+                    .ok()
+                    .and_then(|v| first_party_box_refusal(&v))
+            {
+                (
+                    json!({ "status": "error", "code": code, "description": description }),
+                    status,
+                )
+            } else {
+                handle_send_message(&request_body, identity_key, &env, &store).await
+            }
         }
         (Method::Post, "/listMessages") => {
             handle_list_messages(&request_body, identity_key, &store).await
@@ -570,9 +594,11 @@ async fn handle_presence_route(url: &Url, env: &Env) -> (serde_json::Value, u16)
         let namespace = env.durable_object("MESSAGE_HUB").ok()?;
         let stub = namespace.id_from_name(owner).ok()?.get_stub().ok()?;
         // Url::parse_with_params percent-encodes the room for us.
-        let do_url =
-            Url::parse_with_params("https://do.local/internal/presence", [("room", room.as_str())])
-                .ok()?;
+        let do_url = Url::parse_with_params(
+            "https://do.local/internal/presence",
+            [("room", room.as_str())],
+        )
+        .ok()?;
         let mut res = stub.fetch_with_str(do_url.as_str()).await.ok()?;
         let body: serde_json::Value = res.json().await.ok()?;
         let present = body.get("present").and_then(|v| v.as_bool())?;
@@ -722,7 +748,9 @@ async fn handle_rejoin_deadline_route(
         let req = Request::new_with_init(do_url.as_str(), &init).ok()?;
         let mut res = stub.fetch_with_request(req).await.ok()?;
         let body: serde_json::Value = res.json().await.ok()?;
-        body.get("peer").and_then(|p| p.as_str()).map(|p| p.to_ascii_lowercase())
+        body.get("peer")
+            .and_then(|p| p.as_str())
+            .map(|p| p.to_ascii_lowercase())
     }
     .await;
     // Tier-2 as an EVENT (bsv-low 2026-09-05): file a `ladder` event into the
@@ -738,8 +766,13 @@ async fn handle_rejoin_deadline_route(
                 if let Ok((sender, send_body)) = split_push_body(&raw, now_ms) {
                     if let Ok(db) = env.d1("DB") {
                         let store = storage::Storage::new(&db);
-                        let (_, status) = handle_send_message(&send_body, &sender, env, &store).await;
-                        ladder = if (200..300).contains(&status) { "filed" } else { "refused" };
+                        let (_, status) =
+                            handle_send_message(&send_body, &sender, env, &store).await;
+                        ladder = if (200..300).contains(&status) {
+                            "filed"
+                        } else {
+                            "refused"
+                        };
                         if ladder == "refused" {
                             console_log!("/rejoin-deadline: ladder event refused (HTTP {status}) for room {room}");
                         }
@@ -749,7 +782,10 @@ async fn handle_rejoin_deadline_route(
             None => ladder = "not-a-game-room",
         }
     }
-    (json!({ "status": "success", "room": room, "ladder": ladder }), 200)
+    (
+        json!({ "status": "success", "room": room, "ladder": ladder }),
+        200,
+    )
 }
 
 // Auth-layer error responses (`{code:"UNAUTHORIZED", message:"..."}`) are
@@ -953,7 +989,11 @@ pub(crate) fn is_lobby_room(room: &str) -> bool {
 /// class L): with the probe running only on list changes, a QUIET lobby
 /// could never learn a host had died — the 2026-09-03 event-driven client
 /// had removed the 15 s cadence and nothing replaced the signal.
-pub(crate) fn lobby_departure_body(room: &str, leaver: &str, at_ms: u64) -> Option<serde_json::Value> {
+pub(crate) fn lobby_departure_body(
+    room: &str,
+    leaver: &str,
+    at_ms: u64,
+) -> Option<serde_json::Value> {
     let (owner, suffix) = split_owner_room(room)?;
     let game_id = suffix.strip_prefix(LOBBY_ROOM_PREFIX)?;
     if game_id.is_empty() {
@@ -1023,14 +1063,21 @@ pub(crate) fn ladder_event_push_body(
 /// (the `/broadcast` route's core, shared with the hub's lobby-departure
 /// producer). Returns `(subscribers, pushed)`. Best-effort per hub; a shard
 /// read failure is logged as a partial fan-out.
-pub(crate) async fn fan_out_broadcast(env: &Env, box_name: &str, body: &serde_json::Value) -> (usize, u32) {
+pub(crate) async fn fan_out_broadcast(
+    env: &Env,
+    box_name: &str,
+    body: &serde_json::Value,
+) -> (usize, u32) {
     let Ok(reg) = env.durable_object("BROADCAST_REGISTRY") else {
         return (0, 0);
     };
     // 16 nibble-shards, read in parallel (see the join-notify twin).
     let mut shard_futs = Vec::new();
     for shard in "0123456789abcdef".chars() {
-        let Ok(stub) = reg.id_from_name(&format!("v1:{shard}")).and_then(|i| i.get_stub()) else {
+        let Ok(stub) = reg
+            .id_from_name(&format!("v1:{shard}"))
+            .and_then(|i| i.get_stub())
+        else {
             continue;
         };
         shard_futs.push(async move { stub.fetch_with_str("https://registry/list").await });
@@ -1039,16 +1086,15 @@ pub(crate) async fn fan_out_broadcast(env: &Env, box_name: &str, body: &serde_js
     for fut in shard_futs {
         match fut.await {
             Ok(mut r) => {
-                if let Some(list) = r
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .and_then(|v| serde_json::from_value::<Vec<String>>(v["identities"].clone()).ok())
-                {
+                if let Some(list) = r.json::<serde_json::Value>().await.ok().and_then(|v| {
+                    serde_json::from_value::<Vec<String>>(v["identities"].clone()).ok()
+                }) {
                     identities.extend(list);
                 }
             }
-            Err(e) => console_log!("broadcast {box_name}: a registry shard failed (partial fan-out): {e}"),
+            Err(e) => {
+                console_log!("broadcast {box_name}: a registry shard failed (partial fan-out): {e}")
+            }
         }
     }
     let Ok(namespace) = env.durable_object("MESSAGE_HUB") else {
@@ -1092,6 +1138,30 @@ pub(crate) async fn fan_out_broadcast(env: &Env, box_name: &str, body: &serde_js
 /// pubkey hex) and the remaining `/sendMessage`-shaped JSON (re-serialized
 /// without `sender`, so the reference validator sees exactly what an authed
 /// client would have sent).
+/// The boxes only OUR workers may write (through `/push` / `/broadcast`, bearer-gated):
+/// the seat's durable server-event box and every public broadcast room.
+pub(crate) fn is_first_party_box(name: &str) -> bool {
+    name == EVENTS_BOX || name.starts_with("broadcast-")
+}
+
+/// The refusal an ordinary `/sendMessage` earns when its `messageBox` is first-party:
+/// `(403, code, description)`; `None` for every other box (or an unparseable body,
+/// which `validate_send_message` refuses on its own terms).
+/// The refusal text for a first-party box (shared by the HTTP door and the hub's
+/// live path); `None` for every other box.
+pub(crate) fn first_party_box_reason(name: &str) -> Option<String> {
+    is_first_party_box(name)
+        .then(|| format!("message box '{name}' is first-party: only the service push may write it"))
+}
+
+pub(crate) fn first_party_box_refusal(
+    body: &serde_json::Value,
+) -> Option<(u16, &'static str, String)> {
+    let message = body.get("message").unwrap_or(body);
+    let name = message.get("messageBox").and_then(|v| v.as_str())?;
+    first_party_box_reason(name).map(|reason| (403, "ERR_FIRST_PARTY_BOX", reason))
+}
+
 fn split_push_body(raw: &[u8], now_ms: u64) -> std::result::Result<(String, Vec<u8>), String> {
     let mut v: serde_json::Value =
         serde_json::from_slice(raw).map_err(|e| format!("push body is not JSON: {e}"))?;
@@ -1133,9 +1203,14 @@ fn split_push_body(raw: &[u8], now_ms: u64) -> std::result::Result<(String, Vec<
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();
             h.update(sender.as_bytes());
-            h.update(serde_json::to_vec(&serde_json::Value::Object(message.clone())).unwrap_or_default());
+            h.update(
+                serde_json::to_vec(&serde_json::Value::Object(message.clone())).unwrap_or_default(),
+            );
             h.update(now_ms.to_string().as_bytes());
-            message.insert("messageId".into(), serde_json::Value::String(hex::encode(h.finalize())));
+            message.insert(
+                "messageId".into(),
+                serde_json::Value::String(hex::encode(h.finalize())),
+            );
         }
         obj.insert("message".into(), serde_json::Value::Object(message));
     }
@@ -1175,7 +1250,11 @@ mod push_route_tests {
             r#"{{"sender":"{SENDER}","recipient":"{SENDER}","messageBox":"low_events","body":{{"kind":"pot"}}}}"#
         );
         let (_, rest) = split_push_body(raw.as_bytes(), 1_700_000_000_000).unwrap();
-        assert!(validation::validate_send_message(&rest).is_ok(), "{}", String::from_utf8_lossy(&rest));
+        assert!(
+            validation::validate_send_message(&rest).is_ok(),
+            "{}",
+            String::from_utf8_lossy(&rest)
+        );
     }
 
     #[test]
@@ -1189,9 +1268,46 @@ mod push_route_tests {
     }
 
     #[test]
+    fn the_ordinary_send_route_refuses_the_first_party_boxes_and_nothing_else() {
+        // the seat's server-event box: refused at the door (403), whatever the sender
+        let forged = json!({ "recipient": "02aa", "messageBox": "low_events", "body": { "v": 1, "kind": "case", "status": "finalized_refuse" } });
+        let r = first_party_box_refusal(&forged).expect("low_events is first-party");
+        assert_eq!(r.0, 403);
+        assert_eq!(r.1, "ERR_FIRST_PARTY_BOX");
+        // the wrapped shape (`{"message": {...}}`) is judged the same
+        let wrapped = json!({ "message": { "recipient": "02aa", "messageBox": "broadcast-low-pots", "body": "x" } });
+        assert_eq!(first_party_box_refusal(&wrapped).map(|r| r.0), Some(403));
+        // every other box passes to validation untouched
+        for name in [
+            "low_game_ab",
+            "notifications",
+            "inbox",
+            "low_eventsx",
+            "xbroadcast-low-pots",
+        ] {
+            let ok = json!({ "recipient": "02aa", "messageBox": name, "body": "x" });
+            assert!(
+                first_party_box_refusal(&ok).is_none(),
+                "{name} is not first-party"
+            );
+        }
+        // no box at all: not this gate's call (validation answers ERR_INVALID_MESSAGEBOX)
+        assert!(first_party_box_refusal(&json!({ "recipient": "02aa", "body": "x" })).is_none());
+        assert!(
+            is_first_party_box(EVENTS_BOX)
+                && is_first_party_box("broadcast-low-board")
+                && !is_first_party_box("low_game_x")
+        );
+    }
+
+    #[test]
     fn split_push_body_refuses_a_missing_or_malformed_sender_and_non_objects() {
         assert!(split_push_body(br#"{"recipient":"03ff"}"#, 1_700_000_000_000).is_err());
-        assert!(split_push_body(br#"{"sender":"nothex","recipient":"03ff"}"#, 1_700_000_000_000).is_err());
+        assert!(split_push_body(
+            br#"{"sender":"nothex","recipient":"03ff"}"#,
+            1_700_000_000_000
+        )
+        .is_err());
         assert!(split_push_body(br#"[1,2]"#, 1_700_000_000_000).is_err());
         assert!(split_push_body(b"not json", 1_700_000_000_000).is_err());
     }
@@ -1236,8 +1352,10 @@ mod presence_route_tests {
 
     #[test]
     fn presence_route_threads_last_seen_when_set() {
-        let (body, status) =
-            presence_route_response("03aa-inbox", &answered(false, Some(1_700_000_000_123), None));
+        let (body, status) = presence_route_response(
+            "03aa-inbox",
+            &answered(false, Some(1_700_000_000_123), None),
+        );
         assert_eq!(status, 200);
         assert_eq!(body["present"], json!(false));
         assert_eq!(body["lastSeenMs"], json!(1_700_000_000_123u64));
@@ -1429,7 +1547,8 @@ mod low_event_tests {
     #[test]
     fn the_lobby_departure_body_is_the_app_layer_lobby_envelope_with_a_host_left_change() {
         let room = format!("{OWNER}-low_lobby_{GID}");
-        let body = lobby_departure_body(&room, OWNER, 1_700_000_000_000).expect("a lobby room fans out");
+        let body =
+            lobby_departure_body(&room, OWNER, 1_700_000_000_000).expect("a lobby room fans out");
         assert_eq!(body["kind"], "lobby");
         assert_eq!(body["at"], 1_700_000_000_000u64);
         assert_eq!(body["changes"][0]["kind"], "host-left");
@@ -1462,15 +1581,30 @@ mod low_event_tests {
         assert_eq!(sb["message"]["recipient"], PEER);
         assert_eq!(sb["message"]["messageBox"], EVENTS_BOX);
         assert_eq!(sb["message"]["body"]["kind"], "ladder");
-        assert!(sb["message"]["messageId"].as_str().is_some_and(|m| m.len() == 64));
+        assert!(sb["message"]["messageId"]
+            .as_str()
+            .is_some_and(|m| m.len() == 64));
     }
 
     #[test]
     fn the_ladder_event_refuses_a_lobby_room_a_foreign_owner_a_self_peer_and_a_bad_gid() {
-        assert!(ladder_event_push_body(OWNER, PEER, &format!("{OWNER}-low_lobby_{GID}"), 1, 1).is_none());
-        assert!(ladder_event_push_body(PEER, PEER, &format!("{OWNER}-low_game_{GID}"), 1, 1).is_none());
-        assert!(ladder_event_push_body(OWNER, OWNER, &format!("{OWNER}-low_game_{GID}"), 1, 1).is_none());
-        assert!(ladder_event_push_body(OWNER, PEER, &format!("{OWNER}-low_game_abcd"), 1, 1).is_none());
-        assert!(ladder_event_push_body(OWNER, "nope", &format!("{OWNER}-low_game_{GID}"), 1, 1).is_none());
+        assert!(
+            ladder_event_push_body(OWNER, PEER, &format!("{OWNER}-low_lobby_{GID}"), 1, 1)
+                .is_none()
+        );
+        assert!(
+            ladder_event_push_body(PEER, PEER, &format!("{OWNER}-low_game_{GID}"), 1, 1).is_none()
+        );
+        assert!(
+            ladder_event_push_body(OWNER, OWNER, &format!("{OWNER}-low_game_{GID}"), 1, 1)
+                .is_none()
+        );
+        assert!(
+            ladder_event_push_body(OWNER, PEER, &format!("{OWNER}-low_game_abcd"), 1, 1).is_none()
+        );
+        assert!(
+            ladder_event_push_body(OWNER, "nope", &format!("{OWNER}-low_game_{GID}"), 1, 1)
+                .is_none()
+        );
     }
 }

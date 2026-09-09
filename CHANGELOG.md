@@ -4,6 +4,58 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.20 — 2026-09-09
+
+- The first-party box refusal (0.3.19) now covers the LIVE send path too: the hub's `sendMessage` event (raw WS and socket.io) answers `messageFailed { code: "ERR_FIRST_PARTY_BOX" }` for `low_events` and `broadcast-*` right after the room's box is derived. Found by the same review's delta-verify (M-A): the HTTP door alone left `sendLiveMessage` able to store and live-bridge a forged row. One predicate, both doors; pinned in the hub's tests.
+
+## 0.3.19 — 2026-09-09
+
+- `/sendMessage` REFUSES the first-party boxes (`low_events`, `broadcast-*`) with 403 `ERR_FIRST_PARTY_BOX` at the door: only the bearer-gated `/push` and `/broadcast` write them. Found by bsv-low's from-scratch tower review at the loop-10 promotion (HIGH-1): an authenticated end user could file a forged tower `case` event into a seat's durable box. The client pins each event kind to its producer's identity as well. Pinned (`the_ordinary_send_route_refuses_the_first_party_boxes_and_nothing_else`).
+
+## 0.3.18 — 2026-09-08
+
+### The acknowledge statements stop scanning every box on every ack (bsv-low M19-5, issue #428)
+- Cloudflare D1 query insights for the loop-8 window (2026-09-07 22:16–22:56Z) showed the retained-box acknowledge UPDATE reading 8.9M rows over 1,891 calls and the delete half 7.7M over 1,648: ~4.7k rows per ack. `EXPLAIN QUERY PLAN` on the real migrations names the cost: the outer statement already seeks `sqlite_autoindex_messages_1` (message_id) but the `message_box_id IN (SELECT … FROM message_boxes WHERE type LIKE … ESCAPE …)` subquery is a `SCAN message_boxes` on every statement (SQLite's LIKE optimization cannot apply: the ESCAPE clause rules it out, and `type` is BINARY-collated while LIKE is case-insensitive), so every ack read every box row.
+- Both halves now test retention with a CORRELATED predicate on the candidate row (`EXISTS (SELECT 1 FROM message_boxes mb WHERE mb.message_box_id = messages.message_box_id AND mb.type LIKE …)` / `NOT EXISTS …`): one rowid lookup per candidate message. Semantics are the IN form's byte-for-byte (a retained row is marked, any other row is deleted, a row whose box is gone is deleted; re-ack counts 0), and the bind order is unchanged. No migration and no wire change; the daily TTL sweep keeps the box-list subquery (one statement a day).
+- Pins (rusqlite, dev-only, on the real migrations): the plan for both ack statements contains no `SCAN message_boxes` and looks the box up `USING INTEGER PRIMARY KEY`; the pre-0.3.18 IN form on the same fixture plans the scan (the RED side); the partition semantics above.
+
+## 0.3.17 — 2026-09-07
+
+### A departure delivered to a socket being replaced is REPLAYED; the stranded-departure net runs on every hub event
+- bsv-low loop 7 (2026-09-07, `survivorLooksOnly`): the survivor's felt re-listens every ~12 s under a silent inbox (a fresh socket.io session each time); the `peerLeft` push landed on the session it was replacing (`delivered` = 1, so nothing was parked) and died with it — told-state Absent, every later push deduped, the open seat heard nothing (it recovered from the join-time presence snapshot). The hub now remembers the LAST DELIVERED departure per room (`lastleft:<room>`) and REPLAYS it to a session that joins the room within 60 s while the told-state still says Absent (`departure_replay_due`, pure); a session that already latched it costs nothing.
+- The same loop's first survivor run (16:17Z): the killed seat's departure pushed for its events-box room but NEVER for the game room — a `pendingleft:` entry whose DO alarm was lost on a live, quiet hub (the platform class the heartbeat met on 2026-09-03). The recovery net used to run once per isolate; it now runs on EVERY hub event (a fetch or a raw-WS frame), cheap-guarded to once per 2 s (`rearm_net_due`, pure), and a scheduled time in the past counts as absent (`alarm_needs_replacing`, unchanged). `ensure_alarm_no_later_than` reads the alarm back after each set and retries once (`alarm_set_confirmed`, pure) — the set-dropped class; the fired-but-never-run class leaves the row and is the net's job.
+- Log lines are the counters: `peerLeft for <room> REPLAYED to sid=…`, `rearm net re-armed N stranded departure(s)`, `set_alarm read-back mismatch`. Four new pins; 311 tests green.
+
+## 0.3.16 — 2026-09-05
+
+### A peerJoined that reached no session is PARKED
+- `parkedjoined:<room>` mirrors 0.3.13's parked departure: an arrival pushed to an identity whose only session was dead (a heartbeat-timeout reconnect in flight) is delivered on its next register / room join. One pure rule `parked_presence_choice` decides between a parked departure and a parked arrival: told=Present drops the departure (0.3.15), told=Absent drops the arrival, the 3-minute TTL drops stale news, the newer wins a tie. bsv-low 2026-09-05 `dealtLeaveNotifyRejoin`.
+  (commit `ed38eb2`: 0.3.16: a peerJoined that reached NO session is PARKED (parkedjoined:<room>) and delivered on the identity's next register / room join — the arrival m)
+
+## 0.3.15 — 2026-09-05
+
+### A departure is a SOCKET CLOSE, for every room
+- A client `leaveRoom` on a game room is a room HOP (the felt's inbound watchdog leaves and re-joins to recover a dropped envelope); under load the re-join outran the 4 s debounce and the peer was told "opponent lost connection" about a seat that never left. Only a socket close (tab close, crash, heartbeat timeout) or an explicit app-level goodbye signals. A parked departure is dropped when the peer's arrival already wrote told=Present.
+  (commit `f39b18c`: 0.3.15: a departure is a SOCKET CLOSE for every room (a leaveRoom is a room hop, never a departure); a parked departure superseded by the peer's arriv)
+
+## 0.3.14 — 2026-09-05
+
+### A waiting host's lobby-room departure signals only on a socket CLOSE
+- The lobby's `host-left` fans out only when the host's socket closes (a crash), never on a clean `leaveRoom` (a match / cancel is a room hop) — the lobby half of the rule 0.3.15 then applied to every room.
+  (commit `aa501a9`: 0.3.14: a waiting host's lobby-room departure fans host-left ONLY on a socket CLOSE (crash), never on a clean leaveRoom)
+
+## 0.3.13 — 2026-09-05
+
+### A peerLeft that reached no session is PARKED
+- `parkedleft:<room>` with a 3-minute TTL: a departure pushed while the counterparty's only session was between a leave and a re-join is delivered on its next register / room join instead of being lost with the told-state already flipped (bsv-low full18 run 2, survivorLooksOnly).
+  (commit `e847407`: 0.3.13: a departure nobody was there to receive is PARKED and delivered on the identity's next register / room join; the lobby-room match is exact)
+
+## 0.3.12 — 2026-09-04
+
+### A waiting host's departure is an EVENT for the lobby
+- The relay fans a waiting host's departure into `broadcast-low-lobby` so the lobby's away latch is event-driven (one confirming probe at `confirmDueAt`, never a poll), and the leaver's tier-2 countdown rides a `ladder` event (bsv-low re-run round 1).
+  (commit `4ce92f0`: 0.3.12: two LOW lobby/ladder EVENTS the event-driven client was missing (bsv-low full18 re-run 2026-09-05))
+
 ## 0.3.11 — 2026-09-03
 
 ### A fresh socket is not "overdue"

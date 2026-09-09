@@ -143,13 +143,39 @@ fn type_filter_sql(column: &str, n_prefixes: usize) -> String {
     format!("({ors})")
 }
 
-/// The subquery selecting message_box_ids of RETAINED boxes. Shared verbatim
-/// between the ack UPDATE (IN) and ack DELETE (NOT IN) so the two are exact
-/// complements — no box can be both marked and deleted, or neither.
+/// The subquery selecting message_box_ids of RETAINED boxes. Used by the daily
+/// TTL sweep (one statement a day, a box scan is fine there). The ack path
+/// stopped using it in 0.3.18: see `retained_box_exists_sql`.
 fn retained_box_subquery(n_prefixes: usize) -> String {
     format!(
         "SELECT message_box_id FROM message_boxes WHERE {}",
         type_filter_sql("type", n_prefixes)
+    )
+}
+
+/// The RETAINED-box test as a CORRELATED predicate on the candidate row
+/// (0.3.18, bsv-low M19-5): ONE primary-key lookup of `message_boxes` per
+/// candidate message. The previous `message_box_id IN (SELECT … FROM
+/// message_boxes WHERE type LIKE … ESCAPE …)` form materialized the subquery
+/// once per statement, and that subquery is a FULL SCAN of `message_boxes`
+/// (SQLite's LIKE optimization never applies with an ESCAPE clause), so every
+/// acknowledge read every box row: ~4.7k rows per ack on beta under the
+/// 20-pair fleet (D1 query insights, 2026-09-07 22:16–22:56Z: 8.9M rows over
+/// 1,891 UPDATEs, 7.7M over 1,648 DELETEs).
+///
+/// Semantically identical to the IN form: `IN` was true iff a box row with a
+/// retained type exists for the message's box id, which is exactly what
+/// `EXISTS` states; `NOT EXISTS` is its exact complement (neither side can be
+/// NULL: `message_box_id` is NOT NULL on both tables). Shared verbatim between
+/// the ack UPDATE (`AND EXISTS`) and the ack DELETE (`AND NOT EXISTS`), so the
+/// two halves stay exact complements — no box can be both marked and deleted,
+/// or neither. Bind order is unchanged (identity_key, message_ids...,
+/// like_patterns...): the pattern placeholders still follow the id list.
+fn retained_box_exists_sql(n_prefixes: usize) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM message_boxes mb \
+         WHERE mb.message_box_id = messages.message_box_id AND {})",
+        type_filter_sql("mb.type", n_prefixes)
     )
 }
 
@@ -163,9 +189,9 @@ pub(crate) fn ack_update_sql(n_ids: usize, n_prefixes: usize) -> String {
     format!(
         "UPDATE messages SET acknowledged_at = datetime('now'), updated_at = datetime('now') \
          WHERE recipient = ? AND acknowledged_at IS NULL AND message_id IN ({}) \
-         AND message_box_id IN ({})",
+         AND {}",
         in_placeholders(n_ids),
-        retained_box_subquery(n_prefixes)
+        retained_box_exists_sql(n_prefixes)
     )
 }
 
@@ -183,9 +209,9 @@ pub(crate) fn ack_delete_sql(n_ids: usize, n_prefixes: usize) -> String {
     }
     format!(
         "DELETE FROM messages WHERE recipient = ? AND message_id IN ({}) \
-         AND message_box_id NOT IN ({})",
+         AND NOT {}",
         in_placeholders(n_ids),
-        retained_box_subquery(n_prefixes)
+        retained_box_exists_sql(n_prefixes)
     )
 }
 
@@ -725,19 +751,182 @@ mod tests {
         // And the delete half must EXCLUDE retained boxes.
         let del = ack_delete_sql(3, 1);
         assert!(
-            del.contains("message_box_id NOT IN"),
+            del.contains("AND NOT EXISTS (SELECT 1 FROM message_boxes mb"),
             "the ack delete must exclude retained boxes: {del}"
         );
     }
 
-    /// The update's IN and the delete's NOT IN use the IDENTICAL subquery, so
-    /// the two halves are exact complements: every acked message is either
-    /// marked (retained) or deleted (not retained) — never both, never neither.
+    /// The update's EXISTS and the delete's NOT EXISTS use the IDENTICAL
+    /// predicate, so the two halves are exact complements: every acked message
+    /// is either marked (retained) or deleted (not retained) — never both, never
+    /// neither.
     #[test]
-    fn ack_update_and_delete_partition_on_the_same_subquery() {
-        let sub = retained_box_subquery(2);
-        assert!(ack_update_sql(1, 2).contains(&format!("message_box_id IN ({sub})")));
-        assert!(ack_delete_sql(1, 2).contains(&format!("message_box_id NOT IN ({sub})")));
+    fn ack_update_and_delete_partition_on_the_same_predicate() {
+        let pred = retained_box_exists_sql(2);
+        assert!(ack_update_sql(1, 2).contains(&format!("AND {pred}")));
+        assert!(ack_delete_sql(1, 2).contains(&format!("AND NOT {pred}")));
+        // The predicate is CORRELATED on the candidate row's box id (a primary-key
+        // lookup), never a materialized box list.
+        assert!(pred.contains("mb.message_box_id = messages.message_box_id"));
+        assert!(!ack_update_sql(1, 2).contains("message_box_id IN (SELECT"));
+        assert!(!ack_delete_sql(1, 2).contains("message_box_id NOT IN (SELECT"));
+    }
+
+    // ---- 0.3.18: the ack shapes are proven on a real SQLite with the real
+    // migrations (rusqlite, dev-only). RED-verified: the pre-0.3.18 IN form
+    // plans `SCAN message_boxes` on the same fixture.
+
+    fn migrated_db() -> rusqlite::Connection {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(include_str!("../migrations/0001_initial.sql"))
+            .unwrap();
+        db.execute_batch(include_str!("../migrations/0002_transcript_retention.sql"))
+            .unwrap();
+        // 3,000 boxes (a third retained), 12,000 messages across 40 recipients.
+        // The plans below are a function of schema and statement only: without
+        // ANALYZE (no sqlite_stat1) the planner never consults row counts, so
+        // the rows exist for the semantics test, not for the planner.
+        // (recursive CTEs: the bundled SQLite has no generate_series)
+        db.execute_batch(
+            "WITH RECURSIVE seq(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM seq WHERE value < 3000) \
+             INSERT INTO message_boxes(identity_key, type) \
+             SELECT 'k' || value, CASE WHEN value % 3 = 0 THEN 'low_game_' || value \
+                                       ELSE 'low_lobby_' || value END FROM seq; \
+             WITH RECURSIVE seq(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM seq WHERE value < 12000) \
+             INSERT INTO messages(message_id, message_box_id, sender, recipient, body) \
+             SELECT 'm' || value, (value % 3000) + 1, 's', 'r' || (value % 40), 'b' FROM seq;",
+        )
+        .unwrap();
+        db
+    }
+
+    fn plan(db: &rusqlite::Connection, sql: &str, binds: &[&str]) -> String {
+        let mut stmt = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let params: Vec<&dyn rusqlite::ToSql> =
+            binds.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
+        rows.join("\n")
+    }
+
+    /// The pre-0.3.18 retained ack UPDATE, byte-for-byte (the RED side of the
+    /// plan pin below is the real former statement, never a re-typing of it).
+    fn legacy_ack_update_sql(n_ids: usize, n_prefixes: usize) -> String {
+        format!(
+            "UPDATE messages SET acknowledged_at = datetime('now'), updated_at = datetime('now') \
+             WHERE recipient = ? AND acknowledged_at IS NULL AND message_id IN ({}) \
+             AND message_box_id IN ({})",
+            in_placeholders(n_ids),
+            retained_box_subquery(n_prefixes)
+        )
+    }
+
+    /// The load-bearing plan pin: neither ack statement may scan
+    /// `message_boxes`; the retained-box test must be a rowid lookup.
+    ///
+    /// Pinned at ONE id, the production shape (every LOW client acknowledges a
+    /// single id per call). The outer seek's index choice is a function of the
+    /// IN-list length: at 1 or 2 ids the planner seeks
+    /// `sqlite_autoindex_messages_1` (message_id); at 3 or more ids every
+    /// SQLite tried flips to `idx_messages_recipient` (recipient=?), for the
+    /// old and the new form alike. The box-side property (no scan, a rowid
+    /// lookup) does not depend on that flip, and is asserted at 3 ids too.
+    #[test]
+    fn ack_shapes_never_scan_message_boxes() {
+        let db = migrated_db();
+        let pattern = low_cfg().like_patterns();
+        let p = pattern[0].as_str();
+        let update = plan(&db, &ack_update_sql(1, 1), &["r1", "m1", p]);
+        let delete = plan(&db, &ack_delete_sql(1, 1), &["r1", "m1", p]);
+        for (name, plan) in [("update", &update), ("delete", &delete)] {
+            assert!(
+                !plan.contains("SCAN message_boxes"),
+                "the ack {name} must not scan message_boxes:\n{plan}"
+            );
+            assert!(
+                plan.contains("SEARCH mb USING INTEGER PRIMARY KEY"),
+                "the ack {name} must look the box up by rowid:\n{plan}"
+            );
+            assert!(
+                plan.contains("SEARCH messages USING INDEX sqlite_autoindex_messages_1"),
+                "the ack {name} must seek the candidate messages by id:\n{plan}"
+            );
+        }
+        // At 3 ids the outer seek moves to the recipient index (the threshold
+        // above); the box side stays a rowid lookup, never a scan.
+        let three = plan(&db, &ack_update_sql(3, 1), &["r1", "m1", "m2", "m3", p]);
+        assert!(three.contains("idx_messages_recipient (recipient=?)"), "{three}");
+        assert!(!three.contains("SCAN message_boxes"), "{three}");
+        assert!(three.contains("SEARCH mb USING INTEGER PRIMARY KEY"), "{three}");
+        // The RED side of the same fixture: the pre-0.3.18 statement, verbatim,
+        // scans the boxes.
+        let legacy = plan(&db, &legacy_ack_update_sql(1, 1), &["r1", "m1", p]);
+        assert!(legacy.contains("SCAN message_boxes"), "{legacy}");
+    }
+
+    /// The semantics are byte-for-byte the IN form's: a message in a retained
+    /// box is MARKED (never deleted), one in any other box is DELETED, and a
+    /// message whose box row is gone is deleted (the NOT IN parity).
+    #[test]
+    fn ack_shapes_partition_exactly_like_the_in_form() {
+        let db = migrated_db();
+        let p = low_cfg().like_patterns()[0].clone();
+        // The fixture puts message m<n> in box (n % 3000) + 1, and box b is
+        // 'low_game_b' (retained) iff b % 3 == 0. So m2 sits in box 3 (retained),
+        // m3 in box 4 (a lobby box); m5 is moved to a box id that does not exist.
+        // (the bundled SQLite enforces foreign keys by default; the box-less row is
+        // the point of the case, so the constraint is switched off for the setup)
+        db.execute_batch(
+            "PRAGMA foreign_keys = OFF; \
+             UPDATE messages SET recipient = 'ack-me' WHERE message_id IN ('m2', 'm3', 'm5'); \
+             UPDATE messages SET message_box_id = 999999 WHERE message_id = 'm5';",
+        )
+        .unwrap();
+        let marked = db
+            .execute(
+                &ack_update_sql(3, 1),
+                rusqlite::params!["ack-me", "m2", "m3", "m5", p.as_str()],
+            )
+            .unwrap();
+        let deleted = db
+            .execute(
+                &ack_delete_sql(3, 1),
+                rusqlite::params!["ack-me", "m2", "m3", "m5", p.as_str()],
+            )
+            .unwrap();
+        assert_eq!((marked, deleted), (1, 2), "m2 marked; m3 and the box-less m5 deleted");
+        let m2_acked: Option<String> = db
+            .query_row(
+                "SELECT acknowledged_at FROM messages WHERE message_id = 'm2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(m2_acked.is_some(), "the retained row survives, stamped");
+        let remaining: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE message_id IN ('m3', 'm5')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+        // Re-acking the marked row counts 0 (the IS NULL guard), like before.
+        let again = db
+            .execute(&ack_update_sql(1, 1), rusqlite::params!["ack-me", "m2", p.as_str()])
+            .unwrap();
+        assert_eq!(again, 0);
+        // A wrong recipient acks nothing (the recipient scope is part of the seek).
+        let stranger = db
+            .execute(&ack_update_sql(1, 1), rusqlite::params!["someone-else", "m2", p.as_str()])
+            .unwrap()
+            + db
+                .execute(&ack_delete_sql(1, 1), rusqlite::params!["someone-else", "m2", p.as_str()])
+                .unwrap();
+        assert_eq!(stranger, 0);
     }
 
     /// Retention off ⇒ the delete SQL is the legacy statement byte-for-byte —

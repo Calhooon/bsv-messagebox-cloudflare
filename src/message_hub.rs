@@ -64,6 +64,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use worker::*;
 
+use crate::first_party_box_reason;
 use crate::routes::send_message::{process_send, SendOutcome};
 use crate::storage::Storage;
 use crate::validation::{is_valid_pubkey, ValidatedSendMessage};
@@ -113,6 +114,54 @@ struct ParkedPeerJoined {
 /// PURE: is a parked presence event (departure or arrival) still worth delivering?
 pub(crate) fn parked_peer_left_is_fresh(parked_at_ms: u64, now_ms: u64) -> bool {
     now_ms.saturating_sub(parked_at_ms) <= PARKED_PEER_LEFT_TTL_MS
+}
+/// 0.3.17 (bsv-low loop 7, 2026-09-07 17:05Z): the LAST departure this hub
+/// DELIVERED per room. The survivor's felt re-listens every ~12 s under a
+/// silent inbox (a fresh socket.io session each time); the `peerLeft` push
+/// landed on the socket it was REPLACING (`delivered` = 1, so nothing was
+/// parked) and was lost with it — the told-state said Absent, every later push
+/// deduped, and the open seat heard nothing (it recovered from the join-time
+/// presence snapshot). A session that joins the room within
+/// `PEER_LEFT_REPLAY_MS` of a delivered departure, while the told-state still
+/// says Absent, is REPLAYED that departure. Presence-only; the client latches
+/// a departure once (`peerGone`), so a duplicate costs nothing.
+const LAST_LEFT_PREFIX: &str = "lastleft:";
+/// How long after a delivered departure a re-listening session is still owed
+/// its replay (the felt's watchdog re-listens at ~12–15 s; the 4 s debounce
+/// and a heartbeat reconnect sit well inside a minute).
+pub(crate) const PEER_LEFT_REPLAY_MS: u64 = 60 * 1000;
+/// PURE (0.3.17): is a re-listening session owed the replay of the last
+/// delivered departure? Only a FRESH departure the peer has not undone —
+/// told=Present means the peer came back (never replay a stale absence);
+/// no told-state means nothing was ever delivered (nothing to replay).
+pub(crate) fn departure_replay_due(
+    last_at_ms: Option<u64>,
+    told: Option<ToldPresence>,
+    now_ms: u64,
+) -> bool {
+    match (last_at_ms, told) {
+        (Some(at), Some(ToldPresence::Absent)) => now_ms.saturating_sub(at) <= PEER_LEFT_REPLAY_MS,
+        _ => false,
+    }
+}
+/// 0.3.17: the stranded-departure re-arm net runs on EVERY hub event (a fetch
+/// or a socket frame), cheap-guarded to once per this interval per isolate —
+/// not once per isolate. The DO-alarm loss class (the heartbeat, 2026-09-04;
+/// a game-room departure, 2026-09-07 16:17Z: the events-box room's entry
+/// pushed, the game room's never did) strands a `pendingleft:` entry on a
+/// LIVE, quiet hub until something else wakes it; the once-per-isolate net
+/// never ran again on that isolate. Every hub event is now a chance to find a
+/// stranded entry and pull the alarm back in.
+pub(crate) const REARM_NET_MIN_INTERVAL_MS: u64 = 2_000;
+/// PURE (0.3.17): is the re-arm net due to run again?
+pub(crate) fn rearm_net_due(last_run_ms: u64, now_ms: u64) -> bool {
+    // a clock that went backwards runs the net rather than starving it
+    last_run_ms == 0 || now_ms < last_run_ms || now_ms - last_run_ms >= REARM_NET_MIN_INTERVAL_MS
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LastPeerLeft {
+    leaver: String,
+    at_ms: u64,
 }
 /// Which parked presence event a (re)joining session is owed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,11 +459,11 @@ pub struct MessageHub {
     /// write path via `process_send` for the WS `sendMessage` event
     /// handler (#44).
     env: Env,
-    /// Once-per-instance guard for the pendingleft re-arm recovery scan
-    /// (`rearm_pending_departures_once`). `Cell` is fine: a DO instance
-    /// is single-threaded. NOT persisted — a fresh isolate re-runs the
-    /// scan, which is exactly the point.
-    rearm_scan_done: std::cell::Cell<bool>,
+    /// 0.3.17: when the stranded-departure re-arm net last ran on this
+    /// isolate (epoch ms; 0 = never). `Cell` is fine: a DO instance is
+    /// single-threaded. NOT persisted — a fresh isolate runs the net on its
+    /// first event, which is exactly the point.
+    rearm_net_last_ms: std::cell::Cell<u64>,
 }
 
 impl DurableObject for MessageHub {
@@ -430,19 +479,15 @@ impl DurableObject for MessageHub {
         Self {
             state,
             env,
-            rearm_scan_done: std::cell::Cell::new(false),
+            rearm_net_last_ms: std::cell::Cell::new(0),
         }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
-        // Presence-flap debounce recovery net: on the first request of
-        // this instance's life, re-arm the alarm for any stored
-        // `pendingleft:` entries (see `rearm_pending_departures_once`).
-        // DO alarms are durable, so this only matters after a failure
-        // path stranded an entry — cheap (one prefix list, usually
-        // empty) and guarded to once per isolate, the same
-        // once-per-isolate init discipline used elsewhere in this stack.
-        self.rearm_pending_departures_once().await;
+        // Presence-flap debounce recovery net (0.3.17: on EVERY hub event,
+        // cheap-guarded — see `rearm_pending_departures_net`): re-arm the
+        // alarm for any stored `pendingleft:` entry whose wake was lost.
+        self.rearm_pending_departures_net().await;
         // The DO accepts two distinct kinds of incoming `fetch` calls:
         //
         //   1. WebSocket upgrade (`Upgrade: websocket`) — public-facing,
@@ -530,6 +575,8 @@ impl DurableObject for MessageHub {
         ws: WebSocket,
         message: WebSocketIncomingMessage,
     ) -> Result<()> {
+        // 0.3.17: a raw-WS frame is a hub event too — the same re-arm net.
+        self.rearm_pending_departures_net().await;
         // Recover the per-socket attachment. The upgrade path always
         // writes one; if it's somehow missing we treat the socket as
         // unverified and refuse to act on its events.
@@ -942,7 +989,8 @@ impl MessageHub {
                     return Ok(());
                 }
                 if room_id.contains(BROADCAST_BOX_MARKER) {
-                    self.notify_broadcast_registry(&attachment.identity_key).await;
+                    self.notify_broadcast_registry(&attachment.identity_key)
+                        .await;
                 }
                 if !attachment.joined_rooms.iter().any(|r| r == &room_id) {
                     attachment.joined_rooms.push(room_id.clone());
@@ -984,9 +1032,13 @@ impl MessageHub {
                 // the mirror of `peerLeft`). Both best-effort; never fail the join.
                 let snapshot = self.presence_snapshot(&room_id).await;
                 if let Err(e) = emit(ws, "presence", &snapshot) {
-                    console_log!("MessageHub: presence snapshot emit failed (non-fatal): {}", e);
+                    console_log!(
+                        "MessageHub: presence snapshot emit failed (non-fatal): {}",
+                        e
+                    );
                 }
-                self.push_peer_joined(&room_id, &attachment.identity_key).await;
+                self.push_peer_joined(&room_id, &attachment.identity_key)
+                    .await;
             }
             ClientEvent::LeaveRoom { room_id } => {
                 if let Err(reason) = validate_room_owned(&attachment.identity_key, &room_id) {
@@ -1137,6 +1189,18 @@ impl MessageHub {
                 )];
             }
         };
+        // 0.3.20 (bsv-low loop-10 promotion, the delta-verify's M-A, 2026-09-09):
+        // the FIRST-PARTY boxes are refused on the live path too — the HTTP
+        // gate alone left `sendLiveMessage` able to store + bridge a forged
+        // tower `case` row into a seat's `low_events` (and a frame into a
+        // `broadcast-*` room). Same predicate as the HTTP door, one site for
+        // raw WS and socket.io; a `messageFailed` with the same code.
+        if let Some(reason) = first_party_box_reason(&message_box) {
+            return vec![OutboundEvent::new(
+                "messageFailed",
+                json!({ "reason": reason, "code": "ERR_FIRST_PARTY_BOX" }),
+            )];
+        }
 
         // 4. Remaining per-field validation. Mirrors the HTTP validator's
         // checks (validation::validate_send_message) — same error codes.
@@ -1417,7 +1481,10 @@ impl MessageHub {
         // lose membership it previously joined.
         let existing: Option<SocketIoRegistryEntry> =
             self.state.storage().get(&key).await.ok().flatten();
-        let rooms_now: Vec<String> = existing.as_ref().map(|e| e.joined_rooms.clone()).unwrap_or_default();
+        let rooms_now: Vec<String> = existing
+            .as_ref()
+            .map(|e| e.joined_rooms.clone())
+            .unwrap_or_default();
         let entry = SocketIoRegistryEntry {
             sid: body.sid.clone(),
             registered_at_ms: Date::now().as_millis(),
@@ -1479,7 +1546,12 @@ impl MessageHub {
         };
         let before: Vec<String> = entry.joined_rooms.clone();
         mutate(&mut entry.joined_rooms);
-        let added: Vec<String> = entry.joined_rooms.iter().filter(|r| !before.contains(r)).cloned().collect();
+        let added: Vec<String> = entry
+            .joined_rooms
+            .iter()
+            .filter(|r| !before.contains(r))
+            .cloned()
+            .collect();
         if let Err(e) = self.state.storage().put(&key, entry).await {
             console_log!(
                 "MessageHub: update_socketio_rooms: storage put failed for sid={sid}: {e}"
@@ -1601,7 +1673,12 @@ impl MessageHub {
     /// "last seen N ago"; it can never latch "left" or gate anything.
     async fn stamp_last_seen(&self, room: &str) {
         let key = format!("{LAST_SEEN_PREFIX}{room}");
-        if let Err(e) = self.state.storage().put(&key, Date::now().as_millis()).await {
+        if let Err(e) = self
+            .state
+            .storage()
+            .put(&key, Date::now().as_millis())
+            .await
+        {
             console_log!("MessageHub: last_seen put failed for {room}: {e}");
         }
     }
@@ -1840,16 +1917,31 @@ impl MessageHub {
             return true; // an earlier future alarm already covers us
         }
         let delay_ms = due_at_ms.saturating_sub(now_ms).max(1);
-        match storage
-            .set_alarm(std::time::Duration::from_millis(delay_ms))
-            .await
-        {
-            Ok(()) => true,
-            Err(e) => {
-                console_log!("MessageHub: set_alarm failed (due {due_at_ms}): {e}");
-                false
+        // 0.3.17: read the alarm back after the set and retry ONCE on a
+        // mismatch (absent, or later than what we asked for). A set that the
+        // runtime silently dropped is one of the ways a departure strands.
+        // (The OTHER way — a fired-but-never-run tick whose row keeps
+        // answering its old time, the heartbeat's 2026-09-03 class — leaves
+        // the row intact and is caught by the re-arm net, not here.)
+        for attempt in 0..2u8 {
+            if let Err(e) = storage
+                .set_alarm(std::time::Duration::from_millis(delay_ms))
+                .await
+            {
+                console_log!(
+                    "MessageHub: set_alarm failed (due {due_at_ms}, attempt {attempt}): {e}"
+                );
+                continue;
             }
+            let back: Option<i64> = storage.get_alarm().await.ok().flatten();
+            if alarm_set_confirmed(back, due) {
+                return true;
+            }
+            console_log!(
+                "MessageHub: set_alarm read-back mismatch (asked {due_at_ms}, read {back:?}, attempt {attempt}) — retrying"
+            );
         }
+        false
     }
 
     /// All pending (debounced) departure notifications, as
@@ -1946,32 +2038,44 @@ impl MessageHub {
         }
     }
 
-    /// MED-1(c) recovery net, run once per isolate from the top of
-    /// `fetch`: if any `pendingleft:` entries survived an isolate
-    /// restart with no alarm covering them (possible only via the
-    /// failure paths — DO alarms are otherwise durable), pull the alarm
-    /// in to the earliest due so their trailing checks still run.
-    /// Best-effort: on a list error the guard flag is RESET so a later
-    /// request retries the scan.
-    async fn rearm_pending_departures_once(&self) {
-        if self.rearm_scan_done.get() {
+    /// The stranded-departure re-arm net (MED-1(c), widened in 0.3.17 from
+    /// once-per-isolate to EVERY hub event, guarded to once per
+    /// `REARM_NET_MIN_INTERVAL_MS`): if any `pendingleft:` entry is stored
+    /// with no alarm covering it — a lost DO alarm (the platform class the
+    /// heartbeat met on 2026-09-03 and a game-room departure met on
+    /// 2026-09-07 16:17Z), or a failure path that stranded it — pull the
+    /// alarm in to the earliest due so its trailing check still runs.
+    /// `ensure_alarm_no_later_than` treats a scheduled time in the PAST as
+    /// absent, so a fired-but-never-run tick whose row still answers its old
+    /// time is replaced too. Best-effort; a list error is logged and the next
+    /// event retries.
+    async fn rearm_pending_departures_net(&self) {
+        let now_ms = Date::now().as_millis();
+        if !rearm_net_due(self.rearm_net_last_ms.get(), now_ms) {
             return;
         }
-        self.rearm_scan_done.set(true);
+        self.rearm_net_last_ms.set(now_ms);
         let pending = match self.list_pending_departures().await {
             Ok(p) => p,
             Err(e) => {
-                console_log!("MessageHub: rearm scan list failed ({e}) — will retry");
-                self.rearm_scan_done.set(false);
+                console_log!("MessageHub: rearm net list failed ({e}) — the next event retries");
+                self.rearm_net_last_ms.set(0);
                 return;
             }
         };
         if let Some(earliest) = pending.iter().map(|(_, e)| e.due_at_ms).min() {
-            // Ignore the confirmation bool: this is a recovery net, not
-            // an arm path — a failure here leaves the entries no worse
-            // off, and the next request retriggers nothing (flag set)
-            // but the next departure/alarm re-arms.
+            let current: Option<i64> = self.state.storage().get_alarm().await.ok().flatten();
+            let stranded = current.is_none_or(|t| t <= i64::try_from(now_ms).unwrap_or(i64::MAX));
+            // Ignore the confirmation bool: this is a recovery net, not an
+            // arm path — a failure here leaves the entries no worse off and
+            // the next event retries.
             let _ = self.ensure_alarm_no_later_than(earliest).await;
+            if stranded {
+                console_log!(
+                    "MessageHub: rearm net re-armed {} stranded departure(s) (alarm was {current:?}, earliest due {earliest}, now {now_ms})",
+                    pending.len()
+                );
+            }
         }
     }
 
@@ -2061,14 +2165,81 @@ impl MessageHub {
             // push was deduped: the open seat never heard the event. PARK it; the next
             // register / room join of this identity delivers it (bounded by
             // PARKED_PEER_LEFT_TTL_MS — a stale departure is not news).
-            let parked = ParkedPeerLeft { leaver: body.leaver.clone(), at_ms: Date::now().as_millis() };
-            if let Err(e) = self.state.storage().put(&format!("{PARKED_LEFT_PREFIX}{}", body.room_id), parked).await {
-                console_log!("MessageHub: parkedleft put failed for {}: {e}", body.room_id);
+            let parked = ParkedPeerLeft {
+                leaver: body.leaver.clone(),
+                at_ms: Date::now().as_millis(),
+            };
+            if let Err(e) = self
+                .state
+                .storage()
+                .put(&format!("{PARKED_LEFT_PREFIX}{}", body.room_id), parked)
+                .await
+            {
+                console_log!(
+                    "MessageHub: parkedleft put failed for {}: {e}",
+                    body.room_id
+                );
             } else {
-                console_log!("MessageHub: peerLeft for {} PARKED (no session to deliver to)", body.room_id);
+                console_log!(
+                    "MessageHub: peerLeft for {} PARKED (no session to deliver to)",
+                    body.room_id
+                );
+            }
+        } else {
+            // 0.3.17: DELIVERED — but a session the felt was in the middle of
+            // replacing counts as delivered too, and the frame dies with it.
+            // Remember the departure so a session joining this room within
+            // PEER_LEFT_REPLAY_MS (while the told-state still says Absent) is
+            // replayed it (`deliver_parked_presence`).
+            let last = LastPeerLeft {
+                leaver: body.leaver.clone(),
+                at_ms: Date::now().as_millis(),
+            };
+            if let Err(e) = self
+                .state
+                .storage()
+                .put(&format!("{LAST_LEFT_PREFIX}{}", body.room_id), last)
+                .await
+            {
+                console_log!("MessageHub: lastleft put failed for {}: {e}", body.room_id);
             }
         }
         Response::from_json(&json!({ "delivered": delivered }))
+    }
+
+    /// 0.3.17: replay a recently DELIVERED departure to a session that joined
+    /// the room after it (the felt's re-listen replaced the socket the push
+    /// landed on). Same envelope as the parked delivery; a distinct messageId
+    /// so a log tail can tell a replay from a first delivery. Best-effort.
+    async fn replay_peer_left(&self, sid: &str, room: &str, leaver: &str, age_ms: u64) {
+        let Ok(ns) = self.env.durable_object("ENGINEIO_SESSION") else {
+            return;
+        };
+        let Ok(stub) = ns.id_from_name(sid).and_then(|id| id.get_stub()) else {
+            return;
+        };
+        let payload = json!({
+            "roomId": room,
+            "sender": leaver,
+            "messageId": format!("peer-left-replay-{}", Date::now().as_millis()),
+            "body": {},
+            "event": "peerLeft",
+        })
+        .to_string();
+        let headers = Headers::new();
+        let _ = headers.set("content-type", "application/json");
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(payload.into()));
+        let Ok(req) = Request::new_with_init("https://do.local/internal/socketio-broadcast", &init)
+        else {
+            return;
+        };
+        match stub.fetch_with_request(req).await {
+            Ok(_) => console_log!("MessageHub: peerLeft for {room} REPLAYED to sid={sid} ({age_ms}ms after its delivery)"),
+            Err(e) => console_log!("MessageHub: peerLeft replay for {room} failed: {e}"),
+        }
     }
 
     /// Deliver the parked presence event (a departure, 0.3.13 — or an arrival,
@@ -2081,15 +2252,39 @@ impl MessageHub {
         for room in rooms {
             let left_key = format!("{PARKED_LEFT_PREFIX}{room}");
             let joined_key = format!("{PARKED_JOINED_PREFIX}{room}");
-            let left: Option<ParkedPeerLeft> = self.state.storage().get(&left_key).await.ok().flatten();
-            let joined: Option<ParkedPeerJoined> = self.state.storage().get(&joined_key).await.ok().flatten();
+            let left: Option<ParkedPeerLeft> =
+                self.state.storage().get(&left_key).await.ok().flatten();
+            let joined: Option<ParkedPeerJoined> =
+                self.state.storage().get(&joined_key).await.ok().flatten();
             if left.is_none() && joined.is_none() {
+                // 0.3.17: nothing PARKED — but a departure DELIVERED moments ago
+                // to a session this one is replacing is owed a replay (the
+                // re-listen class, bsv-low loop 7). The told-state decides:
+                // still Absent ⇒ replay; Present ⇒ the peer came back, silence.
+                let last: Option<LastPeerLeft> = self
+                    .state
+                    .storage()
+                    .get(&format!("{LAST_LEFT_PREFIX}{room}"))
+                    .await
+                    .ok()
+                    .flatten();
+                let told = self.read_told(room).await;
+                if departure_replay_due(last.as_ref().map(|l| l.at_ms), told, now_ms) {
+                    let l = last.expect("checked");
+                    self.replay_peer_left(sid, room, &l.leaver, now_ms.saturating_sub(l.at_ms))
+                        .await;
+                }
                 continue;
             }
             let _ = self.state.storage().delete(&left_key).await;
             let _ = self.state.storage().delete(&joined_key).await;
             let told = self.read_told(room).await;
-            let choice = parked_presence_choice(left.as_ref().map(|p| p.at_ms), joined.as_ref().map(|p| p.at_ms), told, now_ms);
+            let choice = parked_presence_choice(
+                left.as_ref().map(|p| p.at_ms),
+                joined.as_ref().map(|p| p.at_ms),
+                told,
+                now_ms,
+            );
             let (event, sender, at_ms) = match choice {
                 ParkedChoice::Nothing => {
                     console_log!(
@@ -2109,8 +2304,12 @@ impl MessageHub {
                     ("peerJoined", p.joiner, p.at_ms)
                 }
             };
-            let Ok(ns) = self.env.durable_object("ENGINEIO_SESSION") else { continue };
-            let Ok(stub) = ns.id_from_name(sid).and_then(|id| id.get_stub()) else { continue };
+            let Ok(ns) = self.env.durable_object("ENGINEIO_SESSION") else {
+                continue;
+            };
+            let Ok(stub) = ns.id_from_name(sid).and_then(|id| id.get_stub()) else {
+                continue;
+            };
             let payload = json!({
                 "roomId": room,
                 "sender": sender,
@@ -2122,11 +2321,22 @@ impl MessageHub {
             let headers = Headers::new();
             let _ = headers.set("content-type", "application/json");
             let mut init = RequestInit::new();
-            init.with_method(Method::Post).with_headers(headers).with_body(Some(payload.into()));
-            let Ok(req) = Request::new_with_init("https://do.local/internal/socketio-broadcast", &init) else { continue };
+            init.with_method(Method::Post)
+                .with_headers(headers)
+                .with_body(Some(payload.into()));
+            let Ok(req) =
+                Request::new_with_init("https://do.local/internal/socketio-broadcast", &init)
+            else {
+                continue;
+            };
             match stub.fetch_with_request(req).await {
-                Ok(_) => console_log!("MessageHub: parked {event} for {room} delivered to sid={sid} ({}ms late)", now_ms.saturating_sub(at_ms)),
-                Err(e) => console_log!("MessageHub: parked {event} delivery failed for {room}: {e}"),
+                Ok(_) => console_log!(
+                    "MessageHub: parked {event} for {room} delivered to sid={sid} ({}ms late)",
+                    now_ms.saturating_sub(at_ms)
+                ),
+                Err(e) => {
+                    console_log!("MessageHub: parked {event} delivery failed for {room}: {e}")
+                }
             }
         }
     }
@@ -2276,11 +2486,25 @@ impl MessageHub {
             // told-state already says Present, so it would never be re-pushed. PARK
             // it; the next register / room join of this identity delivers it
             // (bounded by the same TTL; dropped if the peer left again meanwhile).
-            let parked = ParkedPeerJoined { joiner: body.joiner.clone(), at_ms: Date::now().as_millis() };
-            if let Err(e) = self.state.storage().put(&format!("{PARKED_JOINED_PREFIX}{}", body.room_id), parked).await {
-                console_log!("MessageHub: parkedjoined put failed for {}: {e}", body.room_id);
+            let parked = ParkedPeerJoined {
+                joiner: body.joiner.clone(),
+                at_ms: Date::now().as_millis(),
+            };
+            if let Err(e) = self
+                .state
+                .storage()
+                .put(&format!("{PARKED_JOINED_PREFIX}{}", body.room_id), parked)
+                .await
+            {
+                console_log!(
+                    "MessageHub: parkedjoined put failed for {}: {e}",
+                    body.room_id
+                );
             } else {
-                console_log!("MessageHub: peerJoined for {} PARKED (no session to deliver to)", body.room_id);
+                console_log!(
+                    "MessageHub: peerJoined for {} PARKED (no session to deliver to)",
+                    body.room_id
+                );
             }
         }
         Response::from_json(&json!({ "delivered": delivered }))
@@ -2313,7 +2537,12 @@ impl MessageHub {
             return;
         };
         match stub.fetch_with_request(req).await {
-            Ok(_) => console_log!("MessageHub: peerJoined {} → {} (room {})", joiner, peer, peer_room),
+            Ok(_) => console_log!(
+                "MessageHub: peerJoined {} → {} (room {})",
+                joiner,
+                peer,
+                peer_room
+            ),
             Err(e) => console_log!("MessageHub: peerJoined notify failed: {e}"),
         }
     }
@@ -2571,6 +2800,20 @@ fn alarm_needs_replacing(current: Option<i64>, due_ms: i64, now_ms: i64) -> bool
     }
 }
 
+/// The runtime stamps a set alarm as `its now + delay` on ITS clock, so the
+/// read-back lands a few ms AFTER the due time we computed (beta, 2026-09-07
+/// 19:55Z: asked …613, read …617 — 4 ms). A read-back inside this slack is
+/// our alarm; a strict `<= due` declared every set failed and fell back to an
+/// immediate push, which defeats the debounce (the first 0.3.17 build).
+pub(crate) const ALARM_READ_BACK_SLACK_MS: i64 = 1_000;
+/// PURE (0.3.17): did the alarm we just set actually land? A read-back at our
+/// due time (within the runtime's stamping slack), or an EARLIER one (another
+/// producer's alarm covers us), confirms it; `None` or a materially LATER
+/// time means the set did not take.
+fn alarm_set_confirmed(read_back: Option<i64>, due_ms: i64) -> bool {
+    matches!(read_back, Some(t) if t <= due_ms + ALARM_READ_BACK_SLACK_MS)
+}
+
 /// Per-row decision for a listed `pendingleft:` entry.
 #[derive(Debug, PartialEq, Eq)]
 enum PendingRowAction {
@@ -2823,12 +3066,42 @@ mod tests {
         assert_eq!(unreadable["identityKey"], "02bb");
         assert!(unreadable["present"].is_null());
         assert!(unreadable.get("lastSeenMs").is_none());
-        let seated = presence_snapshot_json("03aa-low_game_1", Some("02bb"), Some(true), Some(5), None);
+        let seated =
+            presence_snapshot_json("03aa-low_game_1", Some("02bb"), Some(true), Some(5), None);
         assert_eq!(seated["present"], true);
         assert_eq!(seated["lastSeenMs"], 5);
-        let gone = presence_snapshot_json("03aa-low_game_1", Some("02bb"), Some(false), Some(5), Some(9));
+        let gone = presence_snapshot_json(
+            "03aa-low_game_1",
+            Some("02bb"),
+            Some(false),
+            Some(5),
+            Some(9),
+        );
         assert_eq!(gone["present"], false);
         assert_eq!(gone["rejoinDeadlineMs"], 9);
+    }
+
+    #[test]
+    fn the_live_send_path_refuses_the_first_party_boxes_with_the_same_code() {
+        // the seat's server-event box and every broadcast room are refused on the
+        // WS path exactly as on the HTTP door (0.3.20); every other box passes
+        assert!(first_party_box_reason("low_events").is_some());
+        assert!(first_party_box_reason("broadcast-low-pots").is_some());
+        assert!(first_party_box_reason("broadcast-").is_some());
+        for ok in [
+            "low_game_ab",
+            "notifications",
+            "inbox",
+            "low_eventsx",
+            "xbroadcast-low-pots",
+        ] {
+            assert!(
+                first_party_box_reason(ok).is_none(),
+                "{ok} is not first-party"
+            );
+        }
+        let reason = first_party_box_reason("low_events").unwrap();
+        assert!(reason.contains("first-party"), "{reason}");
     }
 
     #[test]
@@ -2915,8 +3188,12 @@ mod tests {
 
     #[test]
     fn presence_body_includes_both_last_seen_and_rejoin_deadline() {
-        let body =
-            presence_body_json("03aa-inbox", false, Some(1_700_000_000_123), Some(1_700_000_060_000));
+        let body = presence_body_json(
+            "03aa-inbox",
+            false,
+            Some(1_700_000_000_123),
+            Some(1_700_000_060_000),
+        );
         assert_eq!(body["lastSeenMs"], json!(1_700_000_000_123u64));
         assert_eq!(body["rejoinDeadlineMs"], json!(1_700_000_060_000u64));
     }
@@ -3213,7 +3490,10 @@ mod tests {
             },
         );
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].event_name, "sendMessageAck", "duplicate must ack, not fail");
+        assert_eq!(
+            out[0].event_name, "sendMessageAck",
+            "duplicate must ack, not fail"
+        );
         assert_eq!(out[0].data["status"], "success");
         assert_eq!(out[0].data["messageId"], "mid-abc");
         assert_eq!(out[0].data["roomId"], room);
@@ -3362,9 +3642,8 @@ mod tests {
                 self.alarm_at = Some(self.now + PEER_LEFT_DEBOUNCE_MS);
                 return;
             }
-            let pending: Vec<(String, PendingPeerLeft)> = std::mem::take(&mut self.pending)
-                .into_iter()
-                .collect();
+            let pending: Vec<(String, PendingPeerLeft)> =
+                std::mem::take(&mut self.pending).into_iter().collect();
             let (due, rest, next) = split_due_pending(pending, self.now);
             self.pending = rest.into_iter().collect();
             for (room, entry) in due {
@@ -3401,10 +3680,10 @@ mod tests {
             due_at_ms: due,
         };
         let pending = vec![
-            ("r1".to_string(), mk(5_000)),  // due
-            ("r2".to_string(), mk(9_000)),  // future
-            ("r3".to_string(), mk(6_000)),  // due (boundary: <= now)
-            ("r4".to_string(), mk(7_500)),  // future (earliest next)
+            ("r1".to_string(), mk(5_000)), // due
+            ("r2".to_string(), mk(9_000)), // future
+            ("r3".to_string(), mk(6_000)), // due (boundary: <= now)
+            ("r4".to_string(), mk(7_500)), // future (earliest next)
         ];
         let (due, rest, next) = split_due_pending(pending, 6_000);
         let due_rooms: Vec<&str> = due.iter().map(|(r, _)| r.as_str()).collect();
@@ -3420,7 +3699,10 @@ mod tests {
     #[test]
     fn departure_push_due_only_when_room_still_empty() {
         assert!(departure_push_due(false), "still empty → push");
-        assert!(!departure_push_due(true), "reoccupied (flap rejoined) → silent");
+        assert!(
+            !departure_push_due(true),
+            "reoccupied (flap rejoined) → silent"
+        );
     }
 
     #[test]
@@ -3488,7 +3770,12 @@ mod tests {
         sim.advance_to(10_000);
         sim.depart(&room, ID_A);
         sim.advance_to(120_000);
-        assert_eq!(sim.pushes.len(), 1, "exactly one push, got: {:?}", sim.pushes);
+        assert_eq!(
+            sim.pushes.len(),
+            1,
+            "exactly one push, got: {:?}",
+            sim.pushes
+        );
         let (p_room, p_leaver, p_at) = &sim.pushes[0];
         assert_eq!(p_room, &room);
         assert_eq!(p_leaver, ID_A);
@@ -3539,7 +3826,12 @@ mod tests {
         sim.advance_to(12_000);
         sim.depart(&room, ID_A); // FINAL departure
         sim.advance_to(120_000);
-        assert_eq!(sim.pushes.len(), 1, "exactly one push, got: {:?}", sim.pushes);
+        assert_eq!(
+            sim.pushes.len(),
+            1,
+            "exactly one push, got: {:?}",
+            sim.pushes
+        );
         let (_, _, p_at) = &sim.pushes[0];
         assert!(
             *p_at >= 12_000 + PEER_LEFT_DEBOUNCE_MS,
@@ -3599,9 +3891,15 @@ mod tests {
         sim.join(&room); // tab 2
         sim.advance_to(10_000);
         sim.depart(&room, ID_A); // tab 1 leaves — tab 2 still seated
-        assert!(sim.pending.is_empty(), "not the last session — nothing armed");
+        assert!(
+            sim.pending.is_empty(),
+            "not the last session — nothing armed"
+        );
         assert!(sim.alarm_at.is_none());
-        assert_eq!(sim.lastseen[&room], 10_000, "departure still stamps lastseen");
+        assert_eq!(
+            sim.lastseen[&room], 10_000,
+            "departure still stamps lastseen"
+        );
         sim.advance_to(60_000);
         assert_eq!(sim.pushes.len(), 0, "no push while a session remains");
         sim.depart(&room, ID_A); // tab 2 — the LAST session
@@ -3655,7 +3953,10 @@ mod tests {
             vec![(room.clone(), ID_A.to_string(), 10_000)],
             "no wake guaranteed → push now"
         );
-        assert!(sim.pending.is_empty(), "entry un-stored — nothing can double-fire");
+        assert!(
+            sim.pending.is_empty(),
+            "entry un-stored — nothing can double-fire"
+        );
         sim.advance_to(120_000);
         assert_eq!(sim.pushes.len(), 1);
     }
@@ -3718,8 +4019,14 @@ mod parked_peer_left_tests {
     #[test]
     fn a_parked_departure_is_fresh_inside_the_ttl_and_stale_past_it() {
         assert!(parked_peer_left_is_fresh(1_000, 1_000));
-        assert!(parked_peer_left_is_fresh(1_000, 1_000 + PARKED_PEER_LEFT_TTL_MS));
-        assert!(!parked_peer_left_is_fresh(1_000, 1_000 + PARKED_PEER_LEFT_TTL_MS + 1));
+        assert!(parked_peer_left_is_fresh(
+            1_000,
+            1_000 + PARKED_PEER_LEFT_TTL_MS
+        ));
+        assert!(!parked_peer_left_is_fresh(
+            1_000,
+            1_000 + PARKED_PEER_LEFT_TTL_MS + 1
+        ));
         assert!(parked_peer_left_is_fresh(5_000, 1_000)); // a clock that went backwards never drops news
     }
 
@@ -3728,20 +4035,151 @@ mod parked_peer_left_tests {
         use ParkedChoice::*;
         use ToldPresence::*;
         let now = 1_000_000; // comfortably past the TTL so the stale case cannot underflow
-        // the dealtLeaveNotifyRejoin shape: the arrival parked, told=Present, nothing else parked
-        assert_eq!(parked_presence_choice(None, Some(now - 5_000), Some(Present), now), Joined);
+                             // the dealtLeaveNotifyRejoin shape: the arrival parked, told=Present, nothing else parked
+        assert_eq!(
+            parked_presence_choice(None, Some(now - 5_000), Some(Present), now),
+            Joined
+        );
         // the peer left AGAIN after arriving: the arrival is not news any more
-        assert_eq!(parked_presence_choice(None, Some(now - 5_000), Some(Absent), now), Nothing);
+        assert_eq!(
+            parked_presence_choice(None, Some(now - 5_000), Some(Absent), now),
+            Nothing
+        );
         // stale past the TTL
-        assert_eq!(parked_presence_choice(None, Some(now - PARKED_PEER_LEFT_TTL_MS - 1), Some(Present), now), Nothing);
+        assert_eq!(
+            parked_presence_choice(
+                None,
+                Some(now - PARKED_PEER_LEFT_TTL_MS - 1),
+                Some(Present),
+                now
+            ),
+            Nothing
+        );
         // 0.3.15's rule kept: a parked departure is dropped once the peer came back
-        assert_eq!(parked_presence_choice(Some(now - 5_000), None, Some(Present), now), Nothing);
-        assert_eq!(parked_presence_choice(Some(now - 5_000), None, Some(Absent), now), Left);
+        assert_eq!(
+            parked_presence_choice(Some(now - 5_000), None, Some(Present), now),
+            Nothing
+        );
+        assert_eq!(
+            parked_presence_choice(Some(now - 5_000), None, Some(Absent), now),
+            Left
+        );
         // both parked, no told-state at all: the newer one is the news
-        assert_eq!(parked_presence_choice(Some(now - 9_000), Some(now - 5_000), None, now), Joined);
-        assert_eq!(parked_presence_choice(Some(now - 5_000), Some(now - 9_000), None, now), Left);
+        assert_eq!(
+            parked_presence_choice(Some(now - 9_000), Some(now - 5_000), None, now),
+            Joined
+        );
+        assert_eq!(
+            parked_presence_choice(Some(now - 5_000), Some(now - 9_000), None, now),
+            Left
+        );
         // nothing parked
-        assert_eq!(parked_presence_choice(None, None, Some(Present), now), Nothing);
+        assert_eq!(
+            parked_presence_choice(None, None, Some(Present), now),
+            Nothing
+        );
+    }
+}
+
+#[cfg(test)]
+mod hardening_0_3_17_tests {
+    use super::*;
+
+    const ID_A: &str = "02d09d2feb33d5a17f426fd3d0c5c1a45c87961ece4c095fd111d37c7b2b0b4090";
+    const ID_B: &str = "03b327e37ae081cd7954341bd4ac22cb2ada6db1f39c2560f741bfc88e8ad1d6d2";
+
+    #[test]
+    fn a_replay_is_owed_only_for_a_fresh_delivered_departure_the_peer_has_not_undone() {
+        use ToldPresence::*;
+        let now = 1_000_000;
+        // the loop-7 shape: delivered 11 s ago onto the socket being replaced, told still Absent
+        assert!(departure_replay_due(Some(now - 11_000), Some(Absent), now));
+        // at the window's edge, and just past it
+        assert!(departure_replay_due(
+            Some(now - PEER_LEFT_REPLAY_MS),
+            Some(Absent),
+            now
+        ));
+        assert!(!departure_replay_due(
+            Some(now - PEER_LEFT_REPLAY_MS - 1),
+            Some(Absent),
+            now
+        ));
+        // the peer came back: never replay a stale absence
+        assert!(!departure_replay_due(
+            Some(now - 11_000),
+            Some(Present),
+            now
+        ));
+        // nothing was ever delivered / no told-state: nothing to replay
+        assert!(!departure_replay_due(None, Some(Absent), now));
+        assert!(!departure_replay_due(Some(now - 11_000), None, now));
+        // a clock that went backwards never drops news
+        assert!(departure_replay_due(Some(now + 5_000), Some(Absent), now));
+    }
+
+    #[test]
+    fn the_rearm_net_runs_on_the_first_event_and_then_at_most_once_per_interval() {
+        assert!(rearm_net_due(0, 10_000));
+        assert!(!rearm_net_due(
+            10_000,
+            10_000 + REARM_NET_MIN_INTERVAL_MS - 1
+        ));
+        assert!(rearm_net_due(10_000, 10_000 + REARM_NET_MIN_INTERVAL_MS));
+        assert!(rearm_net_due(50_000, 10_000)); // a clock that went backwards runs it rather than starving it
+    }
+
+    #[test]
+    fn a_set_alarm_is_confirmed_by_a_read_back_at_or_before_the_due_time_within_the_runtime_slack()
+    {
+        assert!(alarm_set_confirmed(Some(14_000), 14_000));
+        assert!(alarm_set_confirmed(Some(14_004), 14_000)); // the beta shape: the runtime stamped its own now + delay, 4 ms later
+        assert!(alarm_set_confirmed(
+            Some(14_000 + ALARM_READ_BACK_SLACK_MS),
+            14_000
+        ));
+        assert!(alarm_set_confirmed(Some(12_000), 14_000)); // an earlier producer's alarm covers us
+        assert!(!alarm_set_confirmed(
+            Some(14_001 + ALARM_READ_BACK_SLACK_MS),
+            14_000
+        )); // materially later: the set did not take
+        assert!(!alarm_set_confirmed(Some(20_000), 14_000));
+        assert!(!alarm_set_confirmed(None, 14_000));
+    }
+
+    /// The 2026-09-07 16:17Z shape, at the level of the pure debounce core: a
+    /// departure's trailing check whose DO alarm is LOST strands the entry —
+    /// nothing fires — until a hub event runs the re-arm net, which finds the
+    /// due entry with a stale/absent alarm and pulls the alarm back in; the
+    /// push then lands. The old once-per-isolate net never ran again on a
+    /// live isolate, so the same entry stayed stranded.
+    #[test]
+    fn a_lost_alarm_strands_the_departure_until_a_hub_event_reruns_the_net() {
+        let room = format!("{ID_A}-low_game_feedface");
+        let entry = arm_departure_debounce(ID_B, 10_000);
+        let pending = vec![(room.clone(), entry)];
+        // the runtime lost the tick: at due time nothing fired; the row still
+        // answers the old scheduled time (the heartbeat's 2026-09-03 class)
+        let now = 10_000 + PEER_LEFT_DEBOUNCE_MS + 30_000;
+        let stale_row: Option<i64> = Some((10_000 + PEER_LEFT_DEBOUNCE_MS) as i64);
+        // the net's own judgement: the earliest due is in the past and the row is stale
+        let earliest = pending.iter().map(|(_, e)| e.due_at_ms).min().unwrap();
+        assert!(
+            alarm_needs_replacing(stale_row, earliest as i64, now as i64),
+            "a stale row is replaced"
+        );
+        assert!(
+            alarm_needs_replacing(None, earliest as i64, now as i64),
+            "an absent alarm is replaced"
+        );
+        // once the alarm fires (re-armed by the net), the due entry pushes
+        let (due, rest, next) = split_due_pending(pending, now);
+        assert_eq!(due.len(), 1);
+        assert!(rest.is_empty() && next.is_none());
+        assert!(departure_push_due(false));
+        // and the net is gated: a burst of events runs it once per interval
+        assert!(rearm_net_due(0, now));
+        assert!(!rearm_net_due(now, now + 100));
     }
 }
 
