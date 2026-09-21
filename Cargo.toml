@@ -1,6 +1,6 @@
 [package]
 name = "rust-message-box"
-version = "0.3.20"
+version = "0.3.26"
 edition = "2021"
 
 [lib]
@@ -32,7 +32,7 @@ pkcs8 = { version = "0.10", features = ["pem"] }
 hmac = "0.12"
 
 # BSV
-bsv-middleware-cloudflare = "0.3.2"
+bsv-middleware-cloudflare = "0.3.3"
 bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
 
 [dev-dependencies]
@@ -54,3 +54,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # removes the 429→500 trigger + adds BRC-104 replay protection. Any further
 # hardening (the bounded KV read-retry) ships as a published 0.3.2, never a
 # local path-patch. WS-1: public bsv-middleware-cloudflare is the canonical lineage.
+
+# bsv-low W-D (2026-09-10): the Durable Object session backend is on the public
+# lineage's branch `do-session-store` (0.3.3, `~/bsv/wt-middleware-do`) until it
+# is PUBLISHED at the promotion; this path patch satisfies the `0.3.2` caret
+# above (a patch to a version OUTSIDE the requirement is silently unused —
+# read cargo's warning). Remove it with the 0.3.3 publish.

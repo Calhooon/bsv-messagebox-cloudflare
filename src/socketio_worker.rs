@@ -124,13 +124,29 @@ mod ttl_tests {
     fn session_ttl_parse_floor_and_fallback() {
         assert_eq!(parse_session_ttl(None), 3600, "unset → 1h fallback");
         assert_eq!(parse_session_ttl(Some("".into())), 3600, "empty → fallback");
-        assert_eq!(parse_session_ttl(Some("8h".into())), 3600, "garbage → fallback");
+        assert_eq!(
+            parse_session_ttl(Some("8h".into())),
+            3600,
+            "garbage → fallback"
+        );
         // KV rejects expiration_ttl < 60 — a sub-minute config must not
         // silently drop every session write (review round-A finding).
-        assert_eq!(parse_session_ttl(Some("0".into())), 60, "0 parses → floored");
-        assert_eq!(parse_session_ttl(Some("30".into())), 60, "sub-minute → floored");
+        assert_eq!(
+            parse_session_ttl(Some("0".into())),
+            60,
+            "0 parses → floored"
+        );
+        assert_eq!(
+            parse_session_ttl(Some("30".into())),
+            60,
+            "sub-minute → floored"
+        );
         assert_eq!(parse_session_ttl(Some("60".into())), 60);
-        assert_eq!(parse_session_ttl(Some("28800".into())), 28800, "LOW's 8h passes through");
+        assert_eq!(
+            parse_session_ttl(Some("28800".into())),
+            28800,
+            "LOW's 8h passes through"
+        );
     }
 }
 

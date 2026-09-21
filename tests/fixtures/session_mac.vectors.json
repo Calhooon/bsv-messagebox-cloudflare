@@ -1,0 +1,66 @@
+{
+  "clientNonce": "Y2xpZW50LW5vbmNlLWJhc2U2NA==",
+  "frames": [
+    {
+      "d": "\"02aa-low_inbox\"",
+      "e": "joinRoom",
+      "m": "90e07f7164091eb296f55fc8a8483bad6f49de42db8f8bfa3865492f5d2984db",
+      "n": 1
+    },
+    {
+      "d": "{\"roomId\":\"02aa-low_inbox\",\"message\":{\"messageId\":\"m1\",\"recipient\":\"02bb\",\"body\":\"{\\\"encryptedMessage\\\":\\\"AAAA\\\"}\"}}",
+      "e": "sendMessage",
+      "m": "96629687200c9d58b50bbe094b8d6ae0d95a6e6ac3bc7fcd411681833b93a79b",
+      "n": 2
+    },
+    {
+      "d": "\"02aa-low_inbox\"",
+      "e": "leaveRoom",
+      "m": "7547461be6ee153edd0df4c4f4cbcaffd69d0a5b4cab17465508655630a34b5c",
+      "n": 3
+    },
+    {
+      "d": "[]",
+      "e": "presence",
+      "m": "7cde585fb994d4d3d7a900a91fe2a5914d867a9bbfe5f7eb0cd35a942f346607",
+      "n": 18446744073709551615
+    }
+  ],
+  "http": [
+    {
+      "body": "{\"messageBox\":\"low_inbox\"}",
+      "h": 1,
+      "mac": "933762f5ea2a29ccb4a942764c2b37396a1331aea32b128df2eb32704fcd34ac",
+      "method": "POST",
+      "path": "/listMessages",
+      "responseBody": "{\"status\":\"success\",\"messages\":[]}",
+      "responseMac": "cf4d0f58942978786c05fc90fd9466adb0fa48dc9cfe20bc5abb0caa3af4a5f5"
+    },
+    {
+      "body": "{\"messageIds\":[\"m1\"]}",
+      "h": 2,
+      "mac": "fdf5d276154e3c5cce55338a59cd142a3702220f1c2bceb6f0d448519209bd12",
+      "method": "POST",
+      "path": "/acknowledgeMessage",
+      "responseBody": "{\"status\":\"success\"}",
+      "responseMac": "3f74d65b221465196a3a8c8a559d0bf79c81956472b749a51df61dd32a7e48c3"
+    },
+    {
+      "body": "",
+      "h": 3,
+      "mac": "63c49f5130462b4c178114a8c932dd10b952b160865115575a558ff744a6ebbf",
+      "method": "GET",
+      "path": "/presence?room=02aa-low_game_1",
+      "responseBody": "{\"present\":true}",
+      "responseMac": "8497df810e88e145516f2eda0a32b77279424d449337d159733e3f4c3ac93614"
+    }
+  ],
+  "id": "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc",
+  "identity": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "idleMs": 3600000,
+  "key": "3189aaa50e7da56072898a9fb1c62af598b6d69f12c300f907b8c85b74d7dca4",
+  "label": "low-relay-session/v1",
+  "producer": "rust-message-box src/session_lane.rs emit_session_mac_vectors (fixed inputs; regenerate, never retype)",
+  "salt": "e3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bc",
+  "serverNonce": "c2VydmVyLW5vbmNlLWJhc2U2NA=="
+}

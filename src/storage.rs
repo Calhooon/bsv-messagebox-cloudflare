@@ -180,11 +180,10 @@ impl<'a> Storage<'a> {
         // constraint, and the id is resolved by the re-fetch below regardless of
         // whether this attempt, a retry, or a dropped-but-landed attempt created
         // the row — so no changes-count reinterpretation is needed here.
-        let insert = Query::new(
-            "INSERT OR IGNORE INTO message_boxes (identity_key, type) VALUES (?, ?)",
-        )
-        .bind(identity_key)
-        .bind(box_type);
+        let insert =
+            Query::new("INSERT OR IGNORE INTO message_boxes (identity_key, type) VALUES (?, ?)")
+                .bind(identity_key)
+                .bind(box_type);
         let (_meta, _retried) = with_d1_write_retry(|| insert.execute(self.db)).await?;
         // Re-fetch to get the ID (handles both fresh insert and race)
         self.find_message_box(identity_key, box_type)
@@ -821,8 +820,9 @@ where
     use std::future::Future;
     use std::task::Poll;
     let mut op = Box::pin(op);
-    let mut timeout =
-        Box::pin(worker::Delay::from(std::time::Duration::from_millis(timeout_ms)));
+    let mut timeout = Box::pin(worker::Delay::from(std::time::Duration::from_millis(
+        timeout_ms,
+    )));
     std::future::poll_fn(|cx| {
         if let Poll::Ready(r) = op.as_mut().poll(cx) {
             return Poll::Ready(r);
@@ -1066,7 +1066,11 @@ mod retry_tests {
         })
         .await;
         assert_eq!(out.unwrap(), 7);
-        assert_eq!(calls.get(), 2, "stall → transient error → retried, not hung");
+        assert_eq!(
+            calls.get(),
+            2,
+            "stall → transient error → retried, not hung"
+        );
     }
 
     #[tokio::test]
@@ -1150,7 +1154,10 @@ mod retry_tests {
         .await;
         let (m, retried) = out.expect("recovers on retry");
         assert_eq!(m.changes, 1);
-        assert!(retried, "a retry happened → idempotency reinterpretation armed");
+        assert!(
+            retried,
+            "a retry happened → idempotency reinterpretation armed"
+        );
         assert_eq!(calls.get(), 2);
     }
 
@@ -1191,7 +1198,10 @@ mod retry_tests {
     #[test]
     fn insert_idempotency_under_retry() {
         // Clean first attempt inserted the row.
-        assert!(insert_changes_mean_stored(1, false), "fresh insert = stored");
+        assert!(
+            insert_changes_mean_stored(1, false),
+            "fresh insert = stored"
+        );
         // Clean first-attempt collision = genuine duplicate messageId.
         assert!(
             !insert_changes_mean_stored(0, false),

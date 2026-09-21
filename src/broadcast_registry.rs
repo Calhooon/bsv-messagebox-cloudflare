@@ -39,17 +39,27 @@ pub async fn register_identity(env: &Env, identity: &str) {
         return;
     };
     let shard = identity.chars().next().unwrap_or('0');
-    let Ok(stub) = ns.id_from_name(&format!("v1:{shard}")).and_then(|id| id.get_stub()) else {
+    let Ok(stub) = ns
+        .id_from_name(&format!("v1:{shard}"))
+        .and_then(|id| id.get_stub())
+    else {
         return;
     };
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
-    init.with_body(Some(serde_json::json!({ "identity": identity }).to_string().into()));
+    init.with_body(Some(
+        serde_json::json!({ "identity": identity })
+            .to_string()
+            .into(),
+    ));
     let Ok(req) = Request::new_with_init("https://registry/register", &init) else {
         return;
     };
     if let Err(e) = stub.fetch_with_request(req).await {
-        console_log!("BroadcastRegistry: register {} failed (non-fatal): {e}", &identity[..12.min(identity.len())]);
+        console_log!(
+            "BroadcastRegistry: register {} failed (non-fatal): {e}",
+            &identity[..12.min(identity.len())]
+        );
     }
 }
 
@@ -119,8 +129,18 @@ mod tests {
         // Three missed refreshes (a slow DO, a dropped fetch) still leave the
         // entry fresh; the window is the safety net, the refresh the truth.
         let refresh_ms = REGISTRY_REFRESH_EVERY_MS;
-        assert_eq!(refresh_ms, 7 * crate::engineio::session::PING_INTERVAL_MS, "seven ticks, as before 0.3.8");
-        assert!(refresh_ms * 3 < FRESH_MS, "refresh {refresh_ms} ms × 3 must sit inside {FRESH_MS} ms");
-        assert!(refresh_ms >= 60_000, "a refresh per minute or slower — never a chatty write");
+        assert_eq!(
+            refresh_ms,
+            7 * crate::engineio::session::PING_INTERVAL_MS,
+            "seven ticks, as before 0.3.8"
+        );
+        assert!(
+            refresh_ms * 3 < FRESH_MS,
+            "refresh {refresh_ms} ms × 3 must sit inside {FRESH_MS} ms"
+        );
+        assert!(
+            refresh_ms >= 60_000,
+            "a refresh per minute or slower — never a chatty write"
+        );
     }
 }

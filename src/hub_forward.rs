@@ -81,7 +81,9 @@ where
 {
     use std::task::Poll;
     let mut op = Box::pin(op);
-    let mut timeout = Box::pin(worker::Delay::from(std::time::Duration::from_millis(timeout_ms)));
+    let mut timeout = Box::pin(worker::Delay::from(std::time::Duration::from_millis(
+        timeout_ms,
+    )));
     std::future::poll_fn(|cx| {
         if let Poll::Ready(r) = op.as_mut().poll(cx) {
             return Poll::Ready(r);

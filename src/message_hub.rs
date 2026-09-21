@@ -66,6 +66,7 @@ use worker::*;
 
 use crate::first_party_box_reason;
 use crate::routes::send_message::{process_send, SendOutcome};
+use crate::session_lane::{HubMirror, MirrorUpdate, Refusal as LaneRefusal};
 use crate::storage::Storage;
 use crate::validation::{is_valid_pubkey, ValidatedSendMessage};
 
@@ -78,6 +79,13 @@ const IDENTITY_KEY_HEADER: &str = "x-bsv-auth-identity-key";
 /// Used by `handle_internal_push` to fan out broadcasts to socket.io
 /// subscribers (whose state lives in a different DO class — `EngineIoSession`).
 const SOCKETIO_SUB_PREFIX: &str = "socketio_sub:";
+/// bsv-low W-B (D10): the HTTP lane's MIRROR of a socket's session lane,
+/// keyed by the session id: `session:<id>` → `HubMirror` (K, the identity,
+/// the window, the HTTP counter `h`). Registered by the socket DO on the
+/// first frame the client sends on its lane (piggybacked on the routed
+/// event, no extra await), refreshed when the window moved past the slack,
+/// revoked when the socket unregisters, swept when expired.
+const SESSION_MIRROR_PREFIX: &str = "session:";
 
 /// DO-storage key prefix for the room→peer map (#40 peer-left
 /// notification). `peer_by_room:<my_room_id>` → the identity key of the
@@ -409,6 +417,12 @@ struct SocketIoEventBody {
     /// (the authsocket reference doesn't put it on the wire).
     #[serde(default)]
     data: Value,
+    /// bsv-low W-B (D10): the forwarding socket's session lane, present
+    /// once the client has spoken on it. Upserted as this identity's HTTP
+    /// mirror BEFORE the event is dispatched (an HTTP call may follow at
+    /// once).
+    #[serde(default)]
+    session: Option<MirrorUpdate>,
 }
 
 /// One outbound event the EngineIoSession should encode as a signed
@@ -435,6 +449,26 @@ impl OutboundEvent {
 #[serde(rename_all = "camelCase")]
 struct SocketIoRegistration {
     sid: String,
+    /// bsv-low W-B (D10): on unregister, the closing socket's session id;
+    /// its HTTP mirror is revoked in the same call.
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// `/internal/session-verify` (bsv-low W-B, D10): the Worker asks this
+/// identity's hub to verify one HTTP-lane request. The body's digest, never
+/// the body.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct SessionVerifyBody {
+    id: String,
+    identity: String,
+    // bounded: the counter is refused above MAX_SAFE_COUNTER at the header (session_lane::parse_counter)
+    h: u64,
+    method: String,
+    path: String,
+    body_sha256: String,
+    mac: String,
 }
 
 /// Persistent registry entry for a socket.io subscriber. Stored at
@@ -447,6 +481,7 @@ struct SocketIoRegistration {
 #[serde(rename_all = "camelCase")]
 struct SocketIoRegistryEntry {
     sid: String,
+    // bounded: a millisecond stamp
     registered_at_ms: u64,
     #[serde(default)]
     joined_rooms: Vec<String>,
@@ -542,6 +577,10 @@ impl DurableObject for MessageHub {
         if req.method() == Method::Post && path == "/internal/socketio-unregister" {
             return self.handle_socketio_unregister(&mut req).await;
         }
+        // bsv-low W-B (D10): the HTTP lane's verify (Worker-to-DO only).
+        if req.method() == Method::Post && path == "/internal/session-verify" {
+            return self.handle_session_verify(&mut req).await;
+        }
         // #40 peer presence (same worker-internal trust model as the routes
         // above — the public internet never reaches a DO stub directly):
         //   * /internal/peer-left — the counterparty's hub says they left;
@@ -635,6 +674,11 @@ impl DurableObject for MessageHub {
         // best-effort: if the socket is already torn down, ignore.
         let mirror_code = u16::try_from(code).ok().filter(|c| *c >= 1000);
         let _ = ws.close(mirror_code.or(Some(1000)), Some(reason.as_str()));
+        // 0.3.26 (bsv-low #495): a close is the highest-signal hub event (a
+        // crash); it runs the departures re-arm net like every fetch and frame,
+        // so a `pendingleft:` entry stranded in ANOTHER room by a lost alarm is
+        // pulled back in here too (the 2 s gate keeps it free).
+        self.rearm_pending_departures_net().await;
         // #40: a closed socket (tab close / crash / network drop) departs
         // every room it had joined — if any was the identity's last seat,
         // tell the peer. Best-effort: presence never fails the close path.
@@ -644,6 +688,8 @@ impl DurableObject for MessageHub {
 
     async fn websocket_error(&self, ws: WebSocket, error: Error) -> Result<()> {
         console_log!("MessageHub: WS error: {}", error);
+        // 0.3.26 (bsv-low #495): the net runs on the error path as on the close.
+        self.rearm_pending_departures_net().await;
         // #225: an ABRUPT termination (network death, killed tab, TCP
         // reset) can surface here instead of — or as well as —
         // `websocket_close`. It is a departure all the same: run the
@@ -1273,12 +1319,17 @@ impl MessageHub {
     /// — the EngineIoSession encodes each as a signed General and ships
     /// over the active transport.
     async fn handle_socketio_event(&self, req: &mut Request) -> Result<Response> {
-        let body: SocketIoEventBody = match req.json().await {
+        let mut body: SocketIoEventBody = match req.json().await {
             Ok(b) => b,
             Err(e) => {
                 return Response::error(format!("invalid socketio-event body: {e}"), 400);
             }
         };
+        // bsv-low W-B (D10): the mirror BEFORE the dispatch, so an HTTP call
+        // that follows this frame at once finds its session here.
+        if let Some(update) = body.session.take() {
+            self.upsert_session_mirror(&body.identity_key, update).await;
+        }
 
         let outbound = self.dispatch_socketio_event(body).await;
         Response::from_json(&json!({ "outbound": outbound }))
@@ -1297,6 +1348,9 @@ impl MessageHub {
             event_name,
             data,
             sid,
+            // bsv-low W-B (D10): consumed by `handle_socketio_event` before
+            // the dispatch (the mirror upsert); nothing to do with routing.
+            session: _,
         } = body;
         match event_name.as_str() {
             "joinRoom" => {
@@ -1452,6 +1506,16 @@ impl MessageHub {
                     json!({ "status": "success" }),
                 )]
             }
+            // bsv-low W-B (D10): a session-aware client says hello on a freshly
+            // minted lane so the socket DO's forward registers the HTTP mirror
+            // here at once (the upsert happened before this dispatch). The
+            // welcome rides BACK on the lane: the client's first verified
+            // delivery, proving the lane in both directions at every mint.
+            // A reference client never sends the hello.
+            "sessionHello" => vec![OutboundEvent::new(
+                "sessionWelcome",
+                json!({ "status": "success" }),
+            )],
             other => {
                 console_log!(
                     "MessageHub: socketio-event: unknown event '{other}' for identity={identity_key}"
@@ -1461,6 +1525,178 @@ impl MessageHub {
                     json!({ "reason": format!("unknown event: {other}") }),
                 )]
             }
+        }
+    }
+
+    // =======================================================================
+    // bsv-low W-B (D10) — the HTTP lane's session mirror
+    // =======================================================================
+
+    fn session_mirror_key(id: &str) -> String {
+        format!("{SESSION_MIRROR_PREFIX}{id}")
+    }
+
+    /// Upsert the mirror for a lane the forwarding socket's client is using.
+    /// Bound to the FORWARDING socket's verified identity (never to a claim
+    /// in the update); an existing mirror of another identity is left alone
+    /// and logged (a session id is 32 random bytes: this is a bug, not a
+    /// collision). A refresh writes only when the window moved past the
+    /// slack; the HTTP counter is never reset by a refresh.
+    async fn upsert_session_mirror(&self, identity_key: &str, update: MirrorUpdate) {
+        if update.id.is_empty() || update.key.is_empty() || identity_key.is_empty() {
+            return;
+        }
+        // The mirror stores the identity lower-cased (L6); compare like for like.
+        let identity_key = identity_key.to_ascii_lowercase();
+        let identity_key = identity_key.as_str();
+        let key = Self::session_mirror_key(&update.id);
+        let existing: Option<HubMirror> = self.state.storage().get(&key).await.ok().flatten();
+        let next = match existing {
+            None => HubMirror::new(identity_key, update),
+            Some(m) if m.identity != identity_key => {
+                console_log!(
+                    "MessageHub: session mirror {}… belongs to another identity; ignored",
+                    &update.id[..12.min(update.id.len())]
+                );
+                return;
+            }
+            Some(m) if m.key != update.key => {
+                // The same id with a different K cannot happen (the id and K
+                // are minted together); refuse to move the key.
+                console_log!("MessageHub: session mirror key mismatch; ignored");
+                return;
+            }
+            Some(mut m) => {
+                if !m.refresh_due(update.expires_at_ms) {
+                    return;
+                }
+                m.expires_at_ms = update.expires_at_ms;
+                m
+            }
+        };
+        let fresh = next.last_h == 0;
+        if let Err(e) = self.state.storage().put(&key, &next).await {
+            console_log!("MessageHub: session mirror put failed: {e}");
+            return;
+        }
+        console_log!(
+            "TRACE_SESSION mirror {} identity={} id={}… expires_at={}",
+            if fresh { "registered" } else { "refreshed" },
+            identity_key,
+            &next.id[..12.min(next.id.len())],
+            next.expires_at_ms
+        );
+    }
+
+    async fn revoke_session_mirror(&self, id: &str) {
+        if id.is_empty() {
+            return;
+        }
+        let _ = self
+            .state
+            .storage()
+            .delete(&Self::session_mirror_key(id))
+            .await;
+        console_log!(
+            "TRACE_SESSION mirror revoked id={}…",
+            &id[..12.min(id.len())]
+        );
+    }
+
+    /// Drop every expired mirror (a lost teardown leaves one behind). Runs on
+    /// each socket registration: one list per connect, never per frame.
+    async fn sweep_expired_session_mirrors(&self, now_ms: u64) {
+        let opts = ListOptions::new().prefix(SESSION_MIRROR_PREFIX);
+        let map = match self.state.storage().list_with_options(opts).await {
+            Ok(m) => m,
+            Err(e) => {
+                console_log!("MessageHub: session mirror list failed: {e}");
+                return;
+            }
+        };
+        let mut expired: Vec<String> = Vec::new();
+        let entries = map.entries();
+        if let Some(iter) = js_sys::try_iter(&entries).ok().flatten() {
+            for e in iter.flatten() {
+                let arr: js_sys::Array = e.into();
+                let k = arr.get(0).as_string().unwrap_or_default();
+                if let Ok(m) = serde_wasm_bindgen::from_value::<HubMirror>(arr.get(1)) {
+                    if !m.is_live(now_ms) && !k.is_empty() {
+                        expired.push(k);
+                    }
+                }
+            }
+        }
+        for k in expired {
+            let _ = self.state.storage().delete(&k).await;
+            console_log!("TRACE_SESSION mirror swept key={k}");
+        }
+    }
+
+    /// `/internal/session-verify`: verify one HTTP-lane request against the
+    /// mirror (the identity named must be the mirror's; the window; the
+    /// counter; the MAC over the method, the path and the body's digest).
+    /// Answers `{ok:true, identity, key}` (the Worker seals the response with
+    /// K under the same `h`) or `{ok:false, reason}`; always 200 so the
+    /// Worker distinguishes a refusal from a hub fault. An expired mirror is
+    /// deleted on the way out.
+    async fn handle_session_verify(&self, req: &mut Request) -> Result<Response> {
+        let body: SessionVerifyBody = match req.json().await {
+            Ok(b) => b,
+            Err(e) => return Response::error(format!("invalid session-verify body: {e}"), 400),
+        };
+        let now = Date::now().as_millis();
+        let body = SessionVerifyBody {
+            identity: body.identity.to_ascii_lowercase(),
+            ..body
+        };
+        let key = Self::session_mirror_key(&body.id);
+        let mirror: Option<HubMirror> = if body.id.is_empty() {
+            None
+        } else {
+            self.state.storage().get(&key).await.ok().flatten()
+        };
+        let Some(mut mirror) = mirror else {
+            return Response::from_json(
+                &json!({ "ok": false, "reason": LaneRefusal::UnknownSession.as_str() }),
+            );
+        };
+        if mirror.identity != body.identity {
+            return Response::from_json(
+                &json!({ "ok": false, "reason": LaneRefusal::UnknownSession.as_str() }),
+            );
+        }
+        let digest = match hex::decode(&body.body_sha256) {
+            Ok(v) if v.len() == 32 => {
+                let mut d = [0u8; 32];
+                d.copy_from_slice(&v);
+                d
+            }
+            _ => {
+                return Response::from_json(
+                    &json!({ "ok": false, "reason": LaneRefusal::Malformed.as_str() }),
+                );
+            }
+        };
+        match mirror.verify_http(body.h, &body.method, &body.path, &digest, &body.mac, now) {
+            Ok(()) => {
+                // The counter moved: persist before answering, so a replay
+                // after an eviction is still a replay.
+                if let Err(e) = self.state.storage().put(&key, &mirror).await {
+                    console_log!("MessageHub: session mirror put (verify) failed: {e}");
+                    return Response::from_json(&json!({ "ok": false, "reason": "storage" }));
+                }
+                Response::from_json(
+                    &json!({ "ok": true, "identity": mirror.identity, "key": mirror.key }),
+                )
+            }
+            Err(LaneRefusal::Expired) => {
+                let _ = self.state.storage().delete(&key).await;
+                Response::from_json(
+                    &json!({ "ok": false, "reason": LaneRefusal::Expired.as_str() }),
+                )
+            }
+            Err(reason) => Response::from_json(&json!({ "ok": false, "reason": reason.as_str() })),
         }
     }
 
@@ -1475,6 +1711,10 @@ impl MessageHub {
         if body.sid.is_empty() {
             return Response::error("registration sid must be non-empty", 400);
         }
+        // bsv-low W-B (D10): one sweep of expired session mirrors per
+        // connect (a lost teardown's residue), never per frame.
+        self.sweep_expired_session_mirrors(Date::now().as_millis())
+            .await;
         let key = format!("{SOCKETIO_SUB_PREFIX}{}", body.sid);
         // Preserve existing joined_rooms across re-registration so a
         // session that re-emits its `register` post-hibernation doesn't
@@ -1578,6 +1818,11 @@ impl MessageHub {
         let departing: Option<SocketIoRegistryEntry> =
             self.state.storage().get(&key).await.ok().flatten();
         let _ = self.state.storage().delete(&key).await;
+        // bsv-low W-B (D10): the lane died with its socket; its HTTP mirror
+        // goes with it.
+        if let Some(id) = body.session_id.as_deref() {
+            self.revoke_session_mirror(id).await;
+        }
         if let Some(entry) = departing {
             if !entry.joined_rooms.is_empty() {
                 if let Some(leaver) = room_identity(&entry.joined_rooms[0]).map(str::to_string) {
@@ -2596,7 +2841,25 @@ impl MessageHub {
         if room.is_empty() {
             return Response::error("presence requires ?room=<roomId>", 400);
         }
-        let present = self.room_still_occupied(&room, None, None).await;
+        let occupied = self.room_still_occupied(&room, None, None).await;
+        // 0.3.25 (bsv-low loop 13, survivorLooksOnly): a room that just EMPTIED is undecided until its departure
+        // debounce has run — the same window the `peerLeft` push waits (`PENDING_LEFT_PREFIX`, `PEER_LEFT_DEBOUNCE_MS`).
+        // A join-time snapshot read inside that window used to answer `present: false` for a peer mid-re-listen
+        // (a leave + rejoin within a second: the client's transport watchdog; bsv-low #491), and the OWNER's hub
+        // then wrote told=absent from that answer and deduped the real push behind it — so the one time the
+        // answer was true (a killed peer) the snapshot was the only delivery, and the one time it was false
+        // (a flap) it painted a departure. Undecided answers `null`: nothing learned, no told-state written.
+        let pending: Option<PendingPeerLeft> = if occupied {
+            None
+        } else {
+            self.state
+                .storage()
+                .get(&format!("{PENDING_LEFT_PREFIX}{room}"))
+                .await
+                .ok()
+                .flatten()
+        };
+        let present = presence_answer(occupied, pending.as_ref(), Date::now().as_millis());
         // Advisory last-seen: read `lastseen:<room>` (u64 millis) and
         // thread it through ONLY when present. A missing/unreadable key
         // omits the field entirely — never 0/null, never a false claim.
@@ -2635,7 +2898,7 @@ impl MessageHub {
 /// independent.
 /// See `PRESENCE_TOLD_PREFIX`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum ToldPresence {
+pub(crate) enum ToldPresence {
     Present,
     Absent,
 }
@@ -2671,7 +2934,8 @@ fn told_transition(prev: Option<ToldPresence>, observed_present: bool) -> (bool,
 
 /// The `presence` event body (join-time snapshot). `present: null` with
 /// `identityKey: null` = no counterparty learned; `present: null` with a key =
-/// the peer hub could not be read (a fault, not an absence).
+/// the peer hub could not be read, or (0.3.25) the peer's room emptied inside its
+/// departure debounce and is undecided — a fault or a flap window, never an absence.
 fn presence_snapshot_json(
     room: &str,
     peer: Option<&str>,
@@ -2691,10 +2955,13 @@ fn presence_snapshot_json(
 
 fn presence_body_json(
     room: &str,
-    present: bool,
+    present: Option<bool>,
     last_seen_ms: Option<u64>,
     rejoin_deadline_ms: Option<u64>,
 ) -> Value {
+    // `present: null` = undecided (the room emptied inside its departure debounce) — the joiner's hub reads it
+    // as "nothing learned" (`presence_snapshot`), the public route as a hub that could not answer; neither is
+    // ever a fabricated `false`.
     let mut body = json!({ "room": room, "present": present });
     if let Some(ms) = last_seen_ms {
         body["lastSeenMs"] = json!(ms);
@@ -2703,6 +2970,22 @@ fn presence_body_json(
         body["rejoinDeadlineMs"] = json!(ms);
     }
     body
+}
+
+/// Pure core of the `/internal/presence` answer (0.3.25, bsv-low loop 13): a live session in the room is
+/// `Some(true)`; an EMPTY room whose departure debounce is still running (`pendingleft:<room>` stored, its
+/// trailing check not yet overdue by a whole window) is `None` — undecided, the flap window the `peerLeft`
+/// push itself waits, so a snapshot read during a peer's re-listen never claims an absence and never writes a
+/// told-state the real push would then dedupe against; an empty room past that (no pending entry, or one a
+/// whole window overdue — a lost alarm the fetch-time re-arm net is already pushing) is `Some(false)`.
+fn presence_answer(occupied: bool, pending: Option<&PendingPeerLeft>, now_ms: u64) -> Option<bool> {
+    if occupied {
+        return Some(true);
+    }
+    match pending {
+        Some(p) if now_ms <= p.due_at_ms.saturating_add(PEER_LEFT_DEBOUNCE_MS) => None,
+        _ => Some(false),
+    }
 }
 
 /// Pure core of the departed-socket teardown latch (#225). Given the
@@ -2733,8 +3016,10 @@ struct PendingPeerLeft {
     /// Epoch-ms of the departure that (re)armed this entry. Diagnostic
     /// only — the `lastseen:` stamp (written immediately at departure)
     /// is the client-facing "was here until T" truth.
+    // bounded: a millisecond stamp
     departed_at_ms: u64,
     /// Epoch-ms when the trailing occupancy re-check is due.
+    // bounded: a millisecond stamp
     due_at_ms: u64,
 }
 
@@ -3041,6 +3326,91 @@ fn description_or(body: &Value, default: &str) -> String {
 mod tests {
     use super::*;
 
+    /// 0.3.26 (bsv-low #495): the departures re-arm net runs on the close and
+    /// the error paths too — the highest-signal hub events — not only on a
+    /// fetch and a socket frame. A source pin: the calls exist and come FIRST.
+    #[test]
+    fn the_departures_net_runs_on_the_close_and_error_paths_too() {
+        let src = include_str!("message_hub.rs");
+        let c = src
+            .find("async fn websocket_close(")
+            .expect("the close handler");
+        let cbody = &src[c..c + src[c..]
+            .find("async fn websocket_error(")
+            .expect("the error handler")];
+        let net = cbody
+            .find("self.rearm_pending_departures_net().await;")
+            .expect("the net on the close path");
+        let teardown = cbody
+            .find("self.teardown_departed_socket(&ws).await;")
+            .expect("the teardown");
+        assert!(net < teardown, "the net runs before the close's teardown");
+        let e = src
+            .find("async fn websocket_error(")
+            .expect("the error handler");
+        let ebody = &src[e..e
+            + src[e + 10..]
+                .find("\n    async fn ")
+                .expect("the next method")
+            + 10];
+        let net = ebody
+            .find("self.rearm_pending_departures_net().await;")
+            .expect("the net on the error path");
+        let teardown = ebody
+            .find("self.teardown_departed_socket(&ws).await;")
+            .expect("the teardown");
+        assert!(net < teardown, "the net runs before the error's teardown");
+    }
+
+    #[test]
+    fn presence_answer_is_undecided_inside_the_departure_debounce_and_absent_past_it() {
+        // bsv-low loop 13 (2026-09-20): the join-time snapshot read 4 s after a kill said `false` while the
+        // debounced push was 50 ms away, the owner's hub wrote told=absent from it and deduped the push;
+        // loop 12 (#491) read `false` for a peer mid-re-listen. Both are the same missing window.
+        let armed = arm_departure_debounce("02bb", 10_000); // trailing check due at 14_000
+        assert_eq!(
+            presence_answer(true, Some(&armed), 10_500),
+            Some(true),
+            "a live session wins"
+        );
+        assert_eq!(
+            presence_answer(false, Some(&armed), 10_500),
+            None,
+            "inside the window: undecided"
+        );
+        assert_eq!(
+            presence_answer(false, Some(&armed), 14_000),
+            None,
+            "at the due time: the alarm is running"
+        );
+        assert_eq!(
+            presence_answer(false, Some(&armed), 14_000 + PEER_LEFT_DEBOUNCE_MS),
+            None,
+            "a late alarm gets one more window"
+        );
+        assert_eq!(
+            presence_answer(false, Some(&armed), 14_001 + PEER_LEFT_DEBOUNCE_MS),
+            Some(false),
+            "a stranded entry is a lost alarm: the absence is real and the re-arm net is pushing it"
+        );
+        assert_eq!(
+            presence_answer(false, None, 10_500),
+            Some(false),
+            "no pending entry: a settled absence"
+        );
+    }
+
+    #[test]
+    fn presence_body_carries_null_for_an_undecided_room_and_keeps_the_advisory_fields() {
+        let body = presence_body_json("03aa-inbox", None, Some(1_700_000_000_123), None);
+        assert!(
+            body["present"].is_null(),
+            "undecided rides as null, never as a guessed bool"
+        );
+        assert_eq!(body["lastSeenMs"], 1_700_000_000_123u64);
+        assert!(body.get("rejoinDeadlineMs").is_none());
+    }
+
     #[test]
     fn told_transition_emits_exactly_on_change_and_always_on_first_observation() {
         use ToldPresence::*;
@@ -3151,7 +3521,7 @@ mod tests {
         // Advisory contract: no last-seen key => the field is ABSENT
         // (not 0, not null), so a reader can never misread it. With no
         // tier-2 deadline either, `rejoinDeadlineMs` is likewise absent.
-        let body = presence_body_json("03aa-inbox", true, None, None);
+        let body = presence_body_json("03aa-inbox", Some(true), None, None);
         assert_eq!(body["room"], "03aa-inbox");
         assert_eq!(body["present"], json!(true));
         assert!(
@@ -3167,7 +3537,7 @@ mod tests {
     #[test]
     fn presence_body_includes_last_seen_when_set() {
         // When a heartbeat exists it is threaded through as a number.
-        let body = presence_body_json("03aa-inbox", false, Some(1_700_000_000_123), None);
+        let body = presence_body_json("03aa-inbox", Some(false), Some(1_700_000_000_123), None);
         assert_eq!(body["present"], json!(false));
         assert_eq!(body["lastSeenMs"], json!(1_700_000_000_123u64));
         assert!(body.get("rejoinDeadlineMs").is_none());
@@ -3177,7 +3547,7 @@ mod tests {
     fn presence_body_includes_rejoin_deadline_when_set() {
         // Tier-2: the stayer-published deadline is threaded through as a
         // number, independent of the heartbeat and of `present`.
-        let body = presence_body_json("03aa-inbox", true, None, Some(1_700_000_060_000));
+        let body = presence_body_json("03aa-inbox", Some(true), None, Some(1_700_000_060_000));
         assert_eq!(body["present"], json!(true));
         assert_eq!(body["rejoinDeadlineMs"], json!(1_700_000_060_000u64));
         assert!(
@@ -3190,7 +3560,7 @@ mod tests {
     fn presence_body_includes_both_last_seen_and_rejoin_deadline() {
         let body = presence_body_json(
             "03aa-inbox",
-            false,
+            Some(false),
             Some(1_700_000_000_123),
             Some(1_700_000_060_000),
         );
@@ -4009,6 +4379,147 @@ mod tests {
             sim.pushes
         );
         assert_eq!(sim.pushes[0].0, room_a);
+    }
+
+    // ---- bsv-low W-B (D10): the HTTP lane's session mirror ----------------
+
+    fn strip_ws(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The mirror is upserted from the forwarding socket's VERIFIED identity
+    /// BEFORE the event is dispatched (an HTTP call may follow at once),
+    /// revoked in the unregister call, and the verify route is registered.
+    #[test]
+    fn the_session_mirror_is_upserted_before_the_dispatch_and_revoked_on_unregister() {
+        let src = strip_ws(include_str!("message_hub.rs"));
+        let event = {
+            let start = src
+                .find("asyncfnhandle_socketio_event(")
+                .expect("the event handler");
+            let end = src[start..]
+                .find("asyncfndispatch_socketio_event(")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        let upsert = event
+            .find("ifletSome(update)=body.session.take(){self.upsert_session_mirror(&body.identity_key,update).await;}")
+            .expect("the upsert from the verified identity");
+        let dispatch = event
+            .find("self.dispatch_socketio_event(body).await")
+            .expect("the dispatch");
+        assert!(upsert < dispatch, "the mirror before the dispatch");
+        let unregister = {
+            let start = src
+                .find("asyncfnhandle_socketio_unregister(")
+                .expect("unregister");
+            let end = src[start..]
+                .find("Response::from_json(&json!({\"status\":\"ok\"}))")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        assert!(unregister.contains(
+            "ifletSome(id)=body.session_id.as_deref(){self.revoke_session_mirror(id).await;}"
+        ));
+        assert!(src.contains(
+            "path==\"/internal/session-verify\"{returnself.handle_session_verify(&mutreq).await;}"
+        ));
+    }
+
+    /// The verify: the named identity must be the mirror's (an id is never
+    /// honoured for another identity), the pure verify judges the counter
+    /// and the MAC, the moved counter is PERSISTED before the `ok` answer,
+    /// an expired mirror is deleted, and K is answered only on `ok`.
+    #[test]
+    fn the_session_verify_binds_the_identity_persists_the_counter_and_answers_k_only_on_ok() {
+        let src = strip_ws(include_str!("message_hub.rs"));
+        let body = {
+            let start = src
+                .find("asyncfnhandle_session_verify(")
+                .expect("the verify");
+            let end = src[start..]
+                .find("asyncfnhandle_socketio_register(")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        let identity = body
+            .find("ifmirror.identity!=body.identity{")
+            .expect("the identity bind");
+        let verify = body.find("mirror.verify_http(").expect("the pure verify");
+        assert!(identity < verify);
+        let ok_arm = body.find("Ok(())=>{").expect("the ok arm");
+        let expired_arm = body
+            .find("Err(LaneRefusal::Expired)=>{")
+            .expect("the expired arm");
+        let ok = &body[ok_arm..expired_arm];
+        let put = ok
+            .find("self.state.storage().put(&key,&mirror).await")
+            .expect("the persist");
+        let answer = ok.find("\"ok\":true").expect("the ok answer");
+        assert!(put < answer, "the counter is persisted before the answer");
+        assert_eq!(
+            body.matches("\"key\":mirror.key").count(),
+            1,
+            "K is answered once, on ok"
+        );
+        assert!(ok.contains("\"key\":mirror.key"));
+        let expired = &body[expired_arm..];
+        assert!(expired.contains("self.state.storage().delete(&key).await"));
+    }
+
+    /// A refresh never resets the HTTP counter and never moves the key or
+    /// the identity; only the window moves, and only past the slack.
+    #[test]
+    fn a_mirror_refresh_moves_only_the_window() {
+        let src = strip_ws(include_str!("message_hub.rs"));
+        let body = {
+            let start = src
+                .find("asyncfnupsert_session_mirror(")
+                .expect("the upsert");
+            let end = src[start..]
+                .find("asyncfnrevoke_session_mirror(")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        assert!(body.contains("Some(m)ifm.identity!=identity_key=>{"));
+        assert!(body.contains("Some(m)ifm.key!=update.key=>{"));
+        assert!(body.contains("if!m.refresh_due(update.expires_at_ms){return;}"));
+        // The refresh arm, whole: the window moves, nothing else does.
+        assert!(
+            body.contains("Some(mutm)=>{if!m.refresh_due(update.expires_at_ms){return;}m.expires_at_ms=update.expires_at_ms;m}"),
+            "a refresh moves only the window (never the counter, the key or the identity)"
+        );
+    }
+
+    /// bsv-low W-B (D10): `sessionHello` is routed like any event (so the
+    /// forward that carries it registers the HTTP mirror) and is answered with
+    /// ONE `sessionWelcome`, which the socket DO seals back onto the lane.
+    #[test]
+    fn session_hello_is_dispatched_and_answered_with_a_welcome() {
+        let src = strip_ws(include_str!("message_hub.rs"));
+        let body = {
+            let start = src
+                .find("asyncfndispatch_socketio_event(")
+                .expect("the dispatch");
+            let end = src[start..]
+                .find("asyncfnhandle_socketio_register(")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        assert!(body.contains(
+            "\"sessionHello\"=>vec![OutboundEvent::new(\"sessionWelcome\",json!({\"status\":\"success\"}),)],"
+        ));
+        let hello = body.find("\"sessionHello\"=>").unwrap();
+        let unknown = body.find("other=>{").expect("the unknown-event arm");
+        assert!(
+            hello < unknown,
+            "the hello is named before the unknown-event refusal"
+        );
     }
 }
 

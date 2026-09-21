@@ -1,10 +1,18 @@
 use bsv_middleware_cloudflare::{
     add_cors_headers, init_panic_hook,
     middleware::{
-        auth::handle_cors_preflight, process_auth, sign_json_response, AuthMiddlewareOptions,
+        auth::handle_cors_preflight, process_auth_do, sign_json_response, AuthMiddlewareOptions,
         AuthResult,
     },
 };
+
+/// bsv-low W-D (2026-09-10): the BRC-104 path's session store is the Durable
+/// Object backend (`AuthSessionStore`, one object per session nonce: the record
+/// and the replay guard, no KV write per request); KV is the cold path. The
+/// class is exported from THIS crate's wasm by the re-export below and bound
+/// under this name in `wrangler.low.toml` (both envs) with migration `v10`.
+pub const AUTH_SESSION_STORE_BINDING: &str = "AUTH_SESSION_STORE";
+pub use bsv_middleware_cloudflare::AuthSessionStore;
 use serde_json::json;
 use worker::*;
 
@@ -32,6 +40,9 @@ mod r2_presign;
 // Durable Objects (M9)
 mod hub_forward;
 mod message_hub;
+/// The session lane (bsv-low W-B, register row D10): one BRC-103 handshake per
+/// connection, then MAC'd frames — zero wallet calls per frame.
+pub mod session_lane;
 
 // Engine.IO + Socket.IO transport layer (M10 Phase A — issue #61).
 // `/socket.io/*` traffic lands on the per-sid `EngineIoSession` DO via
@@ -94,7 +105,9 @@ fn cors_error_500() -> Response {
 async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // CORS preflight — must respond before auth
     if req.method() == Method::Options {
-        return handle_cors_preflight();
+        // bsv-low W-B (D10): the browser's preflight must allow the HTTP
+        // lane's headers as well as the middleware's.
+        return handle_cors_preflight().map(with_session_lane_cors);
     }
 
     // OpenAPI spec — public endpoint (no auth required)
@@ -169,7 +182,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
             .strip_prefix("Bearer ")
             .map(|s| s.to_string())
             .unwrap_or_default();
-        if expected.is_empty() || got != expected {
+        if !crate::session_lane::bearer_matches(&got, &expected) {
             return Response::error("unauthorized", 401);
         }
         let mut req = req;
@@ -183,6 +196,96 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         let (body, status) = handle_send_message(&send_body, &sender, &env, &store).await;
         return Response::from_json(&body).map(|r| r.with_status(status));
     }
+    // bsv-low #443 step 4 (2026-09-14): `POST /session/attest` — a first-party
+    // DOOR (the app-layer, the tower) asks whether ONE hub-lane call verifies,
+    // so it can mint its own lane for that identity without a handshake of
+    // its own (the client's first relay socket handshake is the tab's proof;
+    // the hub MIRROR of that lane is the identity authority). Bearer-gated
+    // like `/push` (the doors hold BROADCAST_TOKEN as RELAY_PUSH_TOKEN and
+    // reach us through the RELAY service binding). The body is the hub's
+    // verify body verbatim; the answer is `{ok, identity}` or `{ok:false,
+    // reason}` — NEVER the key (a door mints its own lane with its own key).
+    // The hub's counter moves on a verified attest exactly as on an HTTP-lane
+    // call, so an attest cannot be replayed. A hub that cannot be asked is
+    // 503 `hub-unavailable` (the door answers 503, never a refusal).
+    if req.method() == Method::Post && req.path() == "/session/attest" {
+        let expected = env
+            .secret("BROADCAST_TOKEN")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let got = req
+            .headers()
+            .get("Authorization")?
+            .unwrap_or_default()
+            .strip_prefix("Bearer ")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if !crate::session_lane::bearer_matches(&got, &expected) {
+            return Response::error("unauthorized", 401);
+        }
+        let mut req = req;
+        let body: serde_json::Value = match req.json().await {
+            Ok(v) => v,
+            Err(e) => return Response::error(format!("invalid attest body: {e}"), 400),
+        };
+        let identity = body
+            .get("identity")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !session_attest_body_ok(&body) {
+            return Response::from_json(&serde_json::json!({ "ok": false, "reason": "malformed" }));
+        }
+        let ask = body.to_string();
+        let answer = async {
+            let namespace = env.durable_object("MESSAGE_HUB")?;
+            let stub = namespace.id_from_name(&identity)?.get_stub()?;
+            let hdrs = Headers::new();
+            hdrs.set("content-type", "application/json")?;
+            let mut init = RequestInit::new();
+            init.with_method(Method::Post)
+                .with_headers(hdrs)
+                .with_body(Some(ask.into()));
+            let r = Request::new_with_init("https://do.local/internal/session-verify", &init)?;
+            let mut res = stub.fetch_with_request(r).await?;
+            res.json::<serde_json::Value>().await
+        };
+        let answer = crate::hub_forward::with_do_op_timeout(
+            answer,
+            crate::hub_forward::FORWARD_OP_TIMEOUT_MS,
+        )
+        .await;
+        return match answer {
+            Ok(v) => {
+                let ok = v.get("ok").and_then(|x| x.as_bool()) == Some(true);
+                if ok {
+                    console_log!("TRACE_SESSION attest ok identity={}", identity);
+                    Response::from_json(&serde_json::json!({ "ok": true, "identity": identity }))
+                } else {
+                    let reason = v
+                        .get("reason")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("unknown-session");
+                    console_log!(
+                        "TRACE_SESSION attest refused identity={} reason={}",
+                        identity,
+                        reason
+                    );
+                    Response::from_json(&serde_json::json!({ "ok": false, "reason": reason }))
+                }
+            }
+            Err(e) => {
+                console_log!(
+                    "TRACE_SESSION attest hub-unavailable identity={} err={e}",
+                    identity
+                );
+                Response::from_json(
+                    &serde_json::json!({ "ok": false, "reason": "hub-unavailable" }),
+                )
+                .map(|r| r.with_status(503))
+            }
+        };
+    }
     if req.method() == Method::Post && req.path() == "/broadcast" {
         let expected = env
             .secret("BROADCAST_TOKEN")
@@ -195,7 +298,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
             .strip_prefix("Bearer ")
             .map(|s| s.to_string())
             .unwrap_or_default();
-        if expected.is_empty() || got != expected {
+        if !crate::session_lane::bearer_matches(&got, &expected) {
             return Response::error("unauthorized", 401);
         }
         #[derive(serde::Deserialize)]
@@ -255,27 +358,47 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let req_method_dbg = req.method();
     let req_path_dbg = req.path();
 
-    let auth_result = process_auth(req, &env, &auth_options)
-        .await
-        .map_err(|e| Error::from(e.to_string()))?;
+    // bsv-low W-B (D10): THE HTTP SESSION LANE. A request carrying
+    // `x-low-session` is verified through the identity's hub (the mirror of
+    // the socket's lane: the counter and a MAC over the method, the path and
+    // the body, no signature, no KV) and its answer is sealed under the same
+    // counter; a refusal is 401 `ERR_SESSION_REFUSED {reason}` and the client
+    // falls back to BRC-104 for that call. A request without the header
+    // takes the full BRC-104 path exactly as before.
+    let mut req = req;
+    let lane = session_lane_auth(&mut req, &env).await;
+    let (identity_key, req, session, request_body, lane_seal) = match lane {
+        Some(Ok(auth)) => (
+            auth.identity,
+            req,
+            None,
+            auth.body,
+            Some((auth.key, auth.h)),
+        ),
+        Some(Err(refusal)) => return Ok(refusal),
+        None => {
+            let auth_result = process_auth_do(req, &env, &auth_options, AUTH_SESSION_STORE_BINDING)
+                .await
+                .map_err(|e| Error::from(e.to_string()))?;
+            match auth_result {
+                AuthResult::Authenticated {
+                    context,
+                    request,
+                    session,
+                    body,
+                } => (context.identity_key, request, session, body, None),
+                // Pass middleware responses through unchanged. The middleware's 401
+                // for unauthenticated requests emits
+                // `{status:"error", code:"UNAUTHORIZED", message:"Mutual-authentication failed!"}`
+                // which matches the TS reference server at messagebox.babbage.systems
+                // byte-for-byte (verified via tests/e2e_live_parity.py).
+                AuthResult::Response(response) => return Ok(response),
+            }
+        }
+    };
     let t_auth_done = Date::now().as_millis();
 
-    let (auth_context, req, session, request_body) = match auth_result {
-        AuthResult::Authenticated {
-            context,
-            request,
-            session,
-            body,
-        } => (context, request, session, body),
-        // Pass middleware responses through unchanged. The middleware's 401
-        // for unauthenticated requests emits
-        // `{status:"error", code:"UNAUTHORIZED", message:"Mutual-authentication failed!"}`
-        // which matches the TS reference server at messagebox.babbage.systems
-        // byte-for-byte (verified via tests/e2e_live_parity.py).
-        AuthResult::Response(response) => return Ok(response),
-    };
-
-    let identity_key = &auth_context.identity_key;
+    let identity_key = identity_key.as_str();
     let db = env.d1("DB")?;
     let store = storage::Storage::new(&db);
 
@@ -402,24 +525,261 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // (for /sendMessage: D1 read_send_context + box + insert_message, which have
     // their own per-op timing under TRACE_LAT send.* in routes::send_message).
     console_log!(
-        "TRACE_LAT req method={:?} path={} auth_ms={} route_ms={} status={}",
+        "TRACE_LAT req method={:?} path={} auth_ms={} route_ms={} status={} lane={}",
         req_method_dbg,
         req_path_dbg,
         t_auth_done.saturating_sub(t_req_start),
         t_route_done.saturating_sub(t_auth_done),
-        status
+        status,
+        if lane_seal.is_some() {
+            "session"
+        } else {
+            "brc104"
+        }
     );
 
-    // Sign response if session available, otherwise plain CORS
-    match session {
-        Some(ref s) => {
+    // The answer: signed under BRC-104 when the middleware authenticated;
+    // sealed under the session lane's K when the lane did; plain CORS
+    // otherwise (never reached with `allow_unauthenticated: false`).
+    match (session, lane_seal) {
+        (Some(ref s), _) => {
             sign_json_response(&body, status, &[], s).map_err(|e| Error::from(e.to_string()))
         }
-        None => {
+        (None, Some((key, h))) => seal_session_lane_response(&body, status, &key, h),
+        (None, None) => {
             let resp = Response::from_json(&body)?.with_status(status);
             Ok(add_cors_headers(resp))
         }
     }
+}
+
+// -- bsv-low W-B (D10): the HTTP session lane --------------------------------
+
+/// A request the session lane verified: whose it is, the key to seal the
+/// answer with, the counter it came under, and the body the route reads.
+struct SessionLaneAuth {
+    identity: String,
+    key: String,
+    h: u64,
+    body: Vec<u8>,
+}
+
+/// `None`: no `x-low-session` header, the request takes BRC-104.
+/// `Some(Ok)`: verified by the identity's hub. `Some(Err)`: the refusal to
+/// answer with (401 `ERR_SESSION_REFUSED {reason}`; 503 when the hub could
+/// not be asked, so the client falls back rather than reads "refused").
+async fn session_lane_auth(
+    req: &mut Request,
+    env: &Env,
+) -> Option<std::result::Result<SessionLaneAuth, Response>> {
+    use crate::session_lane as lane;
+    let headers = req.headers();
+    let id = headers.get(lane::SESSION_HEADER).ok().flatten()?;
+    let identity = headers
+        .get(lane::SESSION_IDENTITY_HEADER)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let h = headers
+        .get(lane::SESSION_COUNTER_HEADER)
+        .ok()
+        .flatten()
+        .and_then(|v| lane::parse_counter(&v));
+    let mac = headers
+        .get(lane::SESSION_MAC_HEADER)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let method = req.method();
+    let path_and_query = match req.url() {
+        Ok(u) => match u.query() {
+            Some(q) if !q.is_empty() => format!("{}?{}", u.path(), q),
+            _ => u.path().to_string(),
+        },
+        Err(_) => req.path(),
+    };
+    let (Some(h), false, false) = (h, identity.is_empty(), mac.is_empty()) else {
+        return Some(Err(session_lane_refusal(
+            lane::Refusal::Malformed.as_str(),
+            401,
+        )));
+    };
+    let body = match req.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            console_log!("TRACE_SESSION http malformed body: {e}");
+            return Some(Err(session_lane_refusal(
+                lane::Refusal::Malformed.as_str(),
+                401,
+            )));
+        }
+    };
+    let digest: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&body).into()
+    };
+    let ask = json!({
+        "id": id,
+        "identity": identity,
+        "h": h,
+        "method": method.as_ref(),
+        "path": path_and_query,
+        "bodySha256": hex::encode(digest),
+        "mac": mac,
+    })
+    .to_string();
+    let answer = async {
+        let namespace = env.durable_object("MESSAGE_HUB")?;
+        let stub = namespace.id_from_name(&identity)?.get_stub()?;
+        let hdrs = Headers::new();
+        hdrs.set("content-type", "application/json")?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(hdrs)
+            .with_body(Some(ask.into()));
+        let r = Request::new_with_init("https://do.local/internal/session-verify", &init)?;
+        let mut res = stub.fetch_with_request(r).await?;
+        res.json::<serde_json::Value>().await
+    };
+    let answer =
+        crate::hub_forward::with_do_op_timeout(answer, crate::hub_forward::FORWARD_OP_TIMEOUT_MS)
+            .await;
+    let verdict = match answer {
+        Ok(v) => v,
+        Err(e) => {
+            console_log!(
+                "TRACE_SESSION http hub-unavailable identity={} path={} err={e}",
+                identity,
+                path_and_query
+            );
+            return Some(Err(session_lane_refusal("hub-unavailable", 503)));
+        }
+    };
+    if verdict.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let reason = verdict
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown-session")
+            .to_string();
+        console_log!(
+            "TRACE_SESSION http refused identity={} path={} h={} reason={}",
+            identity,
+            path_and_query,
+            h,
+            reason
+        );
+        return Some(Err(session_lane_refusal(&reason, 401)));
+    }
+    let key = verdict
+        .get("key")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let verified = verdict
+        .get("identity")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if key.is_empty() || verified != identity {
+        return Some(Err(session_lane_refusal(
+            lane::Refusal::UnknownSession.as_str(),
+            401,
+        )));
+    }
+    console_log!(
+        "TRACE_SESSION http ok identity={} path={} h={}",
+        identity,
+        path_and_query,
+        h
+    );
+    Some(Ok(SessionLaneAuth {
+        identity: verified,
+        key,
+        h,
+        body,
+    }))
+}
+
+/// The lane's refusal body: `{status, code, reason}` with CORS, so a browser
+/// client reads the reason and falls back.
+fn session_lane_refusal(reason: &str, status: u16) -> Response {
+    let body = json!({
+        "status": "error",
+        "code": crate::session_lane::HTTP_REFUSED_CODE,
+        "reason": reason,
+        "description": format!("session lane refused: {reason}"),
+    });
+    match Response::from_json(&body) {
+        Ok(r) => with_session_lane_cors(add_cors_headers(r.with_status(status))),
+        Err(_) => Response::error("session lane refused", status)
+            .unwrap_or_else(|_| Response::empty().expect("an empty response builds")),
+    }
+}
+
+/// Seal a route's answer under the lane: the body as sent, `x-low-session-n`
+/// (the request's `h`) and `x-low-session-mac` over it.
+fn seal_session_lane_response(
+    body: &serde_json::Value,
+    status: u16,
+    key: &str,
+    h: u64,
+) -> Result<Response> {
+    use crate::session_lane as lane;
+    let text = serde_json::to_string(body)?;
+    let mac = lane::response_mac(key, h, &text)
+        .ok_or_else(|| Error::from("session lane: the mirror's key is not hex"))?;
+    let resp = Response::from_bytes(text.into_bytes())?.with_status(status);
+    let headers = resp.headers();
+    headers.set("content-type", "application/json")?;
+    headers.set(lane::SESSION_COUNTER_HEADER, &h.to_string())?;
+    headers.set(lane::SESSION_MAC_HEADER, &mac)?;
+    Ok(with_session_lane_cors(add_cors_headers(resp)))
+}
+
+/// The middleware's CORS lists are the reference's; the lane's headers are
+/// appended (allowed on the request, exposed on the answer).
+fn with_session_lane_cors(resp: Response) -> Response {
+    use crate::session_lane as lane;
+    let headers = resp.headers();
+    let allow = headers
+        .get("Access-Control-Allow-Headers")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let extra_allow = format!(
+        "{}, {}, {}, {}",
+        lane::SESSION_HEADER,
+        lane::SESSION_IDENTITY_HEADER,
+        lane::SESSION_COUNTER_HEADER,
+        lane::SESSION_MAC_HEADER
+    );
+    let _ = headers.set(
+        "Access-Control-Allow-Headers",
+        &if allow.is_empty() {
+            extra_allow
+        } else {
+            format!("{allow}, {extra_allow}")
+        },
+    );
+    let expose = headers
+        .get("Access-Control-Expose-Headers")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let extra_expose = format!(
+        "{}, {}",
+        lane::SESSION_COUNTER_HEADER,
+        lane::SESSION_MAC_HEADER
+    );
+    let _ = headers.set(
+        "Access-Control-Expose-Headers",
+        &if expose.is_empty() {
+            extra_expose
+        } else {
+            format!("{expose}, {extra_expose}")
+        },
+    );
+    resp
 }
 
 // -- Route handlers --
@@ -822,7 +1182,7 @@ async fn route_websocket_upgrade(
     env: &Env,
     auth_options: &AuthMiddlewareOptions,
 ) -> Result<Response> {
-    let auth_result = process_auth(req, env, auth_options)
+    let auth_result = process_auth_do(req, env, auth_options, AUTH_SESSION_STORE_BINDING)
         .await
         .map_err(|e| Error::from(e.to_string()))?;
 
@@ -1311,6 +1671,93 @@ mod push_route_tests {
         assert!(split_push_body(br#"[1,2]"#, 1_700_000_000_000).is_err());
         assert!(split_push_body(b"not json", 1_700_000_000_000).is_err());
     }
+
+    // ---- bsv-low W-B (D10): the HTTP session lane -------------------------
+
+    fn strip_ws(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// A request carrying the session header is judged by the lane and
+    /// NEVER reaches BRC-104 (`process_auth` lives inside the no-header arm);
+    /// its answer is sealed under K; the preflight allows the lane's headers.
+    #[test]
+    fn a_session_request_never_reaches_brc104_and_its_answer_is_sealed() {
+        let src = strip_ws(include_str!("lib.rs"));
+        let handle = {
+            let start = src
+                .find("asyncfnhandle(req:Request,env:Env,ctx:Context)")
+                .expect("handle");
+            let end = src[start..]
+                .find("structSessionLaneAuth{")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        let lane = handle
+            .find("letlane=session_lane_auth(&mutreq,&env).await;")
+            .expect("the lane ask");
+        let brc104 = handle
+            .find("process_auth_do(req,&env,&auth_options,AUTH_SESSION_STORE_BINDING)")
+            .expect("BRC-104");
+        assert!(lane < brc104, "the lane is asked first");
+        let none_arm = handle
+            .find("None=>{letauth_result=process_auth_do(")
+            .expect("BRC-104 only without the header");
+        assert!(none_arm < brc104 + 1);
+        assert_eq!(
+            handle
+                .matches("process_auth_do(req,&env,&auth_options,AUTH_SESSION_STORE_BINDING)")
+                .count(),
+            1,
+            "one BRC-104 call, inside the no-header arm"
+        );
+        assert!(
+            handle.contains("Some(Err(refusal))=>returnOk(refusal),"),
+            "a refusal answers at once"
+        );
+        assert!(handle
+            .contains("(None,Some((key,h)))=>seal_session_lane_response(&body,status,&key,h),"));
+        assert!(handle.contains("returnhandle_cors_preflight().map(with_session_lane_cors);"));
+    }
+
+    /// The lane asks the identity's hub with the body's DIGEST (never the
+    /// body), refuses when the hub's identity is not the one named, and
+    /// answers 503 (not a refusal) when the hub could not be asked.
+    #[test]
+    fn the_lane_ships_the_digest_binds_the_identity_and_tells_a_hub_fault_apart() {
+        let src = strip_ws(include_str!("lib.rs"));
+        let body = {
+            let start = src.find("asyncfnsession_lane_auth(").expect("the lane");
+            let end = src[start..]
+                .find("fnsession_lane_refusal(")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        assert!(body.contains("\"bodySha256\":hex::encode(digest),"));
+        assert!(
+            !body.contains("\"body\":body"),
+            "the body never travels to the hub"
+        );
+        assert!(body.contains("ifkey.is_empty()||verified!=identity{"));
+        assert!(body.contains("session_lane_refusal(\"hub-unavailable\",503)"));
+        assert!(
+            body.contains("with_do_op_timeout("),
+            "the hub ask is bounded"
+        );
+        let seal = {
+            let start = src.find("fnseal_session_lane_response(").expect("the seal");
+            let end = src[start..]
+                .find("fnwith_session_lane_cors(")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        assert!(seal.contains("lane::response_mac(key,h,&text)"));
+        assert!(seal.contains("headers.set(lane::SESSION_COUNTER_HEADER,&h.to_string())?;"));
+        assert!(seal.contains("headers.set(lane::SESSION_MAC_HEADER,&mac)?;"));
+    }
 }
 
 #[cfg(test)]
@@ -1605,6 +2052,95 @@ mod low_event_tests {
         assert!(
             ladder_event_push_body(OWNER, "nope", &format!("{OWNER}-low_game_{GID}"), 1, 1)
                 .is_none()
+        );
+    }
+}
+
+/// bsv-low #443 step 4: the shape a door's attest body must have before the
+/// hub is asked — the hub's verify body verbatim (`id`, `identity`, `h`,
+/// `method`, `path`, `bodySha256`, `mac`), every string bounded. PURE.
+pub fn session_attest_body_ok(body: &serde_json::Value) -> bool {
+    let s = |k: &str, max: usize| -> bool {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .map(|v| !v.is_empty() && v.len() <= max)
+            .unwrap_or(false)
+    };
+    let hex_n = |k: &str, n: usize| -> bool {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .map(|v| v.len() == n && v.bytes().all(|b| b.is_ascii_hexdigit()))
+            .unwrap_or(false)
+    };
+    hex_n("id", 64)
+        && hex_n("identity", 66)
+        && s("method", 8)
+        && s("path", 2048)
+        && s("bodySha256", 64)
+        && s("mac", 64)
+        && body.get("h").and_then(|v| v.as_u64()).is_some()
+}
+
+#[cfg(test)]
+mod session_attest_tests {
+    use super::session_attest_body_ok;
+    use serde_json::json;
+
+    #[test]
+    fn the_attest_body_is_the_hub_verify_body_verbatim_and_bounded() {
+        let good = json!({"id": "ab".repeat(32), "identity": "02".to_string() + &"cd".repeat(32), "h": 7, "method": "POST", "path": "/lane/attest", "bodySha256": "ef".repeat(32), "mac": "01".repeat(32)});
+        assert!(session_attest_body_ok(&good));
+        for k in ["id", "identity", "h", "method", "path", "bodySha256", "mac"] {
+            let mut b = good.clone();
+            b.as_object_mut().unwrap().remove(k);
+            assert!(!session_attest_body_ok(&b), "{k} is required");
+        }
+        let mut long = good.clone();
+        long["path"] = json!("/".repeat(2049));
+        assert!(!session_attest_body_ok(&long), "bounded");
+        let mut bad_h = good.clone();
+        bad_h["h"] = json!("7");
+        assert!(!session_attest_body_ok(&bad_h), "h is a number");
+        // N2: the identity names the hub DO; exactly 66 hex, the id exactly 64.
+        for (k, n) in [("identity", 66), ("id", 64)] {
+            let mut short = good.clone();
+            short[k] = json!("ab".repeat(n / 2 - 1));
+            assert!(!session_attest_body_ok(&short), "{k} is exactly {n}");
+            let mut nothex = good.clone();
+            nothex[k] = json!("zz".repeat(n / 2));
+            assert!(!session_attest_body_ok(&nothex), "{k} is hex");
+        }
+    }
+
+    /// Structural: the route is bearer-gated exactly like `/push`, forwards to
+    /// the identity's hub `/internal/session-verify`, and never answers the key.
+    #[test]
+    fn the_attest_route_is_bearer_gated_forwards_to_the_hub_and_never_leaks_the_key() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("req.path() == \"/session/attest\"")
+            .expect("the route");
+        let end = src[start..]
+            .find("req.path() == \"/broadcast\"")
+            .expect("the next route")
+            + start;
+        let route = &src[start..end];
+        assert!(
+            route.contains(".secret(\"BROADCAST_TOKEN\")"),
+            "bearer-gated like /push"
+        );
+        assert!(
+            route.contains("session_attest_body_ok(&body)"),
+            "the body is checked before the hub is asked"
+        );
+        assert!(
+            route.contains("https://do.local/internal/session-verify"),
+            "the hub's verify"
+        );
+        assert!(!route.contains("\"key\""), "the key never leaves the relay");
+        assert!(
+            route.contains("hub-unavailable") && route.contains("with_status(503)"),
+            "a dead hub is 503, never a refusal"
         );
     }
 }

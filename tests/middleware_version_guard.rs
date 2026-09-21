@@ -17,7 +17,7 @@
 
 /// The published version the relay is expected to ship with (see Cargo.toml's
 /// `bsv-middleware-cloudflare` entry and the 2026-07-23 #249 note beneath it).
-const EXPECTED_VERSION: &str = "0.3.2";
+const EXPECTED_VERSION: &str = "0.3.3";
 const CRATE: &str = "bsv-middleware-cloudflare";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
@@ -40,10 +40,7 @@ fn lock_entries() -> Vec<(String, Option<String>)> {
             })
         };
         if field("name").as_deref() == Some(CRATE) {
-            out.push((
-                field("version").unwrap_or_default(),
-                field("source"),
-            ));
+            out.push((field("version").unwrap_or_default(), field("source")));
         }
     }
     out

@@ -81,10 +81,7 @@ impl RetentionConfig {
     }
 
     pub fn from_env(env: &worker::Env) -> Self {
-        let raw = env
-            .var(RETAIN_BOX_PREFIXES_VAR)
-            .ok()
-            .map(|v| v.to_string());
+        let raw = env.var(RETAIN_BOX_PREFIXES_VAR).ok().map(|v| v.to_string());
         Self::parse(raw.as_deref())
     }
 
@@ -858,9 +855,15 @@ mod tests {
         // At 3 ids the outer seek moves to the recipient index (the threshold
         // above); the box side stays a rowid lookup, never a scan.
         let three = plan(&db, &ack_update_sql(3, 1), &["r1", "m1", "m2", "m3", p]);
-        assert!(three.contains("idx_messages_recipient (recipient=?)"), "{three}");
+        assert!(
+            three.contains("idx_messages_recipient (recipient=?)"),
+            "{three}"
+        );
         assert!(!three.contains("SCAN message_boxes"), "{three}");
-        assert!(three.contains("SEARCH mb USING INTEGER PRIMARY KEY"), "{three}");
+        assert!(
+            three.contains("SEARCH mb USING INTEGER PRIMARY KEY"),
+            "{three}"
+        );
         // The RED side of the same fixture: the pre-0.3.18 statement, verbatim,
         // scans the boxes.
         let legacy = plan(&db, &legacy_ack_update_sql(1, 1), &["r1", "m1", p]);
@@ -897,7 +900,11 @@ mod tests {
                 rusqlite::params!["ack-me", "m2", "m3", "m5", p.as_str()],
             )
             .unwrap();
-        assert_eq!((marked, deleted), (1, 2), "m2 marked; m3 and the box-less m5 deleted");
+        assert_eq!(
+            (marked, deleted),
+            (1, 2),
+            "m2 marked; m3 and the box-less m5 deleted"
+        );
         let m2_acked: Option<String> = db
             .query_row(
                 "SELECT acknowledged_at FROM messages WHERE message_id = 'm2'",
@@ -916,16 +923,24 @@ mod tests {
         assert_eq!(remaining, 0);
         // Re-acking the marked row counts 0 (the IS NULL guard), like before.
         let again = db
-            .execute(&ack_update_sql(1, 1), rusqlite::params!["ack-me", "m2", p.as_str()])
+            .execute(
+                &ack_update_sql(1, 1),
+                rusqlite::params!["ack-me", "m2", p.as_str()],
+            )
             .unwrap();
         assert_eq!(again, 0);
         // A wrong recipient acks nothing (the recipient scope is part of the seek).
         let stranger = db
-            .execute(&ack_update_sql(1, 1), rusqlite::params!["someone-else", "m2", p.as_str()])
+            .execute(
+                &ack_update_sql(1, 1),
+                rusqlite::params!["someone-else", "m2", p.as_str()],
+            )
             .unwrap()
-            + db
-                .execute(&ack_delete_sql(1, 1), rusqlite::params!["someone-else", "m2", p.as_str()])
-                .unwrap();
+            + db.execute(
+                &ack_delete_sql(1, 1),
+                rusqlite::params!["someone-else", "m2", p.as_str()],
+            )
+            .unwrap();
         assert_eq!(stranger, 0);
     }
 
@@ -953,7 +968,10 @@ mod tests {
             "the transcript read must be caller-scoped — no unscoped read of a \
              box type may exist: {sql}"
         );
-        assert!(sql.contains("ORDER BY m.rowid ASC"), "stable insertion order: {sql}");
+        assert!(
+            sql.contains("ORDER BY m.rowid ASC"),
+            "stable insertion order: {sql}"
+        );
         assert!(sql.contains("LIMIT ?"), "isolate OOM bound: {sql}");
     }
 
@@ -985,7 +1003,11 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["messageId"], "m1", "insertion order preserved");
         assert_eq!(msgs[1]["messageId"], "m2");
-        assert_eq!(msgs[0]["acknowledged"], json!(true), "delivered = marked, still readable");
+        assert_eq!(
+            msgs[0]["acknowledged"],
+            json!(true),
+            "delivered = marked, still readable"
+        );
         assert_eq!(msgs[1]["acknowledged"], json!(false));
         assert_eq!(msgs[0]["createdAt"], "2026-08-06T10:00:00.000Z");
         assert_eq!(msgs[0]["sender"], "02aa");
@@ -1008,7 +1030,10 @@ mod tests {
         let purged = transcript_response("low_game_abc", &[], Some(&tomb));
         assert_eq!(purged["purgedAt"], "2026-08-06T11:00:00.000Z");
         assert_eq!(purged["purgeReason"], "client");
-        assert_ne!(never, purged, "the two empties must not be the same wire bytes");
+        assert_ne!(
+            never, purged,
+            "the two empties must not be the same wire bytes"
+        );
     }
 
     #[test]
@@ -1066,7 +1091,11 @@ mod tests {
         assert_eq!(ttl_days(None), 14);
         assert_eq!(ttl_days(Some("7")), 7);
         assert_eq!(ttl_days(Some(" 30 ")), 30);
-        assert_eq!(ttl_days(Some("0")), 14, "a 0-day TTL would eat live transcripts");
+        assert_eq!(
+            ttl_days(Some("0")),
+            14,
+            "a 0-day TTL would eat live transcripts"
+        );
         assert_eq!(ttl_days(Some("-3")), 14);
         assert_eq!(ttl_days(Some("nope")), 14);
         assert_eq!(ttl_days(Some("")), 14);
@@ -1081,7 +1110,10 @@ mod tests {
         );
         assert!(sql.contains("created_at < datetime('now', ?)"));
         let boxes = sweep_delete_boxes_sql(1);
-        assert!(boxes.contains("LIKE ? ESCAPE"), "box GC also class-restricted: {boxes}");
+        assert!(
+            boxes.contains("LIKE ? ESCAPE"),
+            "box GC also class-restricted: {boxes}"
+        );
         assert!(
             boxes.contains("NOT IN (SELECT message_box_id FROM messages)"),
             "box GC only removes EMPTY boxes: {boxes}"
@@ -1091,7 +1123,10 @@ mod tests {
     #[test]
     fn sweep_tombstones_expired_boxes_with_boxwide_marker() {
         let sql = sweep_tombstone_sql(1);
-        assert!(sql.contains("'*', 'expired'"), "box-wide expiry marker: {sql}");
+        assert!(
+            sql.contains("'*', 'expired'"),
+            "box-wide expiry marker: {sql}"
+        );
         assert!(sql.contains("LIKE ? ESCAPE"), "class-restricted: {sql}");
     }
 

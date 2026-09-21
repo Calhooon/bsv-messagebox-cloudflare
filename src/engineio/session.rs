@@ -56,6 +56,7 @@ use crate::engineio::auth::{
 use crate::engineio::codec::{
     decode_polling_batch, encode_polling_batch, EngineIoPacket, SocketIoPacket,
 };
+use crate::session_lane::{Frame as LaneFrame, MirrorUpdate, Refusal as LaneRefusal, SessionLane};
 
 /// How long a polling GET waits for the queue to fill before returning
 /// with whatever (possibly nothing) is buffered. socket.io clients
@@ -165,6 +166,16 @@ struct SessionState {
     /// broadcast subscriber went deaf 30 min after its last join while its
     /// socket kept answering pings.
     registry_refreshed_at_ms: Option<u64>,
+    /// The SESSION LANE (bsv-low W-B, register row D10): minted when the
+    /// handshake completes, `None` for a reference client that never uses
+    /// it. Persisted in the attachment like `auth`: a hibernation wake must
+    /// verify the next frame with the same `K` and the same counters.
+    lane: Option<SessionLane>,
+    /// bsv-low #443 step 4: whether this socket has spent its ONE `sessionAttach`
+    /// (the gate's L1: an attach costs a hub counter and a hub round trip; a
+    /// refused socket falls back to the handshake, never to a second attach).
+    /// Persisted so a wake does not hand out another.
+    attach_attempted: bool,
 }
 
 impl SessionState {
@@ -181,6 +192,8 @@ impl SessionState {
             awaiting_pong_since_ms: None,
             last_ping_at_ms: None,
             registry_refreshed_at_ms: None,
+            lane: None,
+            attach_attempted: false,
         }
     }
 
@@ -202,6 +215,8 @@ impl SessionState {
             awaiting_pong_since_ms: att.awaiting_pong_since_ms,
             last_ping_at_ms: att.last_ping_at_ms,
             registry_refreshed_at_ms: att.registry_refreshed_at_ms,
+            lane: att.lane.clone(),
+            attach_attempted: att.attach_attempted,
         }
     }
 
@@ -225,6 +240,8 @@ impl SessionState {
             // nothing). Heartbeat state is session state like the rest.
             last_ping_at_ms: self.last_ping_at_ms,
             registry_refreshed_at_ms: self.registry_refreshed_at_ms,
+            lane: self.lane.clone(),
+            attach_attempted: self.attach_attempted,
         }
     }
 
@@ -303,6 +320,16 @@ struct WsAttachment {
     /// window was a 10-minute assumption from the pre-heartbeat world).
     #[serde(default)]
     registry_refreshed_at_ms: Option<u64>,
+    /// The session lane (bsv-low W-B, D10): the id, `K` (hex), the identity,
+    /// the two counters and the expiry, ~330 B of the 2 KB attachment cap
+    /// (pinned: `the_attachment_with_a_lane_and_rooms_stays_under_the_cap`).
+    /// Absent on an attachment written before 0.3.21, and for every
+    /// reference client.
+    #[serde(default)]
+    lane: Option<SessionLane>,
+    /// See `SessionState::attach_attempted` (0.3.22).
+    #[serde(default)]
+    attach_attempted: bool,
 }
 
 /// Record a `joinRoom` / `leaveRoom` in the SESSION's own room list — the list
@@ -458,8 +485,9 @@ pub(crate) fn heartbeat_repair(
     // alarm pending and no ping — LOW run 15 logged a spurious "REPAIRED …
     // pinging now" per socket at join); a pre-0.3.8 attachment with no ping
     // and no alarm still falls through to `PingNow` below.
-    let ping_overdue = last_ping_at_ms
-        .map_or(false, |last| now_ms.saturating_sub(last) >= PING_INTERVAL_MS + PING_OVERDUE_GRACE_MS);
+    let ping_overdue = last_ping_at_ms.is_some_and(|last| {
+        now_ms.saturating_sub(last) >= PING_INTERVAL_MS + PING_OVERDUE_GRACE_MS
+    });
     if ping_overdue {
         return HeartbeatRepair::PingNow;
     }
@@ -481,18 +509,20 @@ pub(crate) fn heartbeat_repair(
 /// containing `beta` (prod's bucket does not) — so a `secret put` of the knob's
 /// name on the production worker does nothing.
 pub(crate) fn test_knob_n(beta_marker: Option<&str>, value: Option<&str>) -> u64 {
-    let marker_ok = beta_marker.map_or(false, |m| m.contains("beta"));
+    let marker_ok = beta_marker.is_some_and(|m| m.contains("beta"));
     if !marker_ok {
         return 0;
     }
-    value.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// The broadcast-registry entry is refreshed by TIME (0.3.8), never by a
 /// ping count: an unknown last refresh is due (the first tick after a deploy
 /// re-registers once — harmless).
 pub(crate) fn registry_refresh_due(now_ms: u64, refreshed_at_ms: Option<u64>) -> bool {
-    refreshed_at_ms.map_or(true, |t| {
+    refreshed_at_ms.is_none_or(|t| {
         now_ms.saturating_sub(t) >= crate::broadcast_registry::REGISTRY_REFRESH_EVERY_MS
     })
 }
@@ -512,9 +542,13 @@ impl EngineIoSession {
         // `wrangler secret put` or a dashboard edit on the PRODUCTION worker,
         // so without the marker the name is inert whatever its value.
         let marker = self.env.var("R2_BUCKET_NAME").ok().map(|v| v.to_string());
-        let value = self.env.var("HEARTBEAT_TEST_LOSE_ALARM_AFTER_PONG_EVERY").ok().map(|v| v.to_string());
+        let value = self
+            .env
+            .var("HEARTBEAT_TEST_LOSE_ALARM_AFTER_PONG_EVERY")
+            .ok()
+            .map(|v| v.to_string());
         let n = test_knob_n(marker.as_deref(), value.as_deref());
-        if n == 0 || (now_ms / PING_INTERVAL_MS) % n != 0 {
+        if n == 0 || !(now_ms / PING_INTERVAL_MS).is_multiple_of(n) {
             return;
         }
         console_log!(
@@ -550,7 +584,12 @@ impl EngineIoSession {
                     "EngineIoSession: heartbeat REPAIRED sid={} — no alarm pending (last ping {since_last} ms ago, alarm_at={alarm_at:?}); arming in {ms} ms",
                     att.sid
                 );
-                if let Err(e) = self.state.storage().set_alarm(Duration::from_millis(ms)).await {
+                if let Err(e) = self
+                    .state
+                    .storage()
+                    .set_alarm(Duration::from_millis(ms))
+                    .await
+                {
                     console_log!("EngineIoSession: heartbeat repair set_alarm failed: {e}");
                 }
             }
@@ -564,7 +603,9 @@ impl EngineIoSession {
                     att.awaiting_pong_since_ms = Some(now);
                     att.last_ping_at_ms = Some(now);
                     if let Err(e) = ws.serialize_attachment(&att) {
-                        console_log!("EngineIoSession: heartbeat repair attachment persist failed: {e}");
+                        console_log!(
+                            "EngineIoSession: heartbeat repair attachment persist failed: {e}"
+                        );
                     }
                     if let Some(state) = self.inner.borrow_mut().as_mut() {
                         state.awaiting_pong_since_ms = Some(now);
@@ -595,6 +636,15 @@ impl EngineIoSession {
     async fn disarm_heartbeat_if_idle(&self) {
         if self.state.get_websockets().is_empty() {
             let _ = self.state.storage().delete_alarm().await;
+            // 0.3.26 (bsv-low #495): the census is re-read AFTER the delete —
+            // a socket attached between the two reads keeps its heartbeat
+            // (a transient empty read must never silence a live socket).
+            if !self.state.get_websockets().is_empty() {
+                console_log!(
+                    "EngineIoSession: heartbeat re-armed — a socket attached under the idle disarm"
+                );
+                self.arm_heartbeat_alarm().await;
+            }
         }
     }
 
@@ -642,6 +692,13 @@ impl DurableObject for EngineIoSession {
 
         if path == "/__init" {
             return self.handle_init(&qp).await;
+        }
+        // 0.3.26 (bsv-low #495): a fetch is a wake too — the polling transport
+        // and the Worker→DO paths repair a lost heartbeat chain on every
+        // attached socket, as every inbound frame and every delivery already
+        // do (`ensure_heartbeat` is a no-op for a socket without the upgrade).
+        for ws in self.state.get_websockets() {
+            self.ensure_heartbeat(&ws).await;
         }
 
         // M10 #61 Phase C — internal broadcast endpoint posted to by the
@@ -742,7 +799,8 @@ impl DurableObject for EngineIoSession {
         }
         self.handle_engineio_packet(pkt, Some(&ws)).await;
         if was_pong {
-            self.test_lose_alarm_after_pong(Date::now().as_millis()).await;
+            self.test_lose_alarm_after_pong(Date::now().as_millis())
+                .await;
         }
         Ok(())
     }
@@ -752,8 +810,25 @@ impl DurableObject for EngineIoSession {
         ws: WebSocket,
         code: usize,
         reason: String,
-        _was_clean: bool,
+        was_clean: bool,
     ) -> Result<()> {
+        // 0.3.23 (bsv-low #466, 2026-09-19): NAME the close. An idle games
+        // page's socket dropped twice in 30 min with pongs answered 14 s and
+        // 22 s before each close and no server close path taken; the runtime's
+        // bare "close" event line carried no code, so the relay side could not
+        // say whether the peer closed (1000/1001 + a reason), the network died
+        // (1006, unclean) or the platform relocated the object. One line, the
+        // sid beside it, before the teardown.
+        let sid = ws
+            .deserialize_attachment::<WsAttachment>()
+            .ok()
+            .flatten()
+            .map(|a| a.sid)
+            .unwrap_or_default();
+        console_log!(
+            "EngineIoSession: WS closed sid={sid} code={code} clean={was_clean} reason={:?}",
+            reason.chars().take(120).collect::<String>()
+        );
         self.teardown_ws_transport(&ws).await;
         let mirror_code = u16::try_from(code).ok().filter(|c| *c >= 1000);
         let _ = ws.close(mirror_code.or(Some(1000)), Some(reason.as_str()));
@@ -833,7 +908,10 @@ impl DurableObject for EngineIoSession {
                             // registry entry fresh from the heartbeat — by TIME
                             // (0.3.8), never by a count.
                             let mut refresh: Option<String> = None;
-                            if att.joined_rooms.iter().any(|r| r.contains(crate::message_hub::BROADCAST_BOX_MARKER))
+                            if att
+                                .joined_rooms
+                                .iter()
+                                .any(|r| r.contains(crate::message_hub::BROADCAST_BOX_MARKER))
                                 && registry_refresh_due(now, att.registry_refreshed_at_ms)
                             {
                                 att.registry_refreshed_at_ms = Some(now);
@@ -865,7 +943,8 @@ impl DurableObject for EngineIoSession {
                                 state.registry_refreshed_at_ms = att.registry_refreshed_at_ms;
                             }
                             if let Some(identity) = refresh {
-                                crate::broadcast_registry::register_identity(&self.env, &identity).await;
+                                crate::broadcast_registry::register_identity(&self.env, &identity)
+                                    .await;
                             }
                         }
                         Err(e) => {
@@ -1289,6 +1368,22 @@ impl EngineIoSession {
                 // Non-authMessage events still require the session to
                 // have been CONNECTed (or to have completed BRC-103 — see
                 // is_connected() in this file for the Bug 1 defense).
+                if name == crate::session_lane::ATTACH_EVENT {
+                    // bsv-low #443 step 4: a socket attaching through the hub
+                    // mirror instead of a BRC-103 handshake of its own. Taken
+                    // BEFORE the CONNECT guard below: that guard also accepts
+                    // an authenticated socket because a wake can rehydrate
+                    // `connected=false` (M10 #61), and an attaching socket is
+                    // by definition not yet authenticated — we13 (2026-09-14)
+                    // dropped every attach here as "before CONNECT". The
+                    // attach carries its own proof (the hub's verdict) and is
+                    // answered directly, never routed to a namespace.
+                    let arg = iter.next().unwrap_or(Value::Null);
+                    self.dispatch_session_attach(&arg, &nsp, ws_for_response)
+                        .await;
+                    return;
+                }
+
                 if !self.is_connected() {
                     console_log!(
                         "EngineIoSession: EVENT '{name}' before CONNECT — dropping (auth not started)"
@@ -1296,7 +1391,21 @@ impl EngineIoSession {
                     return;
                 }
 
-                // Any non-`authMessage` Socket.IO EVENT is silently
+                // bsv-low W-B (D10): THE SESSION LANE. A session-aware
+                // client sends every post-handshake event as
+                // `sessionMessage {s, n, e, d, m}`: verified by the lane's
+                // id, window, counter and MAC (no wallet, no signature),
+                // then routed EXACTLY like a verified General. A refusal is
+                // said (`sessionRefused {reason}`, a signed General on the
+                // reference lane) and the client re-handshakes.
+                if name == crate::session_lane::INBOUND_EVENT {
+                    let arg = iter.next().unwrap_or(Value::Null);
+                    self.dispatch_session_message(&arg, &nsp, ws_for_response)
+                        .await;
+                    return;
+                }
+
+                // Any other non-`authMessage` Socket.IO EVENT is silently
                 // dropped. The `@bsv/authsocket-client` (the only
                 // supported client) wraps every `socket.emit(...)` in a
                 // signed BRC-103 General that ships as
@@ -1499,9 +1608,33 @@ impl EngineIoSession {
                 // fan-out needs the subscriber entry) but is no longer
                 // on the latency budget the client measures.
                 if name == "authenticated" {
+                    // bsv-low W-B (D10): MINT THE SESSION LANE. The handshake
+                    // is complete and verified; the offer (id, expiry, salt)
+                    // rides this very General, the reference's shape plus one
+                    // field a reference client ignores. `K` is derived on
+                    // both sides from the salt, the id and the handshake's
+                    // own nonces; it never crosses the wire.
+                    // Only an EXPLICIT ask mints (`laneAsk` in the payload,
+                    // echoed in the offer): the reference client's own
+                    // `authenticated` never touches the lane, so a late or
+                    // duplicate one can never move the socket's lane under
+                    // a session-aware client's feet.
+                    let lane_ask = data
+                        .get("laneAsk")
+                        .and_then(|v| v.as_str())
+                        .filter(|a| !a.is_empty() && a.len() <= 64)
+                        .map(String::from);
+                    let mut data = json!({ "status": "success" });
+                    if let Some(ask) = lane_ask {
+                        if let Some(offer) =
+                            self.mint_session_lane(&snap_state, &identity_key, &ask)
+                        {
+                            data["session"] = json!(offer);
+                        }
+                    }
                     let ack = OutboundSocketIoEvent {
                         event_name: "authenticationSuccess".to_string(),
-                        data: json!({ "status": "success" }),
+                        data,
                     };
                     self.emit_signed_general(&ack, &snap_state, &wallet, nsp, ws_for_response);
                     console_log!(
@@ -1569,7 +1702,12 @@ impl EngineIoSession {
                 let hub_confirmed_join = outbound.iter().any(|ev| ev.event_name == "joinedRoom");
                 let rooms_changed = match self.inner.borrow_mut().as_mut() {
                     Some(s) => {
-                        let changed = record_room_membership(&mut s.joined_rooms, &name, &data, hub_confirmed_join);
+                        let changed = record_room_membership(
+                            &mut s.joined_rooms,
+                            &name,
+                            &data,
+                            hub_confirmed_join,
+                        );
                         // The hub registered the identity at this join: the
                         // registry entry is fresh as of now (0.3.8 time-based
                         // refresh), so the heartbeat re-registers 175 s later,
@@ -1599,6 +1737,418 @@ impl EngineIoSession {
     /// over the active transport (or enqueue for the next polling
     /// drain). Always emitted on the default namespace — namespaces
     /// other than `/` are not supported.
+    /// bsv-low W-B (D10): mint the session lane for this verified socket.
+    /// The 64 random bytes (the id and the salt) come from the platform RNG
+    /// (`getrandom` → `crypto.getRandomValues` on Workers, the same call the
+    /// handshake's own nonce uses). Returns the offer for the handshake's
+    /// last General, or `None` when nothing can be minted (no verified
+    /// identity, no randomness): the socket then stays on the reference
+    /// lane, which is always correct.
+    fn mint_lane_pure(
+        &self,
+        state: &SessionAuthState,
+        identity_key: &str,
+        ask: &str,
+    ) -> Option<(SessionLane, crate::session_lane::SessionOffer)> {
+        let SessionAuthState::Authenticated {
+            server_session_nonce,
+            peer_nonce,
+            ..
+        } = state
+        else {
+            return None;
+        };
+        let mut random = [0u8; 64];
+        if let Err(e) = getrandom::getrandom(&mut random) {
+            console_error!(
+                "EngineIoSession: session lane: no randomness ({e}); the reference lane stands"
+            );
+            return None;
+        }
+        let now = Date::now().as_millis();
+        Some(SessionLane::mint(
+            identity_key,
+            peer_nonce,
+            server_session_nonce,
+            &random,
+            now,
+            ask,
+        ))
+    }
+
+    /// The handshake path's mint: the pure mint, then the lane on this socket
+    /// and the attachment persisted. The attach path (`dispatch_session_attach`)
+    /// uses the same pure mint under its compare-and-set instead.
+    fn mint_session_lane(
+        &self,
+        state: &SessionAuthState,
+        identity_key: &str,
+        ask: &str,
+    ) -> Option<crate::session_lane::SessionOffer> {
+        let (lane, offer) = self.mint_lane_pure(state, identity_key, ask)?;
+        let sid = {
+            let mut guard = self.inner.borrow_mut();
+            let s = guard.as_mut()?;
+            s.lane = Some(lane);
+            s.sid.clone()
+        };
+        self.persist_to_ws_attachment();
+        console_log!(
+            "TRACE_SESSION minted sid={} identity={} id={}… expires_at={}",
+            sid,
+            identity_key,
+            &offer.id[..12],
+            offer.expires_at_ms
+        );
+        Some(offer)
+    }
+
+    /// bsv-low #443 step 4 (2026-09-14): `sessionAttach` — a socket of a tab that
+    /// already holds a relay lane (the first socket's BRC-103 handshake, mirrored
+    /// by the identity's hub) attaches through that mirror instead of a
+    /// handshake of its own: the frame's hub-lane credentials are verified by
+    /// the hub exactly like an HTTP-lane call (`ATTACH /socket`, the socket's
+    /// nonce as the body; the counter moves, so an attach is not replayable);
+    /// on `ok` THIS socket is Authenticated for the identity the HUB answered
+    /// (never the frame's claim alone), its own lane is minted (the same
+    /// `mint_session_lane`, the attach nonce as the client nonce, a fresh server
+    /// nonce), and the ack `sessionAttached {d, m}` is sealed under the HUB
+    /// lane's key (a one-shot MAC the client verifies with its hub lane and binds
+    /// to its nonce). A refusal is a plain `sessionAttachRefused {reason}`; a hub
+    /// that cannot be asked is `hub-unavailable` (the client falls back to the
+    /// reference handshake either way). The presence contract is untouched: this
+    /// is still its own socket, its close still a departure.
+    async fn dispatch_session_attach(
+        &self,
+        arg: &Value,
+        nsp: &str,
+        ws_for_response: Option<&WebSocket>,
+    ) {
+        let refuse = |reason: &str| {
+            let evt = SocketIoPacket::Event {
+                nsp: nsp.to_string(),
+                ack_id: None,
+                data: vec![
+                    Value::String(crate::session_lane::ATTACH_REFUSED_EVENT.into()),
+                    json!({ "reason": reason }),
+                ],
+            };
+            self.send_or_enqueue(EngineIoPacket::Message(evt.encode()), ws_for_response);
+            console_log!("TRACE_SESSION attach refused reason={reason}");
+        };
+        let Some(frame) = crate::session_lane::parse_attach_frame(arg) else {
+            refuse(LaneRefusal::Malformed.as_str());
+            return;
+        };
+        // One attach per socket (L1), judged and spent in ONE borrow with the
+        // authenticated check, before the hub is asked.
+        let gate = {
+            let mut guard = self.inner.borrow_mut();
+            match guard.as_mut() {
+                None => None,
+                Some(s) if s.auth.is_authenticated() => Some("already-authenticated"),
+                Some(s) if s.attach_attempted => Some("attach-exhausted"),
+                Some(s) => {
+                    s.attach_attempted = true;
+                    Some("")
+                }
+            }
+        };
+        match gate {
+            None => return,
+            Some("") => {}
+            Some(reason) => {
+                refuse(reason);
+                return;
+            }
+        }
+        self.persist_to_ws_attachment();
+        // The hub: the identity's own DO, asked with the HTTP-lane verify body.
+        let verify_body = crate::session_lane::attach_verify_body(&frame).to_string();
+        let answer = async {
+            let namespace = self.env.durable_object("MESSAGE_HUB")?;
+            let stub = namespace.id_from_name(&frame.identity)?.get_stub()?;
+            let hdrs = Headers::new();
+            hdrs.set("content-type", "application/json")?;
+            let mut init = RequestInit::new();
+            init.with_method(Method::Post)
+                .with_headers(hdrs)
+                .with_body(Some(verify_body.into()));
+            let r = Request::new_with_init("https://do.local/internal/session-verify", &init)?;
+            let mut res = stub.fetch_with_request(r).await?;
+            res.json::<Value>().await
+        };
+        // Bounded BELOW the client's attach wait (M1): a slow hub is a fallback.
+        let answer = crate::hub_forward::with_do_op_timeout(
+            answer,
+            crate::session_lane::ATTACH_HUB_TIMEOUT_MS,
+        )
+        .await;
+        let verdict = match answer {
+            Ok(v) => v,
+            Err(e) => {
+                console_log!(
+                    "TRACE_SESSION attach hub-unavailable identity={} err={e}",
+                    frame.identity
+                );
+                refuse("hub-unavailable");
+                return;
+            }
+        };
+        if verdict.get("ok").and_then(Value::as_bool) != Some(true) {
+            let reason = verdict
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown-session")
+                .to_string();
+            refuse(&reason);
+            return;
+        }
+        // The identity the HUB holds the mirror for, and the mirror's key for the ack.
+        let identity = verdict
+            .get("identity")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let hub_key = verdict
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if identity.is_empty() || identity != frame.identity || hub_key.is_empty() {
+            refuse(LaneRefusal::UnknownSession.as_str());
+            return;
+        }
+        let mut random = [0u8; 32];
+        if let Err(e) = getrandom::getrandom(&mut random) {
+            console_error!("EngineIoSession: attach: no randomness ({e})");
+            refuse("no-randomness");
+            return;
+        }
+        let server_session_nonce = hex::encode(random);
+        let state = SessionAuthState::Authenticated {
+            server_session_nonce: server_session_nonce.clone(),
+            peer_nonce: frame.nonce.clone(),
+            peer_identity_key: identity.clone(),
+        };
+        let Some((lane, offer)) = self.mint_lane_pure(&state, &identity, &frame.nonce) else {
+            refuse("mint-failed");
+            return;
+        };
+        // Compare-and-set (M2): the hub was asked across an await, and a
+        // handshake that completed meanwhile owns this socket. Authenticated
+        // and the lane land in ONE borrow, or nothing does.
+        let cas = {
+            let mut guard = self.inner.borrow_mut();
+            match guard.as_mut() {
+                None => None,
+                Some(s) if s.auth.is_authenticated() => Some(false),
+                Some(s) => {
+                    s.auth = state.clone();
+                    s.authenticated_emitted = true;
+                    s.lane = Some(lane);
+                    Some(true)
+                }
+            }
+        };
+        match cas {
+            Some(true) => {}
+            Some(false) => {
+                refuse("already-authenticated");
+                return;
+            }
+            None => return,
+        }
+        self.persist_to_ws_attachment();
+        let d =
+            json!({ "session": offer, "serverNonce": server_session_nonce, "nonce": frame.nonce })
+                .to_string();
+        let Some(m) = crate::session_lane::attach_ack_mac(&hub_key, &d) else {
+            refuse("mint-failed");
+            return;
+        };
+        let evt = SocketIoPacket::Event {
+            nsp: nsp.to_string(),
+            ack_id: None,
+            data: vec![
+                Value::String(crate::session_lane::ATTACHED_EVENT.into()),
+                json!({ "d": d, "m": m }),
+            ],
+        };
+        self.send_or_enqueue(EngineIoPacket::Message(evt.encode()), ws_for_response);
+        console_log!(
+            "TRACE_SESSION attached identity={} hub_lane={}… socket_lane={}…",
+            identity,
+            &frame.s[..12],
+            &offer.id[..12]
+        );
+    }
+
+    /// bsv-low W-B (D10): a `sessionMessage` from the client. Verified by the
+    /// lane (the id, the idle window, the counter, the MAC), then routed
+    /// through the SAME hub bridge a verified General takes, the hub's
+    /// answers sealed back onto the lane (`sessionEvent`). A refusal is said
+    /// on the reference lane as a signed General: the client may hold no
+    /// session to verify a MAC with, and its `Peer` still verifies a
+    /// signature.
+    async fn dispatch_session_message(
+        &self,
+        arg: &Value,
+        nsp: &str,
+        ws_for_response: Option<&WebSocket>,
+    ) {
+        let now = Date::now().as_millis();
+        let frame: Option<LaneFrame> = serde_json::from_value(arg.clone()).ok();
+        let (verdict, snap_state, sid) = {
+            let mut guard = self.inner.borrow_mut();
+            let Some(s) = guard.as_mut() else {
+                return;
+            };
+            let verdict = match (&frame, s.lane.as_mut()) {
+                (None, _) => Err(LaneRefusal::Malformed),
+                (Some(_), None) => Err(LaneRefusal::UnknownSession),
+                (Some(f), Some(lane)) => lane.verify_inbound(f, now),
+            };
+            (verdict, s.auth.clone(), s.sid.clone())
+        };
+        let identity_key = snap_state
+            .verified_identity_key()
+            .map(String::from)
+            .unwrap_or_default();
+        match verdict {
+            Err(reason) => {
+                console_log!(
+                    "TRACE_SESSION refused sid={} identity={} reason={} n={}",
+                    sid,
+                    identity_key,
+                    reason.as_str(),
+                    frame.as_ref().map(|f| f.n).unwrap_or(0)
+                );
+                if snap_state.is_authenticated() {
+                    let ev = OutboundSocketIoEvent {
+                        event_name: crate::session_lane::REFUSED_EVENT.to_string(),
+                        data: json!({ "reason": reason.as_str() }),
+                    };
+                    self.emit_on_reference_lane(&ev, &snap_state, nsp, ws_for_response);
+                }
+            }
+            Ok((event_name, data_text)) => {
+                // The counter and the window moved: PERSIST BEFORE ROUTING,
+                // so a hibernation wake during the hub await can never
+                // accept this counter again.
+                self.persist_to_ws_attachment();
+                let data: Value = serde_json::from_str(&data_text).unwrap_or(Value::Null);
+                console_log!(
+                    "TRACE_SESSION in sid={} identity={} event={}",
+                    sid,
+                    identity_key,
+                    event_name
+                );
+                let outbound = self
+                    .forward_event_to_message_hub(&identity_key, &sid, &event_name, &data)
+                    .await;
+                // The same membership mirror the General path keeps (LOW run
+                // 11): the heartbeat's registry-refresh gate reads it.
+                let hub_confirmed_join = outbound.iter().any(|ev| ev.event_name == "joinedRoom");
+                let rooms_changed = match self.inner.borrow_mut().as_mut() {
+                    Some(s) => {
+                        let changed = record_room_membership(
+                            &mut s.joined_rooms,
+                            &event_name,
+                            &data,
+                            hub_confirmed_join,
+                        );
+                        if changed && hub_confirmed_join && event_name == "joinRoom" {
+                            s.registry_refreshed_at_ms = Some(Date::now().as_millis());
+                        }
+                        changed
+                    }
+                    None => false,
+                };
+                if rooms_changed {
+                    self.persist_to_ws_attachment();
+                }
+                for ev in outbound {
+                    if !self.emit_on_session_lane(&ev, nsp, ws_for_response) {
+                        // The lane vanished mid-route (a wake without it):
+                        // the reference lane still answers.
+                        self.emit_on_reference_lane(&ev, &snap_state, nsp, ws_for_response);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The reference lane from a path that holds no wallet yet: build it
+    /// from the secret and emit a signed General. Best-effort, logged.
+    fn emit_on_reference_lane(
+        &self,
+        ev: &OutboundSocketIoEvent,
+        state: &SessionAuthState,
+        nsp: &str,
+        ws_for_response: Option<&WebSocket>,
+    ) {
+        let server_key = match self.env.secret("SERVER_PRIVATE_KEY") {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                console_error!("EngineIoSession: session lane: SERVER_PRIVATE_KEY: {e}");
+                return;
+            }
+        };
+        match make_wallet(&server_key) {
+            Ok(wallet) => self.emit_signed_general(ev, state, &wallet, nsp, ws_for_response),
+            Err(e) => console_error!("EngineIoSession: session lane: make_wallet: {e}"),
+        }
+    }
+
+    /// bsv-low W-B (D10): emit one outbound event on the session lane when
+    /// the lane is live AND active (the client has spoken on it). Returns
+    /// false when the caller must fall back to the signed General: no lane,
+    /// an idle-expired lane, or a client that never spoke on it (a reference
+    /// client would never read a `sessionEvent`).
+    fn emit_on_session_lane(
+        &self,
+        ev: &OutboundSocketIoEvent,
+        nsp: &str,
+        ws_for_response: Option<&WebSocket>,
+    ) -> bool {
+        let now = Date::now().as_millis();
+        // The same room-suffixed name the reference lane carries
+        // (`sendMessage-<roomId>`): the client's listeners key on it.
+        let event_name = authsocket_event_name(&ev.event_name, &ev.data);
+        let data_text = ev.data.to_string();
+        let frame = {
+            let mut guard = self.inner.borrow_mut();
+            let Some(s) = guard.as_mut() else {
+                return false;
+            };
+            let Some(lane) = s.lane.as_mut() else {
+                return false;
+            };
+            if !lane.active || !lane.is_live(now) {
+                return false;
+            }
+            match lane.seal_outbound(&event_name, &data_text, now) {
+                Some(f) => f,
+                None => return false,
+            }
+        };
+        // The relay's counter moved: persist, so a wake never re-stamps a
+        // counter the client already saw.
+        self.persist_to_ws_attachment();
+        let evt = SocketIoPacket::Event {
+            nsp: nsp.to_string(),
+            ack_id: None,
+            data: vec![
+                Value::String(crate::session_lane::OUTBOUND_EVENT.into()),
+                serde_json::to_value(&frame).unwrap_or(Value::Null),
+            ],
+        };
+        self.send_or_enqueue(EngineIoPacket::Message(evt.encode()), ws_for_response);
+        console_log!("TRACE_SESSION out event={} n={}", event_name, frame.n);
+        true
+    }
+
     fn emit_auth_message(&self, value: &Value, nsp: &str, ws_for_response: Option<&WebSocket>) {
         let evt = SocketIoPacket::Event {
             nsp: nsp.to_string(),
@@ -1675,11 +2225,23 @@ impl EngineIoSession {
             }
         };
 
+        // bsv-low W-B (D10): once the client has spoken on the session lane,
+        // every forward carries the lane's mirror (id, K, the window) so the
+        // identity's hub can verify the HTTP lane: no extra await, the hub
+        // writes it only when the window moved past the slack.
+        let session: Option<MirrorUpdate> = self
+            .inner
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.lane.as_ref())
+            .filter(|lane| lane.active)
+            .map(MirrorUpdate::from);
         let payload = json!({
             "identityKey": identity_key,
             "sid": sid,
             "eventName": event_name,
             "data": data,
+            "session": session,
         })
         .to_string();
 
@@ -1768,7 +2330,7 @@ impl EngineIoSession {
         if sid.is_empty() || identity_key.is_empty() {
             return;
         }
-        self.post_registration(identity_key, &sid, /*register=*/ true)
+        self.post_registration(identity_key, &sid, /*register=*/ true, None)
             .await;
     }
 
@@ -1806,8 +2368,8 @@ impl EngineIoSession {
     /// torn-down session. Best-effort.
     async fn unregister_with_message_hub(&self) {
         let snapshot = {
-            let guard = self.inner.borrow();
-            let s = match guard.as_ref() {
+            let mut guard = self.inner.borrow_mut();
+            let s = match guard.as_mut() {
                 Some(s) => s,
                 None => return,
             };
@@ -1816,18 +2378,36 @@ impl EngineIoSession {
                 .verified_identity_key()
                 .map(String::from)
                 .unwrap_or_default();
-            (identity_key, s.sid.clone())
+            // bsv-low W-B (D10): the lane dies with its socket. Taken here,
+            // once, for both lifecycle ends (the socket.io DISCONNECT packet
+            // and the transport teardown); its id rides the unregister so
+            // the hub revokes the HTTP mirror in the same call. A session id
+            // is never accepted on another socket; a reconnect is a new
+            // handshake with a new offer.
+            let lane_id = s.lane.take().map(|lane| lane.id);
+            (identity_key, s.sid.clone(), lane_id)
         };
-        let (identity_key, sid) = snapshot;
+        let (identity_key, sid, lane_id) = snapshot;
         if identity_key.is_empty() || sid.is_empty() {
             return;
         }
-        self.post_registration(&identity_key, &sid, /*register=*/ false)
-            .await;
+        self.post_registration(
+            &identity_key,
+            &sid,
+            /*register=*/ false,
+            lane_id.as_deref(),
+        )
+        .await;
     }
 
     /// Helper: POST to MessageHub `/internal/socketio-(un)register`.
-    async fn post_registration(&self, identity_key: &str, sid: &str, register: bool) {
+    async fn post_registration(
+        &self,
+        identity_key: &str,
+        sid: &str,
+        register: bool,
+        revoke_session: Option<&str>,
+    ) {
         let namespace = match self.env.durable_object("MESSAGE_HUB") {
             Ok(n) => n,
             Err(e) => {
@@ -1851,7 +2431,11 @@ impl EngineIoSession {
         } else {
             "https://do.local/internal/socketio-unregister"
         };
-        let payload = json!({ "sid": sid }).to_string();
+        let mut payload = json!({ "sid": sid });
+        if let Some(id) = revoke_session {
+            payload["sessionId"] = json!(id);
+        }
+        let payload = payload.to_string();
         let headers = Headers::new();
         if headers.set("content-type", "application/json").is_err() {
             return;
@@ -1996,7 +2580,12 @@ impl EngineIoSession {
                 "body": body.body,
             }),
         };
-        self.emit_signed_general(&ev, &snap_state, &wallet, "/", None);
+        // bsv-low W-B (D10): once the client has spoken on the session lane
+        // every delivery rides it (a MAC, no signature); before that, and
+        // for a reference client forever, the signed General.
+        if !self.emit_on_session_lane(&ev, "/", None) {
+            self.emit_signed_general(&ev, &snap_state, &wallet, "/", None);
+        }
         // 0.3.8: a delivery is a wake too — repair a lost heartbeat chain on
         // every attached socket (see `ensure_heartbeat`).
         for ws in self.state.get_websockets() {
@@ -2075,12 +2664,15 @@ impl EngineIoSession {
         // MessageBoxClient) have an order-of-operations where a wake
         // can arrive with `connected=false` in the rehydrated attachment
         // even after BRC-103 has fully completed earlier in the session
-        // lifetime. Mathematically impossible to be authenticated without
-        // having CONNECTed first (BRC-103 messages ride on Socket.IO
-        // EVENT packets which are gated by this same check upstream),
-        // so accept either flag. Defensive but provably safe: a malicious
-        // unauthenticated client can never set `auth.is_authenticated()`
-        // to true.
+        // lifetime. The client always sent its Socket.IO CONNECT before any
+        // EVENT (the protocol orders them), so an Authenticated socket DID
+        // connect; the flag is what a wake lost. Two authenticating events
+        // reach the DO without passing this guard: `authMessage` (the
+        // handshake) and, since 0.3.22 (bsv-low #443 step 4), `sessionAttach`
+        // (dispatched before the CONNECT guard for exactly the wake case), so
+        // `auth.is_authenticated()` with `connected=false` is a legitimate
+        // state, not a contradiction. Accepting either flag stays safe: only
+        // a verified handshake or a hub-verified attach sets Authenticated.
         self.inner
             .borrow()
             .as_ref()
@@ -2243,7 +2835,9 @@ mod tests {
             .split("HeartbeatAction::Close => {")
             .nth(1)
             .expect("the alarm has a Close branch");
-        let body = &close_arm[..close_arm.find("HeartbeatAction::Ping").unwrap_or(close_arm.len())];
+        let body = &close_arm[..close_arm
+            .find("HeartbeatAction::Ping")
+            .unwrap_or(close_arm.len())];
         assert!(
             body.contains("self.teardown_ws_transport(&ws).await;"),
             "the ping-timeout Close branch must run teardown_ws_transport so peerLeft fires for the counterparty"
@@ -2277,20 +2871,40 @@ mod tests {
         assert_eq!(s.last_ping_at_ms, Some(1000));
         assert_eq!(s.registry_refreshed_at_ms, Some(500));
         let back = s.to_attachment();
-        assert_eq!(back.last_ping_at_ms, Some(1000), "a pong must not reset the last-ping stamp");
-        assert_eq!(back.registry_refreshed_at_ms, Some(500), "a pong must not reset the refresh stamp");
+        assert_eq!(
+            back.last_ping_at_ms,
+            Some(1000),
+            "a pong must not reset the last-ping stamp"
+        );
+        assert_eq!(
+            back.registry_refreshed_at_ms,
+            Some(500),
+            "a pong must not reset the refresh stamp"
+        );
         // A fresh session and a 0.3.7 attachment (the old counter field, no stamps) read None.
-        assert!(SessionState::new("x".into()).to_attachment().registry_refreshed_at_ms.is_none());
-        let old: WsAttachment = serde_json::from_str(r#"{"sid":"abc","pings_since_registry_refresh":5}"#).unwrap();
-        assert!(SessionState::from_attachment(&old).registry_refreshed_at_ms.is_none());
-        assert!(SessionState::from_attachment(&old).last_ping_at_ms.is_none());
+        assert!(SessionState::new("x".into())
+            .to_attachment()
+            .registry_refreshed_at_ms
+            .is_none());
+        let old: WsAttachment =
+            serde_json::from_str(r#"{"sid":"abc","pings_since_registry_refresh":5}"#).unwrap();
+        assert!(SessionState::from_attachment(&old)
+            .registry_refreshed_at_ms
+            .is_none());
+        assert!(SessionState::from_attachment(&old)
+            .last_ping_at_ms
+            .is_none());
     }
 
     /// 0.3.8 (gate): the fault knob is inert without the beta marker, however set.
     #[test]
     fn the_test_knob_is_inert_without_the_beta_marker() {
         assert_eq!(test_knob_n(None, Some("3")), 0);
-        assert_eq!(test_knob_n(Some("low-relay-beefs"), Some("3")), 0, "prod's bucket: inert");
+        assert_eq!(
+            test_knob_n(Some("low-relay-beefs"), Some("3")),
+            0,
+            "prod's bucket: inert"
+        );
         assert_eq!(test_knob_n(Some("low-relay-beefs-beta"), Some("3")), 3);
         assert_eq!(test_knob_n(Some("low-relay-beefs-beta"), Some("x")), 0);
         assert_eq!(test_knob_n(Some("low-relay-beefs-beta"), None), 0);
@@ -2301,11 +2915,20 @@ mod tests {
     #[test]
     fn the_registry_refresh_is_due_by_time_never_by_count() {
         let every = crate::broadcast_registry::REGISTRY_REFRESH_EVERY_MS;
-        assert!(registry_refresh_due(1_000_000, None), "an unknown last refresh is due");
-        assert!(!registry_refresh_due(1_000_000, Some(1_000_000 - every + 1)));
+        assert!(
+            registry_refresh_due(1_000_000, None),
+            "an unknown last refresh is due"
+        );
+        assert!(!registry_refresh_due(
+            1_000_000,
+            Some(1_000_000 - every + 1)
+        ));
         assert!(registry_refresh_due(1_000_000, Some(1_000_000 - every)));
         assert!(registry_refresh_due(1_000_000, Some(0)));
-        assert!(!registry_refresh_due(100, Some(1_000)), "a clock that went backwards is not due");
+        assert!(
+            !registry_refresh_due(100, Some(1_000)),
+            "a clock that went backwards is not due"
+        );
     }
 
     /// 0.3.8: the repair decision — LOW runs 12/13's lost-alarm class. A
@@ -2316,37 +2939,80 @@ mod tests {
     fn heartbeat_repair_covers_the_lost_alarm_class() {
         let now = 10_000_000u64;
         // pending, on time / slightly late → armed
-        assert_eq!(heartbeat_repair(now, Some(now - 1_000), Some(now + 24_000)), HeartbeatRepair::Armed);
+        assert_eq!(
+            heartbeat_repair(now, Some(now - 1_000), Some(now + 24_000)),
+            HeartbeatRepair::Armed
+        );
         // a ping 30 s old is OVERDUE (0.3.10) → ping now even with a barely-late row
-        assert_eq!(heartbeat_repair(now, Some(now - 30_000), Some(now - ALARM_LATE_GRACE_MS)), HeartbeatRepair::PingNow);
-        assert_eq!(heartbeat_repair(now, Some(now - 20_000), Some(now - ALARM_LATE_GRACE_MS)), HeartbeatRepair::Armed);
+        assert_eq!(
+            heartbeat_repair(now, Some(now - 30_000), Some(now - ALARM_LATE_GRACE_MS)),
+            HeartbeatRepair::PingNow
+        );
+        assert_eq!(
+            heartbeat_repair(now, Some(now - 20_000), Some(now - ALARM_LATE_GRACE_MS)),
+            HeartbeatRepair::Armed
+        );
         // an alarm long past due is lost as surely as none
-        assert_eq!(heartbeat_repair(now, Some(now - 60_000), Some(now - ALARM_LATE_GRACE_MS - 1)), HeartbeatRepair::PingNow);
-        assert_eq!(heartbeat_repair(now, Some(now - 5_000), Some(now - ALARM_LATE_GRACE_MS - 1)), HeartbeatRepair::ArmIn(PING_INTERVAL_MS - 5_000));
+        assert_eq!(
+            heartbeat_repair(now, Some(now - 60_000), Some(now - ALARM_LATE_GRACE_MS - 1)),
+            HeartbeatRepair::PingNow
+        );
+        assert_eq!(
+            heartbeat_repair(now, Some(now - 5_000), Some(now - ALARM_LATE_GRACE_MS - 1)),
+            HeartbeatRepair::ArmIn(PING_INTERVAL_MS - 5_000)
+        );
         // none pending, last ping 5 s ago → arm for the remaining 20 s
-        assert_eq!(heartbeat_repair(now, Some(now - 5_000), None), HeartbeatRepair::ArmIn(PING_INTERVAL_MS - 5_000));
+        assert_eq!(
+            heartbeat_repair(now, Some(now - 5_000), None),
+            HeartbeatRepair::ArmIn(PING_INTERVAL_MS - 5_000)
+        );
         // none pending, interval passed → ping now (the run-13 socket at +33 s)
-        assert_eq!(heartbeat_repair(now, Some(now - 33_000), None), HeartbeatRepair::PingNow);
-        assert_eq!(heartbeat_repair(now, Some(now - PING_INTERVAL_MS), None), HeartbeatRepair::PingNow);
+        assert_eq!(
+            heartbeat_repair(now, Some(now - 33_000), None),
+            HeartbeatRepair::PingNow
+        );
+        assert_eq!(
+            heartbeat_repair(now, Some(now - PING_INTERVAL_MS), None),
+            HeartbeatRepair::PingNow
+        );
         // no ping ever recorded (a 0.3.7 attachment) → ping now
         assert_eq!(heartbeat_repair(now, None, None), HeartbeatRepair::PingNow);
         // 0.3.11: a FRESH socket (no ping yet, first alarm pending) is armed, not repaired
-        assert_eq!(heartbeat_repair(now, None, Some(now + 24_000)), HeartbeatRepair::Armed);
+        assert_eq!(
+            heartbeat_repair(now, None, Some(now + 24_000)),
+            HeartbeatRepair::Armed
+        );
         // LOW run 14 (0.3.10): the platform's loss LEAVES THE ROW — the nudge
         // lands 33 s after the last ping with the alarm row 8 s past due →
         // ping now, whatever the row says (0.3.8's 10 s grace read Armed here)
-        assert_eq!(heartbeat_repair(now, Some(now - 33_000), Some(now - 8_000)), HeartbeatRepair::PingNow);
+        assert_eq!(
+            heartbeat_repair(now, Some(now - 33_000), Some(now - 8_000)),
+            HeartbeatRepair::PingNow
+        );
         // a future alarm with an overdue ping is a drifted chain → ping now
-        assert_eq!(heartbeat_repair(now, Some(now - 30_000), Some(now + 10_000)), HeartbeatRepair::PingNow);
+        assert_eq!(
+            heartbeat_repair(now, Some(now - 30_000), Some(now + 10_000)),
+            HeartbeatRepair::PingNow
+        );
         // just inside the overdue grace, row 1 s late → armed (the runtime's jitter)
-        assert_eq!(heartbeat_repair(now, Some(now - 26_000), Some(now - 1_000)), HeartbeatRepair::Armed);
+        assert_eq!(
+            heartbeat_repair(now, Some(now - 26_000), Some(now - 1_000)),
+            HeartbeatRepair::Armed
+        );
         // exactly at the overdue grace → ping now
-        assert_eq!(heartbeat_repair(now, Some(now - (PING_INTERVAL_MS + PING_OVERDUE_GRACE_MS)), Some(now - 1_000)), HeartbeatRepair::PingNow);
+        assert_eq!(
+            heartbeat_repair(
+                now,
+                Some(now - (PING_INTERVAL_MS + PING_OVERDUE_GRACE_MS)),
+                Some(now - 1_000)
+            ),
+            HeartbeatRepair::PingNow
+        );
         // the nudge (interval + 8 s) is past the overdue grace, before the 45 s cliff
-        assert!(8_000 > PING_OVERDUE_GRACE_MS);
+        const { assert!(8_000 > PING_OVERDUE_GRACE_MS) };
         // the repair's ping-now lands before the client's 45 s cliff when the
         // client nudges at interval + 8 s: 33 s < 45 s
-        assert!(PING_INTERVAL_MS + 8_000 < PING_INTERVAL_MS + PING_TIMEOUT_MS);
+        const { assert!(PING_INTERVAL_MS + 8_000 < PING_INTERVAL_MS + PING_TIMEOUT_MS) };
     }
 
     /// 0.3.8 source pins: the alarm arms FIRST (before the socket loop and
@@ -2354,21 +3020,73 @@ mod tests {
     #[test]
     fn the_alarm_arms_first_and_every_inbound_frame_repairs_the_heartbeat() {
         let src = include_str!("session.rs");
-        let a = src.find("async fn alarm(&self) -> Result<Response> {").expect("the alarm handler");
-        let body = &src[a..a + src[a..].find("Response::ok(\"heartbeat\")").expect("the alarm's end")];
-        let first_arm = body.find("self.arm_heartbeat_alarm().await;").expect("an arm in the alarm");
+        let a = src
+            .find("async fn alarm(&self) -> Result<Response> {")
+            .expect("the alarm handler");
+        let body = &src[a..a + src[a..]
+            .find("Response::ok(\"heartbeat\")")
+            .expect("the alarm's end")];
+        let first_arm = body
+            .find("self.arm_heartbeat_alarm().await;")
+            .expect("an arm in the alarm");
         let loop_start = body.find("for ws in sockets {").expect("the socket loop");
-        assert!(first_arm < loop_start, "the alarm must arm BEFORE the socket loop (and its awaits)");
-        assert!(body.matches("self.arm_heartbeat_alarm().await;").count() >= 2, "and re-arm after the work");
-        let m = src.find("async fn websocket_message(").expect("the ws message handler");
-        let mbody = &src[m..m + src[m..].find("async fn websocket_close(").expect("the next handler")];
-        let repair = mbody.find("self.ensure_heartbeat(&ws).await;").expect("the repair call");
-        let dispatch = mbody.find("self.handle_engineio_packet(pkt, Some(&ws)).await;").expect("the dispatch");
+        assert!(
+            first_arm < loop_start,
+            "the alarm must arm BEFORE the socket loop (and its awaits)"
+        );
+        assert!(
+            body.matches("self.arm_heartbeat_alarm().await;").count() >= 2,
+            "and re-arm after the work"
+        );
+        let m = src
+            .find("async fn websocket_message(")
+            .expect("the ws message handler");
+        let mbody = &src[m..m + src[m..]
+            .find("async fn websocket_close(")
+            .expect("the next handler")];
+        let repair = mbody
+            .find("self.ensure_heartbeat(&ws).await;")
+            .expect("the repair call");
+        let dispatch = mbody
+            .find("self.handle_engineio_packet(pkt, Some(&ws)).await;")
+            .expect("the dispatch");
         assert!(repair < dispatch, "repair BEFORE dispatch");
         // the broadcast delivery path repairs too
-        let b = src.find("async fn handle_socketio_broadcast(").expect("the broadcast handler");
+        let b = src
+            .find("async fn handle_socketio_broadcast(")
+            .expect("the broadcast handler");
         let bbody = &src[b..b + src[b..].find("\n    }\n").expect("its end")];
-        assert!(bbody.contains("self.ensure_heartbeat(&ws).await;"), "a delivery repairs the heartbeat");
+        assert!(
+            bbody.contains("self.ensure_heartbeat(&ws).await;"),
+            "a delivery repairs the heartbeat"
+        );
+        // 0.3.26 (bsv-low #495): a fetch repairs too (the polling transport and
+        // the Worker→DO paths were the one wake that did not)
+        let f = src
+            .find("async fn fetch(&self, mut req: Request) -> Result<Response> {")
+            .expect("the fetch handler");
+        let fbody = &src[f..f
+            + src[f + 10..]
+                .find("\n    async fn ")
+                .expect("the next method")
+            + 10];
+        assert!(
+            fbody.contains("self.ensure_heartbeat(&ws).await;"),
+            "a fetch repairs the heartbeat on every attached socket"
+        );
+        // and the idle disarm re-reads the census after its delete
+        let d = src
+            .find("async fn disarm_heartbeat_if_idle(&self) {")
+            .expect("the idle disarm");
+        let dbody = &src[d..d + src[d + 10..].find("\n    fn ").expect("the next fn") + 10];
+        let del = dbody.find("delete_alarm()").expect("the delete");
+        let rearm = dbody
+            .find("self.arm_heartbeat_alarm().await;")
+            .expect("the re-arm after the delete");
+        assert!(
+            del < rearm,
+            "the census is re-read AFTER the delete and a live socket re-arms"
+        );
     }
 
     /// LOW run 11 (2026-09-03): the alarm's refresh gate reads the SESSION's
@@ -2381,24 +3099,51 @@ mod tests {
         let mut rooms: Vec<String> = Vec::new();
         let room = serde_json::json!("02aa-broadcast-low-tip");
         // A join the hub refused (wrong owner) records nothing.
-        assert!(!record_room_membership(&mut rooms, "joinRoom", &room, false));
+        assert!(!record_room_membership(
+            &mut rooms, "joinRoom", &room, false
+        ));
         assert!(rooms.is_empty());
         // A confirmed join records once; a repeat is a no-op.
         assert!(record_room_membership(&mut rooms, "joinRoom", &room, true));
         assert!(!record_room_membership(&mut rooms, "joinRoom", &room, true));
         assert_eq!(rooms, vec!["02aa-broadcast-low-tip".to_string()]);
         // Non-string data / other events never touch the list.
-        assert!(!record_room_membership(&mut rooms, "joinRoom", &serde_json::json!(7), true));
-        assert!(!record_room_membership(&mut rooms, "sendMessage", &room, true));
+        assert!(!record_room_membership(
+            &mut rooms,
+            "joinRoom",
+            &serde_json::json!(7),
+            true
+        ));
+        assert!(!record_room_membership(
+            &mut rooms,
+            "sendMessage",
+            &room,
+            true
+        ));
         // The recorded room is exactly what the alarm's gate looks for…
-        assert!(rooms.iter().any(|r| r.contains(crate::message_hub::BROADCAST_BOX_MARKER)));
+        assert!(rooms
+            .iter()
+            .any(|r| r.contains(crate::message_hub::BROADCAST_BOX_MARKER)));
         // …and it survives the attachment round trip.
         let mut s = SessionState::new("abc".into());
         s.joined_rooms = rooms.clone();
-        assert_eq!(SessionState::from_attachment(&s.to_attachment()).joined_rooms, rooms);
+        assert_eq!(
+            SessionState::from_attachment(&s.to_attachment()).joined_rooms,
+            rooms
+        );
         // Leaving removes it; leaving twice is a no-op.
-        assert!(record_room_membership(&mut rooms, "leaveRoom", &room, false));
-        assert!(!record_room_membership(&mut rooms, "leaveRoom", &room, false));
+        assert!(record_room_membership(
+            &mut rooms,
+            "leaveRoom",
+            &room,
+            false
+        ));
+        assert!(!record_room_membership(
+            &mut rooms,
+            "leaveRoom",
+            &room,
+            false
+        ));
         assert!(rooms.is_empty());
     }
 
@@ -2410,17 +3155,40 @@ mod tests {
     /// teardown pin above.
     #[test]
     fn the_ping_arm_persists_the_attachment_before_the_refresh_await() {
-        let src = include_str!("session.rs");
-        let start = src.find("HeartbeatAction::Ping => {").expect("the Ping arm");
-        let end = src[start..].find("Err(e) => {").expect("the Ping arm's send-failed branch") + start;
+        // Whitespace-stripped before matching: rustfmt reflowed the `.await`
+        // onto its own line once (0.3.20's fmt residue) and this pin read
+        // RED for a formatter, not a defect.
+        let src = strip_ws(include_str!("session.rs"));
+        let start = src.find("HeartbeatAction::Ping=>{").expect("the Ping arm");
+        let end = src[start..]
+            .find("Err(e)=>{")
+            .expect("the Ping arm's send-failed branch")
+            + start;
         let arm = &src[start..end];
-        let persist = arm.find("ws.serialize_attachment(&att)").expect("the arm persists the attachment");
-        let refresh = arm.find("register_identity(&self.env, &identity).await").expect("the arm refreshes the registry");
-        assert!(persist < refresh, "persist BEFORE the refresh await — nothing may be written to the attachment after it");
-        assert_eq!(arm.matches("ws.serialize_attachment(&att)").count(), 1, "exactly one persist in the arm");
+        let persist = arm
+            .find("ws.serialize_attachment(&att)")
+            .expect("the arm persists the attachment");
+        let refresh = arm
+            .find("register_identity(&self.env,&identity).await")
+            .expect("the arm refreshes the registry");
+        assert!(
+            persist < refresh,
+            "persist BEFORE the refresh await — nothing may be written to the attachment after it"
+        );
+        assert_eq!(
+            arm.matches("ws.serialize_attachment(&att)").count(),
+            1,
+            "exactly one persist in the arm"
+        );
         let after = &arm[refresh..];
-        assert!(!after.contains("serialize_attachment"), "no attachment write after the await");
-        assert!(!after.contains("borrow_mut()"), "no in-memory write after the await either");
+        assert!(
+            !after.contains("serialize_attachment"),
+            "no attachment write after the await"
+        );
+        assert!(
+            !after.contains("borrow_mut()"),
+            "no in-memory write after the await either"
+        );
     }
 
     /// The routing block must record membership AFTER the hub answered (its
@@ -2428,15 +3196,23 @@ mod tests {
     /// the alarm's teardown pin above.
     #[test]
     fn the_event_routing_records_room_membership_and_persists_it() {
-        let src = include_str!("session.rs");
-        let start = src.find("// -- 2. Phase C event routing --").expect("the routing block");
-        let end = src[start..].find("AuthOutcome::Quiet").expect("the routing block ends") + start;
+        // Whitespace-stripped (see the Ping pin above).
+        let src = strip_ws(include_str!("session.rs"));
+        let start = src
+            .find("//--2.PhaseCeventrouting--")
+            .expect("the routing block");
+        let end = src[start..]
+            .find("AuthOutcome::Quiet")
+            .expect("the routing block ends")
+            + start;
         let block = &src[start..end];
         assert!(block.contains("forward_event_to_message_hub("));
-        assert!(block.contains("record_room_membership(&mut s.joined_rooms, &name, &data, hub_confirmed_join)"));
+        assert!(block
+            .contains("record_room_membership(&muts.joined_rooms,&name,&data,hub_confirmed_join"));
         assert!(block.contains("self.persist_to_ws_attachment();"));
         assert!(
-            block.find("forward_event_to_message_hub(").unwrap() < block.find("record_room_membership(").unwrap(),
+            block.find("forward_event_to_message_hub(").unwrap()
+                < block.find("record_room_membership(").unwrap(),
             "membership is recorded from the hub's answer, never ahead of it"
         );
     }
@@ -2491,5 +3267,417 @@ mod tests {
         let raw2 = r#"{"roomId":"r","sender":"s","messageId":"m","body":{},"event":"peerLeft"}"#;
         let b2: BroadcastBody = serde_json::from_str(raw2).unwrap();
         assert_eq!(b2.event.as_deref(), Some("peerLeft"));
+    }
+    /// Source pins compare the file with every whitespace removed, so a
+    /// formatter can never make one read RED (or GREEN) by itself.
+    fn strip_ws(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    // ---- bsv-low W-B (D10): the session lane's host wiring ----------------
+
+    /// A `sessionMessage` is a post-handshake frame: it sits BEHIND the
+    /// connected gate (an unauthenticated socket cannot reach the lane) and
+    /// AHEAD of the raw-event drop (it is the one non-authMessage EVENT the
+    /// relay answers), and the arm returns after dispatch.
+    #[test]
+    fn the_session_message_arm_sits_behind_the_connected_gate_and_ahead_of_the_drop() {
+        let src = strip_ws(include_str!("session.rs"));
+        let start = src
+            .find("SocketIoPacket::Event{nsp,ack_id,data}=>{")
+            .expect("the EVENT arm");
+        let end = src[start..]
+            .find("SocketIoPacket::Ack{..}=>{")
+            .expect("the EVENT arm ends")
+            + start;
+        let arm = &src[start..end];
+        let gate = arm
+            .find("if!self.is_connected(){")
+            .expect("the connected gate");
+        let lane = arm
+            .find("ifname==crate::session_lane::INBOUND_EVENT{")
+            .expect("the session arm");
+        let drop = arm
+            .find("rawEVENT'{name}'onsocket.iosurface")
+            .expect("the raw-event drop");
+        assert!(gate < lane, "the lane is behind the connected gate");
+        assert!(lane < drop, "the lane is ahead of the drop");
+        let lane_arm = &arm[lane..drop];
+        assert!(
+            lane_arm.contains("self.dispatch_session_message(&arg,&nsp,ws_for_response).await;")
+        );
+        assert!(
+            lane_arm.contains("return;"),
+            "the arm returns after dispatch"
+        );
+    }
+
+    /// The lane is minted exactly where the handshake completes (the
+    /// `authenticated` fast path) and the offer rides `authenticationSuccess`
+    /// as ONE extra field a reference client ignores; the mint precedes the
+    /// emit (the offer is in the data that is signed).
+    #[test]
+    fn the_lane_is_minted_at_the_handshake_end_and_offered_in_authentication_success() {
+        let src = strip_ws(include_str!("session.rs"));
+        let start = src
+            .find("ifname==\"authenticated\"{")
+            .expect("the fast path");
+        let end = src[start..]
+            .find("TRACE_PHDauth.fastpath_emitted")
+            .expect("the fast path's log line")
+            + start;
+        let block = &src[start..end];
+        let ask = block
+            .find("letlane_ask=data.get(\"laneAsk\")")
+            .expect("the explicit ask is read off the client's payload");
+        let mint = block
+            .find("ifletSome(ask)=lane_ask{ifletSome(offer)=self.mint_session_lane(&snap_state,&identity_key,&ask)")
+            .expect("the mint, only under an ask");
+        assert!(ask < mint);
+        let offered = block
+            .find("data[\"session\"]=json!(offer);")
+            .expect("the offer in the data");
+        let emit = block
+            .find("self.emit_signed_general(&ack,&snap_state,&wallet,nsp,ws_for_response);")
+            .expect("the emit");
+        assert!(
+            mint < offered && offered < emit,
+            "mint, offer, then the signed emit"
+        );
+        assert!(
+            block.contains("\"status\":\"success\""),
+            "the reference's own field stays"
+        );
+    }
+
+    /// A hub delivery rides the lane when the lane is active; the signed
+    /// General is the FALLBACK inside the lane's refusal, never a second copy.
+    #[test]
+    fn a_delivery_rides_the_lane_when_active_else_the_signed_general_once() {
+        let src = strip_ws(include_str!("session.rs"));
+        let start = src
+            .find("asyncfnhandle_socketio_broadcast(")
+            .expect("the broadcast handler");
+        let end = src[start..]
+            .find("self.ensure_heartbeat(&ws).await;")
+            .expect("the heartbeat repair after the delivery")
+            + start;
+        let body = &src[start..end];
+        assert!(body.contains(
+            "if!self.emit_on_session_lane(&ev,\"/\",None){self.emit_signed_general(&ev,&snap_state,&wallet,\"/\",None);}"
+        ));
+        assert_eq!(
+            body.matches("self.emit_signed_general(&ev,").count(),
+            1,
+            "the General is emitted exactly once, inside the fallback"
+        );
+    }
+
+    /// `sessionEvent` goes out only on a lane the client has SPOKEN on
+    /// (`active`) and that is still live; anything else falls back to the
+    /// reference lane (a reference client never reads a `sessionEvent`).
+    #[test]
+    fn a_lane_that_never_spoke_or_has_expired_never_receives_a_session_event() {
+        let src = strip_ws(include_str!("session.rs"));
+        let body = {
+            let start = src.find("fnemit_on_session_lane(").expect("the lane emit");
+            let end = src[start..].find("fnemit_auth_message(").expect("its end") + start;
+            &src[start..end]
+        };
+        let guard = body
+            .find("if!lane.active||!lane.is_live(now){returnfalse;}")
+            .expect("the active + live guard");
+        let seal = body.find("lane.seal_outbound(").expect("the seal");
+        assert!(guard < seal, "guarded before sealing");
+        let persist = body
+            .find("self.persist_to_ws_attachment();")
+            .expect("the persist");
+        let send = body.find("self.send_or_enqueue(").expect("the send");
+        assert!(
+            seal < persist && persist < send,
+            "seal, persist the moved counter, then send"
+        );
+        assert!(body.contains("crate::session_lane::OUTBOUND_EVENT"));
+    }
+
+    /// A verified frame's counter is PERSISTED before the hub await (a wake
+    /// mid-route can never accept the same counter again); a refusal is
+    /// said on the reference lane as `sessionRefused` and routes nothing.
+    #[test]
+    fn a_verified_frame_persists_before_routing_and_a_refusal_rides_the_reference_lane() {
+        let src = strip_ws(include_str!("session.rs"));
+        let body = {
+            let start = src
+                .find("asyncfndispatch_session_message(")
+                .expect("the dispatch");
+            let end = src[start..]
+                .find("fnemit_on_reference_lane(")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        let err_arm = body.find("Err(reason)=>{").expect("the refusal arm");
+        let ok_arm = body
+            .find("Ok((event_name,data_text))=>{")
+            .expect("the verified arm");
+        let refusal = &body[err_arm..ok_arm];
+        assert!(refusal.contains("crate::session_lane::REFUSED_EVENT"));
+        assert!(
+            refusal.contains("self.emit_on_reference_lane(&ev,&snap_state,nsp,ws_for_response);")
+        );
+        assert!(
+            !refusal.contains("forward_event_to_message_hub("),
+            "a refusal routes nothing"
+        );
+        let verified = &body[ok_arm..];
+        let persist = verified
+            .find("self.persist_to_ws_attachment();")
+            .expect("the persist");
+        let route = verified
+            .find("self.forward_event_to_message_hub(")
+            .expect("the route");
+        assert!(
+            persist < route,
+            "the moved counter is persisted BEFORE the hub await"
+        );
+        assert!(
+            verified.contains("record_room_membership("),
+            "the membership mirror, like the General path"
+        );
+        assert!(verified.contains("self.emit_on_session_lane(&ev,nsp,ws_for_response)"));
+    }
+
+    /// The lane dies with its socket: BOTH lifecycle ends (the DISCONNECT
+    /// packet and the transport teardown) reach `unregister_with_message_hub`,
+    /// which takes the lane out of the state and sends its id so the hub
+    /// revokes the HTTP mirror in the same call. A session id is never
+    /// accepted on a later socket (a reconnect is a new handshake).
+    #[test]
+    fn the_lane_dies_with_its_socket_and_its_hub_mirror_is_revoked() {
+        let src = strip_ws(include_str!("session.rs"));
+        let teardown = {
+            let start = src.find("asyncfnteardown_ws_transport(").expect("teardown");
+            let end = src[start..]
+                .find("asyncfnunregister_with_message_hub(")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        assert!(teardown.contains("state.closed=true;"));
+        assert!(teardown.contains("self.unregister_with_message_hub().await;"));
+        let disconnect = {
+            let start = src
+                .find("SocketIoPacket::Disconnect{..}=>{")
+                .expect("the DISCONNECT arm");
+            let end = src[start..]
+                .find("SocketIoPacket::Event{")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        assert!(disconnect.contains("self.unregister_with_message_hub().await;"));
+        let unregister = {
+            let start = src
+                .find("asyncfnunregister_with_message_hub(")
+                .expect("unregister");
+            let end = src[start..]
+                .find("asyncfnpost_registration(")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        let taken = unregister
+            .find("letlane_id=s.lane.take().map(|lane|lane.id);")
+            .expect("the lane is taken");
+        let sent = unregister
+            .find("self.post_registration(&identity_key,&sid,/*register=*/false,lane_id.as_deref()")
+            .expect("its id rides the unregister");
+        assert!(taken < sent);
+        let post = {
+            let start = src
+                .find("asyncfnpost_registration(")
+                .expect("post_registration");
+            let end = src[start..]
+                .find("stub.fetch_with_request(req).await")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        assert!(
+            post.contains("payload[\"sessionId\"]=json!(id);"),
+            "the hub revokes by id"
+        );
+    }
+
+    /// Every forward to the hub carries the lane's mirror once the client
+    /// has spoken on it (the HTTP lane verifies there), and never before
+    /// (a reference client's lane is offered, not used).
+    #[test]
+    fn a_forward_carries_the_mirror_only_for_an_active_lane() {
+        let src = strip_ws(include_str!("session.rs"));
+        let body = {
+            let start = src
+                .find("asyncfnforward_event_to_message_hub(")
+                .expect("the forward");
+            let end = src[start..]
+                .find("run_forward_with_retry(")
+                .expect("its end")
+                + start;
+            &src[start..end]
+        };
+        let filtered = body
+            .find(
+                ".and_then(|s|s.lane.as_ref()).filter(|lane|lane.active).map(MirrorUpdate::from);",
+            )
+            .expect("the mirror is taken from an ACTIVE lane only");
+        let carried = body
+            .find("\"session\":session,")
+            .expect("the payload carries it");
+        assert!(filtered < carried);
+    }
+
+    /// The attachment carries the lane through hibernation byte-for-byte,
+    /// stays under the platform's 2 KB cap with a full room list, and an
+    /// attachment written before the lane existed still reads (no lane).
+    #[test]
+    fn the_attachment_with_a_lane_and_rooms_stays_under_the_cap_and_round_trips() {
+        let identity = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut s = SessionState::new("K7bqvE3nJm2xPz9L".to_string());
+        s.transport = Transport::WebSocket;
+        s.connected = true;
+        s.auth = SessionAuthState::Authenticated {
+            server_session_nonce: "c2VydmVyLW5vbmNlLWJhc2U2NC1zZXJ2ZXItbm9uY2U=".into(),
+            peer_nonce: "Y2xpZW50LW5vbmNlLWJhc2U2NC1jbGllbnQtbm9uY2U=".into(),
+            peer_identity_key: identity.into(),
+        };
+        for room in [
+            "low_events",
+            "low_game_0123456789abcdef0123456789abcdef",
+            "low_lobby",
+            "broadcast-low_pots_beta",
+        ] {
+            s.joined_rooms.push(format!("{identity}-{room}"));
+        }
+        s.authenticated_emitted = true;
+        s.awaiting_pong_since_ms = Some(1_757_000_000_000);
+        s.last_ping_at_ms = Some(1_757_000_000_000);
+        s.registry_refreshed_at_ms = Some(1_757_000_000_000);
+        let random = [0x5au8; 64];
+        let (mut lane, _offer) = SessionLane::mint(
+            identity,
+            "Y2xpZW50LW5vbmNlLWJhc2U2NC1jbGllbnQtbm9uY2U=",
+            "c2VydmVyLW5vbmNlLWJhc2U2NC1zZXJ2ZXItbm9uY2U=",
+            &random,
+            1_757_000_000_000,
+            "a1b2c3d4e5f60718",
+        );
+        lane.last_in = 1_000_000;
+        lane.next_out = 1_000_000;
+        lane.active = true;
+        s.lane = Some(lane.clone());
+
+        let att = s.to_attachment();
+        let json = serde_json::to_string(&att).unwrap();
+        assert!(
+            json.len() < 2048,
+            "the attachment must stay under the 2 KB cap; it is {} bytes",
+            json.len()
+        );
+        let back: WsAttachment = serde_json::from_str(&json).unwrap();
+        let s2 = SessionState::from_attachment(&back);
+        assert_eq!(
+            s2.lane,
+            Some(lane),
+            "the lane rides the attachment byte-for-byte"
+        );
+        assert_eq!(s2.joined_rooms, s.joined_rooms);
+
+        // An attachment from before the lane existed (0.3.20 and earlier).
+        let mut old: serde_json::Value = serde_json::from_str(&json).unwrap();
+        old.as_object_mut().unwrap().remove("lane");
+        let old_att: WsAttachment = serde_json::from_value(old).unwrap();
+        assert!(SessionState::from_attachment(&old_att).lane.is_none());
+    }
+}
+
+#[cfg(test)]
+mod attach_structure_tests {
+    /// bsv-low #443 step 4: the socket attach — dispatched after CONNECT beside
+    /// the lane events; the hub is asked BEFORE the socket is Authenticated; the
+    /// identity is the HUB's answer (a frame naming another is refused); the ack
+    /// is sealed under the hub key and never carries the key; the socket lane is
+    /// minted by the SAME `mint_session_lane` as the handshake path.
+    #[test]
+    fn the_attach_asks_the_hub_first_and_mints_for_the_hub_s_identity_without_leaking_the_key() {
+        let src = include_str!("session.rs");
+        let handler = &src[src.find("async fn dispatch_session_attach(").unwrap()..];
+        let handler = &handler[..handler
+            .find("/// bsv-low W-B (D10): a `sessionMessage` from the client.")
+            .unwrap()];
+        let verify = handler
+            .find("https://do.local/internal/session-verify")
+            .expect("the hub's verify");
+        let gate = handler
+            .find("Some(s) if s.attach_attempted => Some(\"attach-exhausted\")")
+            .expect("one attach per socket (L1)");
+        let bind = handler
+            .find("identity != frame.identity")
+            .expect("the identity binding");
+        let mint = handler
+            .find("self.mint_lane_pure(&state, &identity, &frame.nonce)")
+            .expect("the shared pure mint");
+        let cas = handler
+            .find("Some(s) if s.auth.is_authenticated() => Some(false),")
+            .expect("the compare-and-set (M2)");
+        let authed = handler
+            .find("s.auth = state.clone();")
+            .expect("Authenticated set");
+        let lane_set = handler.find("s.lane = Some(lane);").expect("the lane set");
+        assert!(
+            gate < verify
+                && verify < bind
+                && bind < mint
+                && mint < cas
+                && cas < authed
+                && authed < lane_set,
+            "gate → hub → bind → pure mint → compare-and-set → authenticated + lane in one borrow"
+        );
+        assert!(
+            handler.contains("crate::session_lane::ATTACH_HUB_TIMEOUT_MS"),
+            "the hub ask is bounded below the client's attach wait (M1)"
+        );
+        assert!(
+            !handler.contains("FORWARD_OP_TIMEOUT_MS"),
+            "never the forward's 3 s bound"
+        );
+        let src_all = include_str!("session.rs");
+        let src_code = &src_all[..src_all.find("#[cfg(test)]").unwrap()];
+        assert_eq!(
+            src_code.matches("self.mint_lane_pure(").count(),
+            2,
+            "the handshake's mint_session_lane and the attach share the ONE pure mint"
+        );
+        assert!(
+            handler.contains("attach_ack_mac(&hub_key, &d)"),
+            "the ack is sealed under the hub key"
+        );
+        let ack = &handler[handler.find("ATTACHED_EVENT.into()").unwrap()..];
+        assert!(
+            !ack[..ack.find("send_or_enqueue").unwrap()].contains("hub_key"),
+            "the key never rides the ack"
+        );
+        let dispatch = &src[src
+            .find("if name == crate::session_lane::ATTACH_EVENT {")
+            .unwrap()..];
+        let dispatch_pos = src
+            .find("if name == crate::session_lane::ATTACH_EVENT {")
+            .unwrap();
+        let auth_message = src.find("if name == \"authMessage\" {").unwrap();
+        let connected_guard = src.find("EVENT '{name}' before CONNECT").unwrap();
+        assert!(
+            auth_message < dispatch_pos && dispatch_pos < connected_guard,
+            "dispatched after the authMessage branch and BEFORE the CONNECT guard (a wake rehydrates connected=false; an attaching socket is not yet authenticated)"
+        );
+        assert!(dispatch.contains("dispatch_session_attach(&arg, &nsp, ws_for_response)"));
     }
 }
