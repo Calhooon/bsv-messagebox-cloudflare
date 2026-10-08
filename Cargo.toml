@@ -34,6 +34,9 @@ hmac = "0.12"
 # BSV
 bsv-middleware-cloudflare = "0.3.3"
 bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
+# The shared payment check (P0-3): the delivery output compared with the fee.
+# The path is the lane's worktree; replace it with the published 0.2.1.
+bsv-middleware-rs = { version = "0.2.1", path = "../payment-amount-check-middleware-rs" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
