@@ -269,8 +269,20 @@ const SPOOL_PART_BYTES: usize = 8 * 1024 * 1024;
 
 #[async_trait::async_trait(?Send)]
 impl PaymentStore for R2Store<'_> {
-    async fn spool(&self, key: &str, chunks: &mut dyn Chunks, size: u64) -> Result<Stamp, String> {
+    async fn spool(
+        &self,
+        key: &str,
+        chunks: &mut dyn Chunks,
+        size: u64,
+        reader: &str,
+    ) -> Result<Stamp, String> {
         let bucket = self.bucket()?;
+        let metadata = || {
+            std::collections::HashMap::from([(
+                crate::handoff::READER_METADATA.to_string(),
+                reader.to_string(),
+            )])
+        };
         let stamp = |object: worker::Object| Stamp {
             size: object.size(),
             etag: object.etag(),
@@ -282,6 +294,7 @@ impl PaymentStore for R2Store<'_> {
             }
             return bucket
                 .put(key, part)
+                .custom_metadata(metadata())
                 .execute()
                 .await
                 .map_err(|e| format!("R2 put: {}", e))?
@@ -290,6 +303,7 @@ impl PaymentStore for R2Store<'_> {
         }
         let upload = bucket
             .create_multipart_upload(key)
+            .custom_metadata(metadata())
             .execute()
             .await
             .map_err(|e| format!("R2 multipart: {}", e))?;
@@ -324,6 +338,31 @@ impl PaymentStore for R2Store<'_> {
             .await
             .map(stamp)
             .map_err(|e| format!("R2 multipart complete: {}", e))
+    }
+
+    async fn reader(&self, key: &str) -> Result<Option<String>, String> {
+        let object = self
+            .bucket()?
+            .head(key)
+            .await
+            .map_err(|e| format!("R2 head: {}", e))?;
+        match object {
+            None => Ok(None),
+            Some(object) => object
+                .custom_metadata()
+                .map(|mut metadata| metadata.remove(crate::handoff::READER_METADATA))
+                .map_err(|e| format!("R2 metadata: {}", e)),
+        }
+    }
+
+    /// `R2_BUCKET_NAME`, the name the presigned URLs already sign: it is the
+    /// `bucket_name` of the `BEEF_BLOBS` binding (`wrangler.toml`).
+    fn bucket_name(&self) -> Option<String> {
+        self.env
+            .var("R2_BUCKET_NAME")
+            .ok()
+            .map(|name| name.to_string())
+            .filter(|name| !name.is_empty())
     }
 }
 

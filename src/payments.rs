@@ -169,6 +169,11 @@ pub async fn process_payment(
         .map_err(|e| err(503, "ERR_D1_UNAVAILABLE", &format!("D1 binding: {}", e)))?;
     let ledger = crate::storage::D1Ledger { db: &db };
     let rows = crate::storage::D1Rows { db: &db };
+    // The reader every object of the payment names: the relay, the recipient
+    // of the delivery fee (`handoff::READER_METADATA`).
+    let reader = server_private_key(env)
+        .map(|key| key.public_key().to_hex())
+        .map_err(|e| err(500, "ERR_INTERNAL", &e))?;
     let spool_key = crate::beef_upload::build_upload_key(
         sender_key,
         &uuid::Uuid::new_v4().simple().to_string(),
@@ -187,6 +192,7 @@ pub async fn process_payment(
             server_output: judged.as_ref().map(|(output, _)| *output),
             txid: judged.as_ref().map(|(_, judged)| judged.txid.as_str()),
             rows: !fee_recipients.is_empty(),
+            reader: &reader,
             now: worker::Date::now().as_millis() / 1000,
         },
     )
@@ -920,14 +926,16 @@ pub struct WalletInfra<'a> {
 
 #[async_trait::async_trait(?Send)]
 impl FeeWallet for WalletInfra<'_> {
-    async fn internalize(&self, tx: &Value, args: &Value) -> Result<bool, String> {
-        internalize_server_fee(tx, args, self.env).await
+    async fn internalize(&self, args: &Value) -> Result<bool, String> {
+        internalize_server_fee(args, self.env).await
     }
 }
 
 /// Internalize the server delivery fee via WorkerStorageClient → wallet-infra.
-/// `fee` is `handoff::fee_args`: the output, the description, the labels.
-async fn internalize_server_fee(tx: &Value, fee: &Value, env: &Env) -> Result<bool, String> {
+/// `args` is the whole argument, `tx` or `beefAtRest` beside the output, the
+/// description and the labels (`handoff::internalize_inline`,
+/// `handoff::internalize_at_rest`).
+async fn internalize_server_fee(args: &Value, env: &Env) -> Result<bool, String> {
     let private_key = server_private_key(env)?;
     let storage_url = env
         .var("WALLET_STORAGE_URL")
@@ -944,20 +952,12 @@ async fn internalize_server_fee(tx: &Value, fee: &Value, env: &Env) -> Result<bo
         .await
         .map_err(|e| format!("Storage handshake failed: {}", e))?;
 
-    // Build internalization args
-    let args = json!({
-        "tx": tx,
-        "outputs": fee.get("outputs").unwrap_or(&json!([])),
-        "description": fee.get("description").unwrap_or(&json!("MessageBox delivery payment")),
-        "labels": fee.get("labels").unwrap_or(&json!([])),
-        "seekPermission": false
-    });
     let auth = json!({
         "identityKey": identity_key
     });
 
     let result = client
-        .internalize_action(auth, args)
+        .internalize_action(auth, args.clone())
         .await
         .map_err(|e| format!("Internalize failed: {}", e))?;
 

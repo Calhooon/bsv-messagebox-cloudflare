@@ -32,7 +32,7 @@ use rust_message_box::handoff::{
     ack_delete_sql, ack_update_sql, drain_fees, forget_unnamed, hand_off, reclaim_released,
     stored_body, DeferredFee, Drained, Fee, FeeLedger, FeeWallet, HandedOff, Paid, PaymentStore,
     Reclaimed, RowRefs, Seams, FORGET_RELEASED_SQL, INSERT_MESSAGE_SQL, LIST_MESSAGES_SQL,
-    RELEASED_KEYS_SQL, ROW_NAMES_KEY_SQL,
+    READER_METADATA, RELEASED_KEYS_SQL, ROW_NAMES_KEY_SQL,
 };
 use rust_message_box::payments::{judge_delivery_at_rest, judge_delivery_output, Judged};
 use serde_json::{json, Value};
@@ -58,6 +58,8 @@ struct Blobs {
     states: RefCell<HashMap<String, Vec<u8>>>,
     largest_chunk: Cell<usize>,
     spools: Cell<usize>,
+    /// Each object's custom metadata, as R2 keeps it beside the bytes.
+    metadata: RefCell<HashMap<String, HashMap<String, String>>>,
 }
 
 struct Bytes {
@@ -114,7 +116,13 @@ impl BeefStore for Blobs {
 
 #[async_trait::async_trait(?Send)]
 impl PaymentStore for Blobs {
-    async fn spool(&self, key: &str, chunks: &mut dyn Chunks, size: u64) -> Result<Stamp, String> {
+    async fn spool(
+        &self,
+        key: &str,
+        chunks: &mut dyn Chunks,
+        size: u64,
+        reader: &str,
+    ) -> Result<Stamp, String> {
         let mut bytes = Vec::new();
         while let Some(chunk) = chunks.next().await? {
             self.largest_chunk
@@ -127,27 +135,46 @@ impl PaymentStore for Blobs {
         self.objects
             .borrow_mut()
             .insert(key.to_string(), (bytes, etag.clone()));
+        self.metadata.borrow_mut().insert(
+            key.to_string(),
+            HashMap::from([(READER_METADATA.to_string(), reader.to_string())]),
+        );
         Ok(Stamp { size, etag })
+    }
+
+    async fn reader(&self, key: &str) -> Result<Option<String>, String> {
+        let metadata = self.metadata.borrow();
+        Ok(metadata
+            .get(key)
+            .and_then(|meta| meta.get(READER_METADATA))
+            .cloned())
+    }
+
+    fn bucket_name(&self) -> Option<String> {
+        Some(BUCKET.to_string())
     }
 }
 
 /// wallet-infra: accepts unless it is `down`, and keeps the bytes of every
-/// `tx` it is handed and the arguments beside them.
+/// `tx` it is handed, and each `internalizeAction` argument whole as the
+/// relay's client sends it.
 #[derive(Default)]
 struct Wallet {
     handed: RefCell<Vec<usize>>,
-    asked: RefCell<Vec<Value>>,
+    arguments: RefCell<Vec<Value>>,
     down: Cell<bool>,
 }
 
 #[async_trait::async_trait(?Send)]
 impl FeeWallet for Wallet {
-    async fn internalize(&self, tx: &Value, args: &Value) -> Result<bool, String> {
+    async fn internalize(&self, args: &Value) -> Result<bool, String> {
         if self.down.get() {
             return Err("wallet-infra answered 502".to_string());
         }
-        self.handed.borrow_mut().push(tx.to_string().len());
-        self.asked.borrow_mut().push(args.clone());
+        if let Some(tx) = args.get("tx") {
+            self.handed.borrow_mut().push(tx.to_string().len());
+        }
+        self.arguments.borrow_mut().push(args.clone());
         Ok(true)
     }
 }
@@ -404,11 +431,16 @@ async fn send_into(
     let headers = headers(chain);
     let payment = match uploaded {
         Some(key) => {
-            world
-                .blobs
-                .objects
-                .borrow_mut()
-                .insert(key.to_string(), (chain.beef.clone(), "uploaded".into()));
+            // The sender's upload, once: a send naming the key again names
+            // what is there. An upload carries no metadata of the relay's.
+            if !world.has(key) {
+                world
+                    .blobs
+                    .objects
+                    .borrow_mut()
+                    .insert(key.to_string(), (chain.beef.clone(), "uploaded".into()));
+                world.blobs.metadata.borrow_mut().remove(key);
+            }
             json!({
                 "beefR2Key": key,
                 "outputs": [server_output, recipient_output()],
@@ -470,6 +502,7 @@ async fn send_into(
             server_output: Some(&server_output),
             txid: Some(&judged.txid),
             rows,
+            reader: &wallet(SERVER_KEY).identity_key().to_hex(),
             now: NOW,
         },
     )
@@ -542,7 +575,7 @@ fn a_valid_payment_of_100_000_links_is_accepted_end_to_end() {
     // The fee is owed, not refused: a row of the ledger, and wallet-infra
     // was handed nothing in the request.
     assert_eq!(sent.handed.fee, Fee::Deferred);
-    assert!(sent.wallet.handed.borrow().is_empty());
+    assert!(sent.wallet.arguments.borrow().is_empty());
     let owed = sent.ledger.rows.borrow();
     assert_eq!(owed.len(), 1);
     assert_eq!(owed[0].key, sent.spool_key);
@@ -563,15 +596,17 @@ fn the_same_payment_uploaded_to_r2_stays_where_it_arrived() {
     let sent = send(chain, Some(key), true);
 
     the_row_names_the_bytes_at_rest(&sent, &beef, key);
-    assert_eq!(sent.blobs.spools.get(), 0, "no second copy is made");
+    // No second copy: the one object, written again in place once so that
+    // it names its reader (NL-7b), and nothing at another key.
+    assert_eq!(sent.blobs.spools.get(), 1, "the object, once, in place");
     assert_eq!(sent.blobs.objects.borrow().len(), 1);
     assert_eq!(sent.handed.fee, Fee::Deferred);
-    assert!(sent.wallet.handed.borrow().is_empty());
+    assert!(sent.wallet.arguments.borrow().is_empty());
     let owed = sent.ledger.rows.borrow();
     assert_eq!(owed.len(), 1);
     assert_eq!(
         (owed[0].key.as_str(), owed[0].etag.as_str()),
-        (key, "uploaded")
+        (key, "spooled-1")
     );
 }
 
@@ -586,6 +621,27 @@ fn an_everyday_payment_is_internalized_in_the_request_and_its_row_names_the_byte
     assert_eq!(sent.handed.fee, Fee::Internalized);
     assert_eq!(sent.wallet.handed.borrow().len(), 1, "wallet-infra, once");
     assert!(sent.ledger.rows.borrow().is_empty(), "nothing is owed");
+    // The fee that fits is recorded inline, as `tx` in the one shape
+    // wallet-infra decodes as it comes: the hex string (`[SRC] bsv-rs 0.4.1
+    // src/wallet/types.rs:24-43`, `hex_bytes`; rust-wallet-infra@50a282f
+    // src/beef_at_rest.rs:76-88 turns an array into it). The sender sent
+    // `{"beef": <base64>}`, which wallet-infra refuses as a map.
+    let arguments = sent.wallet.arguments.borrow();
+    assert_eq!(arguments[0]["tx"], json!(hex::encode(&beef)), "tx as hex");
+    assert!(arguments[0].get("beefAtRest").is_none());
+}
+
+#[test]
+fn an_everyday_payment_uploaded_to_r2_is_recorded_in_the_request_as_hex() {
+    let chain = chain_atomic_beef(10, 0);
+    let beef = chain.beef.clone();
+
+    let sent = send(chain, Some(UPLOADED), true);
+
+    assert_eq!(sent.handed.fee, Fee::Internalized);
+    let arguments = sent.wallet.arguments.borrow();
+    assert_eq!(arguments.len(), 1, "wallet-infra, once");
+    assert_eq!(arguments[0]["tx"], json!(hex::encode(&beef)), "tx as hex");
 }
 
 #[test]
@@ -599,6 +655,87 @@ fn a_payment_no_row_names_and_no_fee_waits_on_is_not_kept() {
     assert!(row.get("payment").is_none());
 }
 
+// ---- the reader on the object (NL-7b) ----
+//
+// wallet-infra honours a reference only for the caller the object's own
+// metadata names (NL-7c, bsv-stack-lean `docs/lanes/nl-7c-at-rest-caller.md`:
+// the custom metadata `recipient-identity-key`, read before the body). The
+// one caller that hands wallet-infra a reference to the relay's objects is
+// the relay's drain, signed in as the relay (`payments::internalize_server_fee`,
+// `identityKey` the server's): the recipient of the delivery fee the
+// reference is internalized for.
+
+/// The relay's identity key: the recipient of the delivery fee.
+fn relay() -> String {
+    wallet(SERVER_KEY).identity_key().to_hex()
+}
+
+fn the_object_names_the_relay(sent: &Sent, key: &str, beef: &[u8]) {
+    let metadata = sent.blobs.metadata.borrow();
+    assert_eq!(
+        metadata
+            .get(key)
+            .and_then(|meta| meta.get("recipient-identity-key")),
+        Some(&relay()),
+        "the object at {key} names the reader wallet-infra checks"
+    );
+    let objects = sent.blobs.objects.borrow();
+    assert_eq!(
+        objects[key].0, beef,
+        "the bytes are the payment's, unchanged"
+    );
+    // The row and the deferred fee name the object as it is now.
+    let etag = &objects[key].1;
+    let row: Value = serde_json::from_str(&sent.listed[0].1).unwrap();
+    assert_eq!(&row["payment"]["beefEtag"], etag);
+    for fee in sent.ledger.rows.borrow().iter() {
+        assert_eq!(&fee.etag, etag);
+    }
+}
+
+#[test]
+fn the_inline_paths_spool_names_the_relay_on_the_object() {
+    let chain = chain_atomic_beef(100_000, 0);
+    let beef = chain.beef.clone();
+    let sent = send(chain, None, true);
+    assert_eq!(sent.handed.fee, Fee::Deferred);
+    the_object_names_the_relay(&sent, &sent.spool_key, &beef);
+}
+
+#[test]
+fn the_r2_paths_own_object_names_the_relay_too() {
+    let chain = chain_atomic_beef(100_000, 0);
+    let beef = chain.beef.clone();
+    let sent = send(chain, Some(UPLOADED), true);
+    assert_eq!(sent.handed.fee, Fee::Deferred);
+    the_object_names_the_relay(&sent, UPLOADED, &beef);
+}
+
+#[test]
+fn a_re_sent_key_whose_object_names_the_relay_is_not_written_again() {
+    on_a_small_stack(|| {
+        let world = World::new();
+        let chain = chain_atomic_beef(10, 0);
+        for message_id in ["m-1", "m-2"] {
+            block_on(send_into(
+                &world,
+                &chain,
+                Some(UPLOADED),
+                true,
+                message_id,
+                SPOOL,
+            ));
+        }
+        assert_eq!(world.blobs.spools.get(), 1, "written in place once");
+        // Both rows name the object as it is: the earlier row's etag holds.
+        let etag = world.blobs.objects.borrow()[UPLOADED].1.clone();
+        for (_, body) in world.listed() {
+            let row: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(row["payment"]["beefEtag"], json!(etag));
+        }
+    });
+}
+
 // ---- the deferred internalize and its drain ----
 
 const UPLOADED: &str =
@@ -610,36 +747,69 @@ fn drain(sent: &Sent, now: u64) -> Drained {
     block_on(drain_fees(&seams!(sent, rows), now, 10)).expect("the drain ran")
 }
 
+/// The relay's bucket, as wallet-infra binds it (`BEEF_AT_REST_BUCKET`).
+const BUCKET: &str = "bsv-messagebox-beefs";
+
+/// `internalizeAction`'s argument names the bytes at rest and does not carry
+/// them: `beefAtRest` with exactly the four fields wallet-infra reads
+/// (`[SRC] rust-wallet-infra@50a282f src/beef_at_rest.rs:46-54`,
+/// `deny_unknown_fields`), and no `tx` (both is refused, `:90-94`).
+fn the_argument_is_the_reference(argument: &Value, key: &str, size: usize, etag: &str) {
+    assert!(
+        argument.get("tx").is_none(),
+        "the drain sent `tx` (the inline argument, {} bytes), not the reference",
+        argument["tx"].to_string().len()
+    );
+    assert_eq!(
+        argument["beefAtRest"],
+        json!({ "r2Key": key, "size": size, "etag": etag, "bucket": BUCKET }),
+        "the reference: the ledger's key, the exact size, the etag unquoted, the bucket"
+    );
+    assert_eq!(argument["outputs"], json!([delivery_output()]));
+    assert_eq!(argument["description"], "a paid message");
+    assert_eq!(argument["seekPermission"], false);
+}
+
 #[test]
-fn a_deferred_fee_is_internalized_on_the_next_drain_and_its_row_is_cleared() {
+fn a_deferred_fee_of_100_000_links_is_sent_as_a_reference_and_recorded_on_the_next_drain() {
     let chain = chain_atomic_beef(100_000, 0);
     let beef = chain.beef.clone();
     let sent = send(chain, None, true);
     assert_eq!(sent.handed.fee, Fee::Deferred);
+    let etag = sent.ledger.rows.borrow()[0].etag.clone();
 
     let drained = drain(&sent, NOW);
 
-    assert_eq!(
-        drained,
-        Drained {
-            settled: 1,
-            put_off: 0,
-            held: 0
-        }
-    );
-    // wallet-infra was handed the whole BEEF once, read back from the store,
-    // with the delivery output and its remittance beside it.
-    let handed = sent.wallet.handed.borrow();
-    assert_eq!(handed.len(), 1);
-    assert!(handed[0] > beef.len() / 3 * 4, "{} bytes of tx", handed[0]);
-    let asked = sent.wallet.asked.borrow();
-    assert_eq!(asked[0]["outputs"], json!([delivery_output()]));
-    assert_eq!(asked[0]["description"], "a paid message");
+    let arguments = sent.wallet.arguments.borrow();
+    assert_eq!(arguments.len(), 1, "wallet-infra, once");
+    the_argument_is_the_reference(&arguments[0], &sent.spool_key, beef.len(), &etag);
+    assert_eq!(drained.settled, 1, "recorded on the next drain");
     assert!(sent.ledger.rows.borrow().is_empty(), "the row is cleared");
     // The recipient's row still names the bytes, so they stay.
     assert_eq!(sent.blobs.objects.borrow()[&sent.spool_key].0, beef);
     // And nothing is left to drain.
+    drop(arguments);
     assert_eq!(drain(&sent, NOW + 86_400), Drained::default());
+}
+
+#[test]
+fn a_fee_over_8_mib_is_sent_as_a_reference_too_and_is_never_held() {
+    // One byte over what the drain at 0.4.1 handed wallet-infra in one argument.
+    let chain = chain_of_exactly(10, 8 * 1024 * 1024 + 1);
+    let size = chain.beef.len();
+
+    let sent = send(chain, Some(UPLOADED), true);
+    assert_eq!(sent.handed.fee, Fee::Deferred);
+    let etag = sent.ledger.rows.borrow()[0].etag.clone();
+
+    let drained = drain(&sent, NOW);
+
+    assert_eq!(drained.held, 0, "a held fee no longer exists");
+    let arguments = sent.wallet.arguments.borrow();
+    assert_eq!(arguments.len(), 1, "wallet-infra, once");
+    the_argument_is_the_reference(&arguments[0], UPLOADED, size, &etag);
+    assert_eq!(drained.settled, 1);
+    assert!(sent.ledger.rows.borrow().is_empty());
 }
 
 #[test]
@@ -676,7 +846,9 @@ fn a_fault_in_wallet_infra_leaves_the_fee_owed_and_the_message_delivered() {
     sent.wallet.down.set(false);
     assert_eq!(drain(&sent, later).settled, 1);
     assert!(sent.ledger.rows.borrow().is_empty());
-    assert_eq!(sent.wallet.handed.borrow().len(), 1);
+    let arguments = sent.wallet.arguments.borrow();
+    assert_eq!(arguments.len(), 1, "wallet-infra answered once");
+    assert!(arguments[0].get("beefAtRest").is_some(), "by reference");
 }
 
 #[test]
@@ -697,29 +869,6 @@ fn a_fee_no_row_names_keeps_its_bytes_until_it_is_recorded_and_no_longer() {
 }
 
 #[test]
-fn a_fee_whose_bytes_are_more_than_one_argument_carries_is_held_and_never_dropped() {
-    // One byte over what the drain hands wallet-infra in one argument.
-    let chain = chain_of_exactly(10, 8 * 1024 * 1024 + 1);
-
-    let sent = send(chain, Some(UPLOADED), true);
-    assert_eq!(sent.handed.fee, Fee::Deferred);
-
-    let drained = drain(&sent, NOW);
-    assert_eq!(
-        drained,
-        Drained {
-            settled: 0,
-            put_off: 0,
-            held: 1
-        }
-    );
-    assert!(sent.wallet.handed.borrow().is_empty(), "never tried");
-    let rows = sent.ledger.rows.borrow();
-    assert_eq!(rows.len(), 1, "never dropped");
-    assert!(rows[0].next_at > NOW);
-}
-
-#[test]
 fn a_fee_is_never_recorded_from_another_upload_at_its_key() {
     let sent = send_with(chain_atomic_beef(10, 0), Some(UPLOADED), true, true);
     assert_eq!(sent.handed.fee, Fee::Deferred);
@@ -732,7 +881,7 @@ fn a_fee_is_never_recorded_from_another_upload_at_its_key() {
         .insert(UPLOADED.to_string(), (vec![0u8; 64], "another".into()));
 
     assert_eq!(drain(&sent, NOW).held, 1);
-    assert!(sent.wallet.handed.borrow().is_empty());
+    assert!(sent.wallet.arguments.borrow().is_empty());
     assert_eq!(sent.ledger.rows.borrow().len(), 1);
 }
 

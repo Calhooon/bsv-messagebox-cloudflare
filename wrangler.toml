@@ -70,6 +70,8 @@ bucket_name = "bsv-messagebox-beefs"
 # The drain of the deferred delivery fees runs on the scheduled event. A fee
 # is deferred when its BEEF is more than one request hands wallet-infra, or
 # when wallet-infra could not answer; the message is delivered either way.
+# The drain hands wallet-infra a reference to the object (beefAtRest), whose
+# bucket is R2_BUCKET_NAME: wallet-infra binds the same bucket to read it.
 # The same event reclaims the payment objects that acknowledged, purged or
 # expired rows have let go of (beef_released), 25 a firing.
 # With no cron no deferred fee is ever recorded and no object is reclaimed. A deployment sets its own

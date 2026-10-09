@@ -14,12 +14,13 @@
 //! back from the store (`serve_body`), or hands out a URL to them.
 //!
 //! The fee is recorded in the request when the BEEF fits the one JSON-RPC
-//! argument wallet-infra takes (`INTERNALIZE_INLINE_BYTES`), as before.
+//! argument wallet-infra takes (`INTERNALIZE_INLINE_BYTES`), as `tx` in hex.
 //! Otherwise, and whenever wallet-infra cannot answer, it is deferred: a row
 //! of the ledger, drained later (`drain_fees`), retried with a backoff, never
-//! dropped. The message is stored and delivered on the verdict either way.
-//! Nothing here answers a size or a count: a deferred fee is no error to the
-//! sender.
+//! dropped. The drain hands wallet-infra a reference to the bytes at rest
+//! (`beef_at_rest`), never the bytes, so no fee is too large to drain. The
+//! message is stored and delivered on the verdict either way. Nothing here
+//! answers a size or a count: a deferred fee is no error to the sender.
 
 use std::borrow::Cow;
 
@@ -40,21 +41,50 @@ pub use crate::storage::{
     FEE_OWES_KEY_SQL, FORGET_RELEASED_SQL, RELEASED_KEYS_SQL, ROW_NAMES_KEY_SQL,
 };
 
+/// The custom metadata of an object at rest that names the one caller
+/// wallet-infra reads it for by reference (NL-7c): the identity key of the
+/// recipient of the payment the reference is internalized for, the delivery
+/// fee's, so the relay's own (`Paid::reader`).
+pub const READER_METADATA: &str = "recipient-identity-key";
+
 /// The object store of the door, and a way to put a payment's bytes there.
 #[async_trait::async_trait(?Send)]
 pub trait PaymentStore: BeefStore {
     /// Write the `size` bytes `chunks` yields at `key`, a chunk at a time,
-    /// and answer the stamp of what is now at rest there.
-    async fn spool(&self, key: &str, chunks: &mut dyn Chunks, size: u64) -> Result<Stamp, String>;
+    /// with `reader` as its `READER_METADATA`, and answer the stamp of what
+    /// is now at rest there.
+    async fn spool(
+        &self,
+        key: &str,
+        chunks: &mut dyn Chunks,
+        size: u64,
+        reader: &str,
+    ) -> Result<Stamp, String>;
+    /// The `READER_METADATA` of the object at `key`, `None` when it has none.
+    async fn reader(&self, key: &str) -> Result<Option<String>, String>;
+    /// The object at `key`, the bytes `stamp` names, with `reader` as its
+    /// `READER_METADATA`: as it is when it names `reader` already, otherwise
+    /// written again in place from its own stream (R2 keeps metadata only as
+    /// an object is written). The stamp of what is at rest after.
+    async fn name_reader(&self, key: &str, stamp: &Stamp, reader: &str) -> Result<Stamp, String> {
+        if self.reader(key).await?.as_deref() == Some(reader) {
+            return Ok(stamp.clone());
+        }
+        let mut chunks = self.open(key, 0, stamp).await?;
+        self.spool(key, chunks.as_mut(), stamp.size, reader).await
+    }
+    /// The bucket's name, as wallet-infra binds it to read a reference
+    /// (`beef_at_rest`); `None` when the deployment does not say it.
+    fn bucket_name(&self) -> Option<String>;
 }
 
 /// wallet-infra, as the relay asks it to record the server's delivery fee:
-/// BRC-100 `internalizeAction` with `tx` and `args` (`fee_args`). `Ok(false)`
-/// is the wallet's refusal of the payment; `Err` is a wallet that could not
-/// answer.
+/// BRC-100 `internalizeAction` with `args`, the whole argument
+/// (`internalize_inline` or `internalize_at_rest`). `Ok(false)` is the
+/// wallet's refusal of the payment; `Err` is a wallet that could not answer.
 #[async_trait::async_trait(?Send)]
 pub trait FeeWallet {
-    async fn internalize(&self, tx: &Value, args: &Value) -> Result<bool, String>;
+    async fn internalize(&self, args: &Value) -> Result<bool, String>;
 }
 
 /// A delivery fee whose recording in wallet-infra is still owed: the object
@@ -140,6 +170,11 @@ pub struct Paid<'a> {
     pub txid: Option<&'a str>,
     /// Whether a recipient's row will carry the payment.
     pub rows: bool,
+    /// The identity key every object this payment rests in names as its
+    /// reader (`READER_METADATA`): the relay's own, the recipient of the
+    /// delivery fee, whose drain is the one caller that hands wallet-infra a
+    /// reference to it.
+    pub reader: &'a str,
     /// Unix seconds.
     pub now: u64,
 }
@@ -182,6 +217,45 @@ pub fn fee_args(server_output: &Value, payment: &Value) -> Value {
             .and_then(|v| v.as_str())
             .unwrap_or("MessageBox delivery payment"),
         "labels": payment.get("labels").unwrap_or(&json!([])),
+    })
+}
+
+/// `internalizeAction`'s argument with the BEEF inline: `tx`, the hex string
+/// wallet-infra decodes (`[SRC] bsv-rs 0.4.1 src/wallet/types.rs:24-43`), beside
+/// `fee` (`fee_args`).
+pub fn internalize_inline(tx: &str, fee: &Value) -> Value {
+    internalize_with("tx", json!(tx), fee)
+}
+
+/// `internalizeAction`'s argument with the BEEF at rest: `beefAtRest` (the
+/// reference, `beef_at_rest`) in place of `tx`, beside `fee`. wallet-infra
+/// refuses both at once (`[SRC] rust-wallet-infra@50a282f
+/// src/beef_at_rest.rs:90-94`).
+pub fn internalize_at_rest(reference: Value, fee: &Value) -> Value {
+    internalize_with("beefAtRest", reference, fee)
+}
+
+fn internalize_with(name: &str, bytes: Value, fee: &Value) -> Value {
+    let mut args = json!({
+        "outputs": fee.get("outputs").unwrap_or(&json!([])),
+        "description": fee.get("description").unwrap_or(&json!("MessageBox delivery payment")),
+        "labels": fee.get("labels").unwrap_or(&json!([])),
+        "seekPermission": false
+    });
+    args[name] = bytes;
+    args
+}
+
+/// The reference to a payment's BEEF at rest, as wallet-infra reads it
+/// (`[SRC] rust-wallet-infra@50a282f src/beef_at_rest.rs:46-54`, each field and
+/// no other): the object's key, its exact size in bytes, R2's etag unquoted
+/// (the etag, not the HTTP etag), and the bucket's name (not the binding's).
+pub fn beef_at_rest(key: &str, stamp: &Stamp, bucket: &str) -> Value {
+    json!({
+        "r2Key": key,
+        "size": stamp.size,
+        "etag": stamp.etag.trim_matches('"'),
+        "bucket": bucket,
     })
 }
 
@@ -324,6 +398,15 @@ async fn tx_from_rest(
     })
 }
 
+/// The carrier's bytes as one hex string: the fee recorded in the request,
+/// bounded by `INTERNALIZE_INLINE_BYTES`.
+fn hex_of(carrier: &Carrier<'_>) -> String {
+    match carrier {
+        Carrier::Hex(text) => text.to_string(),
+        _ => hex::encode(carrier.bytes(0, carrier.len() as usize)),
+    }
+}
+
 fn beef_key_not_found(e: String) -> RouteResult {
     err(
         400,
@@ -347,13 +430,6 @@ fn store_unavailable(e: String) -> RouteResult {
 /// payment's fee is deferred, not refused. A way of recording, never a word
 /// to the sender.
 pub const INTERNALIZE_INLINE_BYTES: u64 = 1024 * 1024;
-
-/// The largest BEEF the drain hands wallet-infra as one argument. The drain
-/// has an isolate to itself, and `internalizeAction` takes the bytes as one
-/// JSON value: about four thirds of them as base64, held again as the
-/// request's body. A fee over this is held in the ledger (never dropped,
-/// never tried) until wallet-infra takes a reference to the bytes at rest.
-pub const DRAIN_INLINE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The fees one drain takes up.
 pub const DRAIN_BATCH: u32 = 10;
@@ -410,12 +486,14 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
     if let (true, Some(carrier)) = (paid.rows, &carrier) {
         let stamp = seams
             .blobs
-            .spool(paid.spool_key, &mut carrier.chunks(0), size)
+            .spool(paid.spool_key, &mut carrier.chunks(0), size, paid.reader)
             .await
             .map_err(store_unavailable)?;
         rest = Some((paid.spool_key.to_string(), stamp));
     }
 
+    // Whether the R2 path's own object names the reader yet.
+    let mut named = false;
     let mut fee = Fee::NotOwed;
     if let Some(server_output) = paid.server_output {
         let args = fee_args(server_output, paid.payment);
@@ -423,20 +501,23 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
         let owed: Option<String> = if size > INTERNALIZE_INLINE_BYTES {
             Some("the BEEF is more than one request hands wallet-infra".to_string())
         } else {
-            let from_rest = match (&rest, paid.r2_key) {
-                (Some((key, stamp)), Some(_)) => {
-                    Some(tx_from_rest(seams.blobs, key, stamp, shape).await)
+            // `tx` as hex, the shape wallet-infra decodes, whatever shape
+            // the sender sent.
+            let tx = match (&rest, paid.r2_key, &carrier) {
+                (Some((key, stamp)), Some(_), _) => {
+                    tx_from_rest(seams.blobs, key, stamp, TxShape::Hex).await
                 }
-                _ => None,
+                (_, _, Some(carrier)) => Ok(Value::String(hex_of(carrier))),
+                _ => Err("no bytes to hand wallet-infra".to_string()),
             };
-            match from_rest.as_ref().map(|tx| tx.as_ref()) {
-                Some(Err(e)) => Some(format!("the bytes could not be read back: {}", e)),
-                tx => {
-                    let tx = match tx {
-                        Some(Ok(tx)) => tx,
-                        _ => &paid.payment["tx"],
-                    };
-                    match seams.wallet.internalize(tx, &args).await {
+            match tx.as_ref().map(|tx| tx.as_str().unwrap_or_default()) {
+                Err(e) => Some(format!("the bytes could not be read back: {}", e)),
+                Ok(tx) => {
+                    match seams
+                        .wallet
+                        .internalize(&internalize_inline(tx, &args))
+                        .await
+                    {
                         Ok(true) => None,
                         // wallet-infra's own word on the payment, as before.
                         Ok(false) => {
@@ -463,11 +544,12 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
                 if let (None, Some(carrier)) = (&rest, &carrier) {
                     let stamp = seams
                         .blobs
-                        .spool(paid.spool_key, &mut carrier.chunks(0), size)
+                        .spool(paid.spool_key, &mut carrier.chunks(0), size, paid.reader)
                         .await
                         .map_err(store_unavailable)?;
                     rest = Some((paid.spool_key.to_string(), stamp));
                 }
+                name_the_reader(seams, paid, &mut rest, &mut named).await?;
                 let (key, stamp) = rest.as_ref().ok_or_else(|| {
                     err(
                         500,
@@ -502,6 +584,9 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
         };
     }
 
+    if paid.rows {
+        name_the_reader(seams, paid, &mut rest, &mut named).await?;
+    }
     let kept = rest.filter(|_| paid.rows || fee == Fee::Deferred);
     let payment = match &kept {
         Some((key, stamp)) if paid.rows => {
@@ -514,6 +599,27 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
         fee,
         kept: kept.map(|(key, _)| key),
     })
+}
+
+/// The R2 path's own object, once it is kept, names the reader as the spool
+/// names it (`PaymentStore::name_reader`), once per send: the row and the
+/// deferred fee then name the object as it is after.
+async fn name_the_reader(
+    seams: &Seams<'_>,
+    paid: &Paid<'_>,
+    rest: &mut Option<(String, Stamp)>,
+    named: &mut bool,
+) -> Result<(), RouteResult> {
+    let (Some(_), Some((key, stamp)), false) = (paid.r2_key, rest.as_mut(), *named) else {
+        return Ok(());
+    };
+    *stamp = seams
+        .blobs
+        .name_reader(key, stamp, paid.reader)
+        .await
+        .map_err(store_unavailable)?;
+    *named = true;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -607,8 +713,8 @@ pub struct Drained {
     pub settled: u32,
     /// Fees tried and still owed: wallet-infra or the store could not answer.
     pub put_off: u32,
-    /// Fees not tried: the bytes are more than one argument carries, or are
-    /// no longer the upload the door verified.
+    /// Fees not tried: the bytes are no longer the upload the door verified,
+    /// or the deployment names no bucket for the reference.
     pub held: u32,
 }
 
@@ -619,8 +725,10 @@ enum Tried {
     Held(String),
 }
 
-/// One deferred fee: the bytes read back from the store as a stream, held
-/// to the upload the door verified, and handed to wallet-infra.
+/// One deferred fee: the object held to the upload the door verified (its
+/// stamp, one head), and wallet-infra handed the reference to it
+/// (`beef_at_rest`), never its bytes: wallet-infra reads them from the bucket
+/// as a stream. Every fee is drained so, whatever its size.
 async fn try_fee(seams: &Seams<'_>, fee: &DeferredFee) -> Tried {
     let stamp = match seams.blobs.stamp(&fee.key).await {
         Ok(Some(stamp)) => stamp,
@@ -630,20 +738,18 @@ async fn try_fee(seams: &Seams<'_>, fee: &DeferredFee) -> Tried {
     if stamp.etag != fee.etag {
         return Tried::Held("another upload is at the key".to_string());
     }
-    if stamp.size > DRAIN_INLINE_BYTES {
-        return Tried::Held(format!(
-            "{} bytes are more than one argument to wallet-infra carries",
-            stamp.size
-        ));
-    }
+    let Some(bucket) = seams.blobs.bucket_name() else {
+        return Tried::Held("the deployment names no bucket for the reference".to_string());
+    };
     let Ok(args) = serde_json::from_str::<Value>(&fee.args) else {
         return Tried::Held("the row's arguments do not parse".to_string());
     };
-    let tx = match tx_from_rest(seams.blobs, &fee.key, &stamp, TxShape::Base64).await {
-        Ok(tx) => tx,
-        Err(e) => return Tried::PutOff(e),
-    };
-    match seams.wallet.internalize(&tx, &args).await {
+    let reference = beef_at_rest(&fee.key, &stamp, &bucket);
+    match seams
+        .wallet
+        .internalize(&internalize_at_rest(reference, &args))
+        .await
+    {
         Ok(true) => Tried::Settled,
         Ok(false) => Tried::PutOff("wallet-infra did not accept the payment".to_string()),
         Err(e) => Tried::PutOff(e),
@@ -787,6 +893,10 @@ pub(crate) mod tests {
         pub(crate) objects: RefCell<HashMap<String, (Vec<u8>, String)>>,
         pub(crate) opened: Cell<usize>,
         pub(crate) down: Cell<bool>,
+        /// The deployment names no bucket (`bucket_name`).
+        pub(crate) nameless: Cell<bool>,
+        /// Each object's `READER_METADATA`.
+        pub(crate) readers: RefCell<HashMap<String, String>>,
     }
 
     impl Mem {
@@ -865,6 +975,7 @@ pub(crate) mod tests {
             key: &str,
             chunks: &mut dyn Chunks,
             size: u64,
+            reader: &str,
         ) -> Result<Stamp, String> {
             if self.down.get() {
                 return Err("the store is down".to_string());
@@ -874,7 +985,18 @@ pub(crate) mod tests {
                 bytes.extend_from_slice(&chunk);
             }
             assert_eq!(bytes.len() as u64, size);
+            self.readers
+                .borrow_mut()
+                .insert(key.to_string(), reader.to_string());
             Ok(self.put(key, &bytes, "spooled"))
+        }
+
+        async fn reader(&self, key: &str) -> Result<Option<String>, String> {
+            Ok(self.readers.borrow().get(key).cloned())
+        }
+
+        fn bucket_name(&self) -> Option<String> {
+            (!self.nameless.get()).then(|| "bsv-messagebox-beefs".to_string())
         }
     }
 
@@ -1076,7 +1198,7 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl FeeWallet for Scripted {
-        async fn internalize(&self, _tx: &Value, _args: &Value) -> Result<bool, String> {
+        async fn internalize(&self, _args: &Value) -> Result<bool, String> {
             self.asked.set(self.asked.get() + 1);
             self.answer.clone()
         }
@@ -1163,6 +1285,7 @@ pub(crate) mod tests {
                 server_output: fee_owed.then_some(&server_output),
                 txid: fee_owed.then_some("aa"),
                 rows,
+                reader: "02relay",
                 now: 1_000,
             },
         )
@@ -1370,6 +1493,102 @@ pub(crate) mod tests {
             (status, &body["code"]),
             (503, &json!("ERR_PAYMENT_UNAVAILABLE"))
         );
+    }
+
+    // ---- the reference ----
+
+    /// wallet-infra keeping each argument it is handed.
+    #[derive(Default)]
+    struct Recording(RefCell<Vec<Value>>);
+
+    #[async_trait::async_trait(?Send)]
+    impl FeeWallet for Recording {
+        async fn internalize(&self, args: &Value) -> Result<bool, String> {
+            self.0.borrow_mut().push(args.clone());
+            Ok(true)
+        }
+    }
+
+    fn owed_at(key: &str, etag: &str) -> Owed {
+        Owed {
+            rows: RefCell::new(vec![DeferredFee {
+                key: key.to_string(),
+                etag: etag.to_string(),
+                txid: "aa".into(),
+                args: fee_args(&json!({ "outputIndex": 0 }), &json!({})).to_string(),
+                named: false,
+                attempts: 0,
+                next_at: 0,
+            }]),
+            down: false,
+        }
+    }
+
+    #[test]
+    fn the_reference_is_the_four_fields_with_the_etag_unquoted() {
+        let stamp = Stamp {
+            size: 8_388_636,
+            etag: "\"0f343b0931126a20f133d67c2b018a3b\"".into(),
+        };
+        let reference = beef_at_rest(KEY, &stamp, "bsv-messagebox-beefs");
+        assert_eq!(
+            reference,
+            json!({
+                "r2Key": KEY,
+                "size": 8_388_636u64,
+                "etag": "0f343b0931126a20f133d67c2b018a3b",
+                "bucket": "bsv-messagebox-beefs"
+            })
+        );
+        let args = internalize_at_rest(
+            reference,
+            &fee_args(&json!({ "outputIndex": 0 }), &json!({})),
+        );
+        assert!(args.get("tx").is_none(), "no tx beside the reference");
+        assert_eq!(args["outputs"], json!([{ "outputIndex": 0 }]));
+        assert_eq!(args["seekPermission"], false);
+        let inline = internalize_inline("0100", &json!({}));
+        assert_eq!(inline["tx"], "0100");
+        assert!(inline.get("beefAtRest").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_drain_hands_the_reference_and_never_opens_the_object() {
+        let blobs = Mem::default();
+        let stamp = blobs.put(KEY, &bytes(9 * 1024 * 1024), "e1");
+        let (wallet, ledger, rows) = (Recording::default(), owed_at(KEY, "e1"), Named::default());
+        let seams = Seams {
+            blobs: &blobs,
+            wallet: &wallet,
+            ledger: &ledger,
+            rows: &rows,
+        };
+        let drained = drain_fees(&seams, 0, DRAIN_BATCH).await.unwrap();
+        assert_eq!(drained.settled, 1);
+        assert_eq!(blobs.opened.get(), 0, "the relay reads none of the bytes");
+        let handed = wallet.0.borrow();
+        assert_eq!(
+            handed[0]["beefAtRest"],
+            beef_at_rest(KEY, &stamp, "bsv-messagebox-beefs")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deployment_that_names_no_bucket_holds_the_fee_and_sends_nothing() {
+        let blobs = Mem::default();
+        blobs.nameless.set(true);
+        blobs.put(KEY, &bytes(100), "e1");
+        let (wallet, ledger, rows) = (Recording::default(), owed_at(KEY, "e1"), Named::default());
+        let seams = Seams {
+            blobs: &blobs,
+            wallet: &wallet,
+            ledger: &ledger,
+            rows: &rows,
+        };
+        let drained = drain_fees(&seams, 0, DRAIN_BATCH).await.unwrap();
+        assert_eq!((drained.settled, drained.held), (0, 1));
+        assert!(wallet.0.borrow().is_empty(), "never the bytes in its place");
+        assert_eq!(ledger.rows.borrow().len(), 1, "never dropped");
     }
 
     #[test]
