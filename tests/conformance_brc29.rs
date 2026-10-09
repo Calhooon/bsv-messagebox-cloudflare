@@ -21,10 +21,12 @@
 //! hex string, `{"beef": <base64>}`), with the header service replaced by a
 //! stub answering from `header_service.lookup`; the verdict through
 //! `delivery_answer`, the route's answer. The verdict is mapped onto the
-//! vector words and compared with `expected` exactly, 20 of 20, and the
-//! route's status is held to the word's class (the canonical README, "The
+//! vector words and compared with `expected` exactly, 22 of 22, and the
+//! route's status is held to the verdict's class (the canonical README, "The
 //! six words": accept on `Verified` alone; `Underpaid`, `WrongScript` and
-//! `RootMismatch` 4xx; `NoHeaderService` and `Unverifiable` 5xx).
+//! `RootMismatch` 4xx; `NoHeaderService` 5xx; `Unverifiable` by its reason's
+//! side, the owner's ruling of 2026-10-09: a lookup error is the server's,
+//! 5xx, and no root is the payer's, 4xx, with no fields).
 
 use base64::Engine as _;
 use bsv_middleware_rs::{HeaderLookupError, HeaderService, PaymentVerdict, UnverifiableReason};
@@ -38,7 +40,7 @@ use std::sync::Mutex;
 const VECTORS: &str = include_str!("vectors/brc29-payment-vectors.json");
 
 /// The sha256 of the pinned copy (the canonical file's bytes).
-const VECTORS_SHA256: &str = "dae68f0b2999b44088e67206b1c34866a2c3f0fee8f0a8c8f4829d313ba13a8d";
+const VECTORS_SHA256: &str = "836579ad73e20ca0e259a6c7cce5b55d85095cf290f74458937aeb39c9b5253c";
 
 /// Where the canonical file is, when its checkout sits beside this one.
 const CANONICAL_SIBLING: &str = concat!(
@@ -85,27 +87,49 @@ fn word(verdict: PaymentVerdict) -> Observed {
         PaymentVerdict::Unverifiable(UnverifiableReason::HeaderLookupFailed { height, .. }) => {
             observed("Unverifiable", json!({ "height": height }))
         }
-        PaymentVerdict::Unverifiable(reason) => {
-            observed("Unverifiable", json!({ "reason": format!("{:?}", reason) }))
-        }
+        // No root (no proof, an incomplete BEEF) carries no fields: the
+        // reason is the payer's side and the law does not name it.
+        PaymentVerdict::Unverifiable(_) => observed("Unverifiable", json!({})),
     }
 }
 
-/// The status class the canonical README gives a word: 2 for the one accept,
-/// 4 for a payment the payer must change, 5 for a payment the server could
-/// not check.
-fn class_of(word: &str) -> u16 {
-    match word {
-        "Verified" => 2,
-        "Underpaid" | "WrongScript" | "RootMismatch" => 4,
-        "NoHeaderService" | "Unverifiable" => 5,
-        other => panic!("not one of the six words: {other}"),
+/// The reason of an `Unverifiable` verdict as the core names it, for the
+/// run's printed line only: the vectors compare the word and the fields.
+fn reason_of(verdict: &PaymentVerdict) -> Option<String> {
+    match verdict {
+        PaymentVerdict::Unverifiable(reason) => Some(format!("{:?}", reason)),
+        _ => None,
     }
+}
+
+/// The status class the canonical README gives a verdict: 2 for the one
+/// accept, 4 for a payment the payer must change, 5 for a payment the server
+/// could not check. `Unverifiable` takes its reason's side: a lookup error
+/// is the server's, no root is the payer's.
+fn class_of(verdict: &PaymentVerdict) -> u16 {
+    match verdict {
+        PaymentVerdict::Verified { .. } => 2,
+        PaymentVerdict::Underpaid { .. }
+        | PaymentVerdict::WrongScript { .. }
+        | PaymentVerdict::RootMismatch { .. } => 4,
+        PaymentVerdict::NoHeaderService => 5,
+        PaymentVerdict::Unverifiable(UnverifiableReason::HeaderLookupFailed { .. }) => 5,
+        PaymentVerdict::Unverifiable(_) => 4,
+    }
+}
+
+/// One case's answer from the box's path: the vector word and fields, the
+/// route's status (200 for the one accept) and the core's reason.
+#[derive(Debug, Clone, PartialEq)]
+struct Answer {
+    observed: Observed,
+    status: u16,
+    reason: Option<String>,
 }
 
 /// The header service of a case: `{"answer":"root","height":h,"merkle_root":r}`
 /// answers `r` at `h` and nothing elsewhere; `{"answer":"error","reason":s}`
-/// answers nothing. Records every height asked.
+/// answers nothing; `null` is never asked. Records every height asked.
 struct VectorHeaders {
     lookup: Value,
     asked: Mutex<Vec<u32>>,
@@ -129,7 +153,7 @@ impl HeaderService for VectorHeaders {
 }
 
 /// One case through the delivery check, in one shape of `tx`.
-async fn run_shape(case: &Value, tx: &Value) -> Observed {
+async fn run_shape(case: &Value, tx: &Value) -> Answer {
     let s = |k: &str| case[k].as_str().unwrap().to_string();
     let name = s("name");
     let wallet = ProtoWallet::new(Some(
@@ -177,6 +201,9 @@ async fn run_shape(case: &Value, tx: &Value) -> Observed {
     if stage == "config" {
         assert!(asked.is_empty(), "{name}: no service, nothing asked");
     }
+    if case["header_service"]["lookup"].is_null() {
+        assert!(asked.is_empty(), "{name}: no root, nothing asked");
+    }
     if case["requires_merkle_lookup"].as_bool().unwrap() {
         assert_eq!(
             asked,
@@ -184,28 +211,38 @@ async fn run_shape(case: &Value, tx: &Value) -> Observed {
             "{name}: the proof's height is the one asked"
         );
     }
+    let class = class_of(&verdict);
+    let reason = reason_of(&verdict);
     // The route's answer to the verdict.
-    match delivery_answer(verdict) {
+    let status = match delivery_answer(verdict) {
         Ok(satoshis) => {
-            assert_eq!(class_of(&got.word), 2, "{name}: accepted");
+            assert_eq!(class, 2, "{name}: accepted");
             assert_eq!(
                 got.fields["satoshis"],
                 json!(satoshis),
                 "{name}: the amount"
             );
+            200
         }
-        Err((_, status)) => assert_eq!(
-            status / 100,
-            class_of(&got.word),
-            "{name}: {} answered {status}",
-            got.word
-        ),
+        Err((_, status)) => {
+            assert_eq!(
+                status / 100,
+                class,
+                "{name}: {} answered {status}",
+                got.word
+            );
+            status
+        }
+    };
+    Answer {
+        observed: got,
+        status,
+        reason,
     }
-    got
 }
 
 /// One case in every shape the route reads; the shapes must agree.
-async fn run_case(case: &Value) -> Observed {
+async fn run_case(case: &Value) -> Answer {
     let name = case["name"].as_str().unwrap();
     let beef_hex = case["transaction"]["beef_hex"].as_str().unwrap();
     let bytes = hex::decode(beef_hex).unwrap();
@@ -253,7 +290,7 @@ async fn every_vector_case() {
     let file: Value = serde_json::from_str(VECTORS).unwrap();
     assert_eq!(file["schema"], "brc29-payment-vectors/1");
     let cases = file["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 20);
+    assert_eq!(cases.len(), 22);
     assert_eq!(
         file["words"].as_object().unwrap().len(),
         6,
@@ -267,17 +304,24 @@ async fn every_vector_case() {
             case["expected"]["word"].as_str().unwrap(),
             case["expected"]["fields"].clone(),
         );
-        let got = run_case(case).await;
-        let verdict = if got == expected {
+        let answer = run_case(case).await;
+        let got = &answer.observed;
+        // The ruling of 2026-10-09: `Unverifiable` with no fields is no
+        // root, the payer's, and the route answers it 400.
+        if expected.word == "Unverifiable" && expected.fields == json!({}) {
+            assert_eq!(answer.status, 400, "{name}: no root is the payer's");
+        }
+        let verdict = if *got == expected {
             exact += 1;
             "ok"
         } else {
             failures.push(name.to_string());
             "FAIL"
         };
+        let reason = answer.reason.map(|r| format!(" ({r})")).unwrap_or_default();
         println!(
-            "{verdict:8} {name:40} expected {} {} got {} {}",
-            expected.word, expected.fields, got.word, got.fields
+            "{verdict:8} {name:40} expected {} {} got {} {} status {}{reason}",
+            expected.word, expected.fields, got.word, got.fields, answer.status
         );
     }
     println!(
@@ -286,5 +330,5 @@ async fn every_vector_case() {
         failures.len()
     );
     assert!(failures.is_empty(), "failing cases: {:?}", failures);
-    assert_eq!(exact, 20, "20 of 20 exact");
+    assert_eq!(exact, 22, "22 of 22 exact");
 }

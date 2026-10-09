@@ -4,6 +4,13 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.31 (2026-10-09)
+
+### The BRC-29 vectors re-pinned: 22 cases, no root is the payer's (bsv-stack-lean #50)
+- No change to the relay's answers; a test-only release. `tests/vectors/brc29-payment-vectors.json` is again the canonical file's bytes (sha256 `836579ad73e20ca0e259a6c7cce5b55d85095cf290f74458937aeb39c9b5253c`, 22 cases; 0.3.30 pinned the 20 of 2026-10-08, `dae68f0b...3a8d`, and `the_pinned_copy_is_the_canonical_file` was red against the canonical file).
+- The two cases added there on 2026-10-09, `spv-no-root` (a BEEF with the payment and the parent it spends, no BUMP for either) and `spv-incomplete-beef` (the payment alone, its input's transaction not carried), run through the box's payment path as shipped in 0.3.29: both are `Unverifiable` with no fields, 400 `ERR_INVALID_PAYMENT`, and the header service is never asked.
+- The runner follows the owner's ruling of 2026-10-09: `Unverifiable` takes its class from its reason's side (a header lookup the server could not complete is 5xx, no root is the payer's, 4xx); a payer-side reason carries no fields; a case whose `header_service.lookup` is `null` must ask nothing. 22 of 22 exact, in each of the three shapes of `tx` the route reads.
+
 ## 0.3.30 (2026-10-09)
 
 ### The header service over a service binding
