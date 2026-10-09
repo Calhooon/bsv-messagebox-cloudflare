@@ -146,7 +146,8 @@ WebSocket frames (inside the MessageHub DO)
 | `BEEF_BLOBS` | R2 bucket | Holds large BEEF payloads (>100 MB) uploaded via presigned URL |
 | `BSV_NETWORK` | Var | `mainnet` or `testnet` |
 | `WALLET_STORAGE_URL` | Var | Upstream wallet service for payment internalization |
-| `HEADER_SERVICE_URL` | Var | Header service the delivery payment's merkle roots are checked against (`GET {base}/findHeaderHexForHeight?height=`). Unset, blank or a `.invalid` host: every payment that owes a delivery fee is refused 500 `ERR_SERVER_MISCONFIGURED` |
+| `HEADER_SERVICE` | Service binding | Header service the delivery payment's merkle roots are checked against (`GET /findHeaderHexForHeight?height=`), reached as a Worker on the same Cloudflare account (a plain fetch between two Workers of one account is refused). Wins over `HEADER_SERVICE_URL` when both exist |
+| `HEADER_SERVICE_URL` | Var | The same header service by URL (`GET {base}/findHeaderHexForHeight?height=`), for a Worker on another account. Unset, blank or a `.invalid` host, and no `HEADER_SERVICE` binding: every payment that owes a delivery fee is refused 500 `ERR_SERVER_MISCONFIGURED` |
 | `R2_BUCKET_NAME` | Var | Bucket name for R2 presigning; matches `BEEF_BLOBS.bucket_name` |
 | `SERVER_PRIVATE_KEY` | Secret | BRC-31 server identity key (hex) |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | Secret | Full Google service-account JSON (used to sign FCM JWTs in-WASM) |

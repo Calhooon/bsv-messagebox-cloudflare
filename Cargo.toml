@@ -1,6 +1,6 @@
 [package]
 name = "rust-message-box"
-version = "0.3.29"
+version = "0.3.30"
 edition = "2021"
 
 [lib]
@@ -38,7 +38,8 @@ bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction", "wasm"]
 # and since 0.3.0 the six-word verdict with the header service as a trait.
 bsv-middleware-rs = "0.3.0"
 # The header service is a trait of bsv-middleware-rs 0.3.0 (`HeaderService`),
-# declared with async-trait; the box implements it over the Worker fetch.
+# declared with async-trait; the box implements it over the HEADER_SERVICE
+# service binding or the Worker fetch of a URL.
 async-trait = "0.1"
 
 [dev-dependencies]

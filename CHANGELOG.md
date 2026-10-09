@@ -4,6 +4,16 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.30 (2026-10-09)
+
+### The header service over a service binding
+- **A new service binding, `HEADER_SERVICE`**, names the header service as a Worker on the relay's own Cloudflare account. Cloudflare refuses a plain `fetch()` between two Workers of one account (error 1042 behind a 404, the callee never invoked), so on such a deployment 0.3.29's `HEADER_SERVICE_URL` could not reach the header service and every payment that owed a delivery fee was answered 503 `ERR_PAYMENT_UNAVAILABLE`.
+- With the binding, every lookup is the binding's fetch of `https://header-service/findHeaderHexForHeight?height={h}`: a binding ignores the host and the callee sees the path and the query, the route 0.3.29 calls.
+- **The binding wins when both exist.** Without the binding, `HEADER_SERVICE_URL` is read as in 0.3.29 (a Worker on another account may use it). With neither, every payment that owes a delivery fee is refused 500 `ERR_SERVER_MISCONFIGURED`, as before.
+- The answers are those of 0.3.29: a status of 400 or above from the header service, a fetch that fails or a reply that cannot be read is 503 `ERR_PAYMENT_UNAVAILABLE` (fail closed).
+- `wrangler.toml` documents the `[[services]]` block as a comment; a deployment sets its own.
+- `payments::HeaderTransport` is the seam (one GET, the status and the body), with `BindingTransport` and `UrlTransport`; `WorkerHeaderService::over(binding, configured)` chooses. `WorkerHeaderService::configured` is unchanged.
+
 ## 0.3.29 (2026-10-09)
 
 ### The payment door on bsv-middleware-rs 0.3.0: six words, and a header service (bsv-stack-lean #57, #50)

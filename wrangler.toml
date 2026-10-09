@@ -11,12 +11,25 @@ compatibility_date = "2026-04-07"
 [vars]
 BSV_NETWORK = "mainnet"
 WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
-# HEADER_SERVICE_URL: the header service the delivery payment's merkle roots are
-# checked against (0.3.29). It is not set here: a deployment names its own, and
-# until it does every payment that owes a delivery fee is refused 500
-# ERR_SERVER_MISCONFIGURED (fail closed).
+# The header service the delivery payment's merkle roots are checked against
+# (0.3.29) is named one of two ways, and neither is set here: a deployment names
+# its own, and until it does every payment that owes a delivery fee is refused
+# 500 ERR_SERVER_MISCONFIGURED (fail closed).
+#   - The HEADER_SERVICE service binding (0.3.30), the [[services]] block below.
+#     A Worker on the same Cloudflare account as the header service must use the
+#     binding: Cloudflare refuses a plain fetch between two Workers of one
+#     account (error 1042 behind a 404, the callee never invoked).
+#   - HEADER_SERVICE_URL, a var. A Worker elsewhere may use the URL.
+# The binding wins when both exist.
 # Flip to "true" after setting the FIREBASE_SERVICE_ACCOUNT_JSON secret.
 ENABLE_FIREBASE = "false"
+
+# The header service over a service binding (0.3.30). `rust-chaintracks` is the
+# one deployment of the header service; it is production, and there is no beta
+# header service.
+# [[services]]
+# binding = "HEADER_SERVICE"
+# service = "rust-chaintracks"
 
 # Secrets (set via `wrangler secret put`):
 #   SERVER_PRIVATE_KEY            — 64-char hex BRC-31 server identity key.

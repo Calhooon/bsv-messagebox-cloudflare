@@ -23,8 +23,9 @@ type RouteResult = (Value, u16);
 /// carry it once for every entry of `fee_map` (P0-5b) when it is > 0.
 /// A payment transaction above `MAX_PAYMENT_BODY_BYTES` is refused 413
 /// before anything reads it. The delivery output is verified against the
-/// header service `HEADER_SERVICE_URL` names (0.3.29); a deployment that
-/// names none refuses every payment that owes a delivery fee.
+/// header service the `HEADER_SERVICE` binding or `HEADER_SERVICE_URL` names
+/// (0.3.29, 0.3.30); a deployment that names none refuses every payment that
+/// owes a delivery fee.
 pub async fn process_payment(
     payment: &Value,
     fee_map: &[(String, String, i32)],
@@ -447,14 +448,69 @@ pub fn delivery_answer(verdict: PaymentVerdict) -> Result<u64, RouteResult> {
     }
 }
 
-/// The box's header service: the merkle root of the block at a height, from
-/// the service the `HEADER_SERVICE_URL` var names, through
+/// The host a lookup over the binding names. A service binding ignores the
+/// host and hands the callee the path and the query, so the route is the one
+/// the URL mode calls.
+const HEADER_BINDING_BASE: &str = "https://header-service";
+
+/// One GET to the header service: the status and the body, or why the request
+/// did not complete. The seam between the lookup and the way it leaves the
+/// Worker (0.3.30): the service binding, or the Worker fetch of a URL.
+#[async_trait::async_trait(?Send)]
+pub trait HeaderTransport {
+    async fn get(&self, url: &str) -> Result<(u16, String), String>;
+}
+
+/// The `HEADER_SERVICE` service binding: `Fetcher::fetch`, the one way one
+/// Worker reaches another on the same Cloudflare account.
+pub struct BindingTransport(worker::Fetcher);
+
+#[async_trait::async_trait(?Send)]
+impl HeaderTransport for BindingTransport {
+    async fn get(&self, url: &str) -> Result<(u16, String), String> {
+        let response = self.0.fetch(url, None).await.map_err(|e| e.to_string())?;
+        status_and_body(response).await
+    }
+}
+
+/// The Worker fetch of a URL (0.3.29), for a header service on another
+/// account.
+pub struct UrlTransport;
+
+#[async_trait::async_trait(?Send)]
+impl HeaderTransport for UrlTransport {
+    async fn get(&self, url: &str) -> Result<(u16, String), String> {
+        let response = worker::Fetch::Url(
+            url.parse()
+                .map_err(|e| format!("header service URL: {}", e))?,
+        )
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+        status_and_body(response).await
+    }
+}
+
+async fn status_and_body(mut response: worker::Response) -> Result<(u16, String), String> {
+    let status = response.status_code();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("read response: {}", e))?;
+    Ok((status, body))
+}
+
+/// The box's header service: the merkle root of the block at a height, through
 /// `GET {base}/findHeaderHexForHeight?height={h}` (the lookup of
-/// bsv-middleware-cloudflare 0.3.8 `src/payment_verify.rs:96,331-356`).
+/// bsv-middleware-cloudflare 0.3.8 `src/payment_verify.rs:96,331-356`), from
+/// the Worker behind the `HEADER_SERVICE` service binding or, without one,
+/// the service the `HEADER_SERVICE_URL` var names (0.3.30).
 /// It only fetches; the comparison and the fail-closed rule are the
 /// verifier's.
 pub struct WorkerHeaderService {
     base: String,
+    // A Worker is single-threaded; the trait asks for `Send + Sync`.
+    transport: worker::send::SendWrapper<Box<dyn HeaderTransport>>,
 }
 
 impl WorkerHeaderService {
@@ -463,36 +519,51 @@ impl WorkerHeaderService {
     /// `header_service_url`, bsv-middleware-rs 0.3.0). `None` is passed to
     /// the verifier as it is and answered `NoHeaderService`.
     pub fn configured(configured: Option<&str>) -> Option<Self> {
-        header_service_url(configured).map(|base| Self {
+        Self::over(None, configured)
+    }
+
+    /// The service a binding and a configured value name between them: the
+    /// binding when there is one, whatever the value says; without it, the
+    /// service the value names; with neither, none.
+    pub fn over(
+        binding: Option<Box<dyn HeaderTransport>>,
+        configured: Option<&str>,
+    ) -> Option<Self> {
+        let (base, transport) = match binding {
+            Some(binding) => (HEADER_BINDING_BASE, binding),
+            None => (
+                header_service_url(configured)?,
+                Box::new(UrlTransport) as Box<dyn HeaderTransport>,
+            ),
+        };
+        Some(Self {
             base: base.to_string(),
+            transport: worker::send::SendWrapper::new(transport),
         })
     }
 
     fn from_env(env: &Env) -> Option<Self> {
+        let binding = env
+            .service("HEADER_SERVICE")
+            .ok()
+            .map(|service| Box::new(BindingTransport(service)) as Box<dyn HeaderTransport>);
         let configured = env.var("HEADER_SERVICE_URL").ok().map(|v| v.to_string());
-        Self::configured(configured.as_deref())
+        Self::over(binding, configured.as_deref())
     }
 
     async fn fetch_root(&self, height: u32) -> Result<String, String> {
         let url = format!("{}/findHeaderHexForHeight?height={}", self.base, height);
-        let mut response = worker::Fetch::Url(
-            url.parse()
-                .map_err(|e| format!("header service URL: {}", e))?,
-        )
-        .send()
-        .await
-        .map_err(|e| format!("fetch height {}: {}", height, e))?;
-        let status = response.status_code();
+        let (status, body) = self
+            .transport
+            .get(&url)
+            .await
+            .map_err(|e| format!("fetch height {}: {}", height, e))?;
         if status >= 400 {
             return Err(format!(
                 "header service HTTP {} at height {}",
                 status, height
             ));
         }
-        let body = response
-            .text()
-            .await
-            .map_err(|e| format!("read response: {}", e))?;
         header_root_from_response(&body, height)
     }
 }
@@ -1104,6 +1175,94 @@ mod tests {
         ] {
             assert!(header_root_from_response(&body, HEIGHT).is_err(), "{body}");
         }
+    }
+
+    // ---- 0.3.30: the header service over a service binding ----
+
+    /// A `HEADER_SERVICE` binding answering one thing; records the URLs asked.
+    struct StubBinding {
+        answer: Result<(u16, String), String>,
+        asked: Asked,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl HeaderTransport for StubBinding {
+        async fn get(&self, url: &str) -> Result<(u16, String), String> {
+            self.asked.lock().unwrap().push(url.to_string());
+            self.answer.clone()
+        }
+    }
+
+    type Asked = std::sync::Arc<Mutex<Vec<String>>>;
+
+    fn binding(answer: Result<(u16, String), String>) -> (Box<dyn HeaderTransport>, Asked) {
+        let asked = Asked::default();
+        let stub = StubBinding {
+            answer,
+            asked: asked.clone(),
+        };
+        (Box::new(stub), asked)
+    }
+
+    fn honest_reply() -> Result<(u16, String), String> {
+        let body = json!({ "status": "success", "value": { "merkleRoot": parent_root() } });
+        Ok((200, body.to_string()))
+    }
+
+    fn the_lookup_at_height() -> Vec<String> {
+        vec![format!(
+            "https://header-service/findHeaderHexForHeight?height={HEIGHT}"
+        )]
+    }
+
+    #[tokio::test]
+    async fn a_binding_and_no_url_checks_the_root_through_the_binding() {
+        let (stub, asked) = binding(honest_reply());
+        let headers = WorkerHeaderService::over(Some(stub), None)
+            .expect("a HEADER_SERVICE binding names a header service");
+        let tx = tx_json(&[(FEE, payer_script())]);
+        assert_eq!(check_with(&tx, Some(&headers)).await, Ok(FEE));
+        assert_eq!(*asked.lock().unwrap(), the_lookup_at_height());
+    }
+
+    #[tokio::test]
+    async fn the_binding_wins_over_the_url() {
+        let (stub, asked) = binding(honest_reply());
+        let headers = WorkerHeaderService::over(Some(stub), Some("https://headers.example"))
+            .expect("a header service is named");
+        let tx = tx_json(&[(FEE, payer_script())]);
+        assert_eq!(check_with(&tx, Some(&headers)).await, Ok(FEE));
+        assert_eq!(*asked.lock().unwrap(), the_lookup_at_height());
+    }
+
+    #[tokio::test]
+    async fn a_binding_that_cannot_answer_refuses_a_good_payment_503() {
+        for answer in [
+            Ok((404, "error code: 1042".to_string())),
+            Ok((500, honest_reply().unwrap().1)),
+            Ok((200, "not json".to_string())),
+            Err("the binding threw".to_string()),
+        ] {
+            let (stub, asked) = binding(answer.clone());
+            let headers = WorkerHeaderService::over(Some(stub), None)
+                .expect("a HEADER_SERVICE binding names a header service");
+            let tx = tx_json(&[(FEE, payer_script())]);
+            assert_eq!(
+                refusal_code(check_with(&tx, Some(&headers)).await),
+                (503, "ERR_PAYMENT_UNAVAILABLE".to_string()),
+                "{answer:?}"
+            );
+            assert_eq!(*asked.lock().unwrap(), the_lookup_at_height());
+        }
+    }
+
+    #[test]
+    fn no_binding_leaves_the_url_and_neither_names_no_service() {
+        assert!(WorkerHeaderService::over(None, None).is_none());
+        assert!(WorkerHeaderService::over(None, Some("https://chaintracks.invalid")).is_none());
+        let service = WorkerHeaderService::over(None, Some("https://headers.example/"))
+            .expect("the URL names a service");
+        assert_eq!(service.base, "https://headers.example");
     }
 
     // ---- P0-5b: the fee per recipient (M1) and the body bound (H1a) ----
