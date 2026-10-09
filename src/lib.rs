@@ -33,7 +33,9 @@ mod fcm;
 mod fcm_cache;
 mod fcm_jwt;
 mod fcm_token;
-mod payments;
+/// The payment door. Public so the deep-BEEF witness
+/// (`tests/deep_beef_door.rs`, P0-5b) runs the delivery check itself.
+pub mod payments;
 mod permissions;
 mod r2_presign;
 

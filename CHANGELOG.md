@@ -4,6 +4,15 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.28 (2026-10-08)
+
+### The payment door: the fee per recipient, the body bound, the SDK re-pin (bsv-low #580 M1 and H1; bsv-stack-lean #57)
+- The server delivery fee is due once per recipient: a `sendMessage` to N recipients must pay N times `delivery_fee` on output 0, as the box's own quote and the reference server already said (M1).
+- A payment transaction above `MAX_PAYMENT_BODY_BYTES` (4 MiB, the reference's default body limit) is refused 413 `ERR_BODY_TOO_LARGE` before any decode or parse, in every shape the route accepts (H1 a).
+- bsv-rs 0.3.35 (the lock had pinned 0.3.20): every walk over a BEEF's ancestry on the heap, so a stranger's chain of unproven transactions no longer overflows the Worker's stack (H1 b); the BUMP parse linear in its leaves; a tree-height byte over 64 refused.
+- bsv-middleware-rs 0.2.2: `verify_payment_output` refuses a payment over 4 MiB before it parses and parses an Atomic BEEF through the SDK's limits (128 transactions, 32 BUMPs), naming the count and the bound; the box maps every refusal but `Underpaid` to its existing invalid-payment error.
+- The deep-BEEF witness (`tests/deep_beef_door.rs`) runs un-ignored: a chain one transaction over the bound is refused naming it, a chain at the bound parses on a 1 MiB thread and the delivery output is judged as before.
+
 ## 0.3.26 — 2026-09-20
 
 ### Three alarm re-arm nets and the counter bound (bsv-low #495, #496)

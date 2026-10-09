@@ -129,24 +129,39 @@ pub fn build_upload_response(
 
 /// Fetch an R2 object's bytes by key, using the wrangler R2 binding.
 ///
-/// Returns the raw bytes if the object exists, or an error string suitable
-/// for surfacing to the caller as an `ERR_BEEF_KEY_NOT_FOUND` response.
-pub async fn fetch_beef_from_r2(env: &Env, key: &str) -> Result<Vec<u8>, String> {
+/// Returns the raw bytes if the object exists and is within the payment
+/// bound. An object above `payments::MAX_PAYMENT_BODY_BYTES` is refused 413
+/// from its size, before its body is read (P0-5b); any other failure is an
+/// `ERR_BEEF_KEY_NOT_FOUND` 400.
+pub async fn fetch_beef_from_r2(env: &Env, key: &str) -> Result<Vec<u8>, (Value, u16)> {
+    let not_found = |e: String| {
+        (
+            json!({
+                "status": "error",
+                "code": "ERR_BEEF_KEY_NOT_FOUND",
+                "description": format!("Could not fetch BEEF from R2: {}", e),
+            }),
+            400,
+        )
+    };
     let bucket = env
         .bucket(R2_BINDING)
-        .map_err(|e| format!("R2 binding {}: {}", R2_BINDING, e))?;
+        .map_err(|e| not_found(format!("R2 binding {}: {}", R2_BINDING, e)))?;
     let object = bucket
         .get(key)
         .execute()
         .await
-        .map_err(|e| format!("R2 get: {}", e))?
-        .ok_or_else(|| "R2 object not found".to_string())?;
+        .map_err(|e| not_found(format!("R2 get: {}", e)))?
+        .ok_or_else(|| not_found("R2 object not found".to_string()))?;
+    if let Some(refusal) = crate::payments::payment_size_refusal(object.size()) {
+        return Err(refusal);
+    }
     let body = object
         .body()
-        .ok_or_else(|| "R2 object body missing".to_string())?;
+        .ok_or_else(|| not_found("R2 object body missing".to_string()))?;
     body.bytes()
         .await
-        .map_err(|e| format!("R2 body read: {}", e))
+        .map_err(|e| not_found(format!("R2 body read: {}", e)))
 }
 
 /// Delete an R2 object. Best-effort: failures are logged but do not fail
@@ -228,16 +243,7 @@ pub async fn resolve_r2_backed_payment(
         None => return Ok((payment.clone(), None)),
     };
 
-    let bytes = fetch_beef_from_r2(env, &key).await.map_err(|e| {
-        (
-            json!({
-                "status": "error",
-                "code": "ERR_BEEF_KEY_NOT_FOUND",
-                "description": format!("Could not fetch BEEF from R2: {}", e),
-            }),
-            400,
-        )
-    })?;
+    let bytes = fetch_beef_from_r2(env, &key).await?;
 
     let rewritten = inline_beef_into_payment(payment, &bytes);
     Ok((rewritten, Some(key)))

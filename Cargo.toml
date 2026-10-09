@@ -1,6 +1,6 @@
 [package]
 name = "rust-message-box"
-version = "0.3.27"
+version = "0.3.28"
 edition = "2021"
 
 [lib]
@@ -36,7 +36,7 @@ bsv-middleware-cloudflare = "0.3.3"
 bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
 # The shared payment check (P0-3): the delivery output compared with the fee.
 # Published 0.2.1 carries the check.
-bsv-middleware-rs = "0.2.1"
+bsv-middleware-rs = "0.2.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

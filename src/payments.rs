@@ -16,7 +16,10 @@ type RouteResult = (Value, u16);
 /// Process payment for sendMessage. Returns per-recipient output mappings.
 ///
 /// fee_map: Vec of (recipient, messageId, fee) for non-blocked recipients.
-/// delivery_fee: server delivery fee (output[0] if > 0).
+/// delivery_fee: the box's server delivery fee per recipient; output[0] must
+/// carry it once for every entry of `fee_map` (P0-5b) when it is > 0.
+/// A payment transaction above `MAX_PAYMENT_BODY_BYTES` is refused 413
+/// before anything reads it.
 pub async fn process_payment(
     payment: &Value,
     fee_map: &[(String, String, i32)],
@@ -32,6 +35,7 @@ pub async fn process_payment(
             "Payment transaction data is required for payable delivery.",
         )
     })?;
+    check_payment_size(tx)?;
     let outputs = payment
         .get("outputs")
         .and_then(|v| v.as_array())
@@ -70,7 +74,7 @@ pub async fn process_payment(
         check_delivery_output(
             tx,
             server_output,
-            delivery_fee as u64,
+            delivery_fee_due(delivery_fee, fee_map.len())?,
             sender_key,
             &server_wallet,
         )?;
@@ -244,6 +248,67 @@ fn route_outputs_to_recipients(
     Ok(result)
 }
 
+/// The delivery fee the server output must carry for a send to `recipients`
+/// recipients: the box's fee once per recipient, as the reference charges it
+/// (message-box-server at ts-stack@fb1b2da, `sendMessage.ts:710-722`, applied
+/// at `:1707-1713` and checked against output 0 at `:1061-1067`; its client
+/// pays the same sum, `MessageBoxClient.ts:4283-4299`). A fee that cannot be
+/// formed (no recipient, a negative fee, an overflow) is the reference's
+/// thrown `TypeError`, a 500.
+fn delivery_fee_due(delivery_fee: i32, recipients: usize) -> Result<u64, RouteResult> {
+    u64::try_from(delivery_fee)
+        .ok()
+        .filter(|_| recipients > 0)
+        .zip(u64::try_from(recipients).ok())
+        .and_then(|(fee, n)| fee.checked_mul(n))
+        .ok_or_else(|| err(500, "ERR_INTERNAL", "Invalid aggregate delivery fee."))
+}
+
+/// The largest payment transaction the payment path reads, in bytes: 4 MiB,
+/// the reference message box's request body limit at its default profile
+/// (ts-stack@fb1b2da `infra/message-box-server/src/app.ts:171,195-208`, the
+/// `standard` value; `src/security/edgePolicy.ts:135-156`). Every payment the
+/// reference accepts arrives in a body of at most that size, so its
+/// transaction is no larger: this bound refuses nothing the reference serves.
+/// Above it the payment is refused 413 before it is decoded or parsed.
+pub const MAX_PAYMENT_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// The 413 for a payment transaction of `len` bytes above the bound, in the
+/// reference's code (`edgePolicy.ts:613-633`, `ERR_BODY_TOO_LARGE`).
+pub(crate) fn payment_size_refusal(len: u64) -> Option<RouteResult> {
+    (len > MAX_PAYMENT_BODY_BYTES as u64).then(|| {
+        err(
+            413,
+            "ERR_BODY_TOO_LARGE",
+            &format!(
+                "The payment transaction exceeds {} bytes.",
+                MAX_PAYMENT_BODY_BYTES
+            ),
+        )
+    })
+}
+
+/// The bound, read from the length of the encoded transaction before any
+/// decode: a byte array's length, half a hex string's, three quarters of a
+/// base64 string's less its padding. A shape that is none of these is left
+/// to `payment_tx_bytes`, which refuses it.
+fn check_payment_size(tx: &Value) -> Result<(), RouteResult> {
+    let len = match tx {
+        Value::Array(items) => items.len(),
+        Value::String(h) => h.len().div_ceil(2),
+        Value::Object(o) => match o.get("beef").and_then(|b| b.as_str()) {
+            Some(b) => (b.len() / 4 * 3 + b.len() % 4 * 3 / 4)
+                .saturating_sub(b.bytes().rev().take(2).filter(|c| *c == b'=').count()),
+            None => 0,
+        },
+        _ => 0,
+    };
+    match payment_size_refusal(len as u64) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
 /// The server delivery output, read before it is internalized (P0-3).
 ///
 /// The remittance must be a `wallet payment` from the authenticated sender;
@@ -252,7 +317,7 @@ fn route_outputs_to_recipients(
 /// Matches the reference's checks before internalizing
 /// (message-box-server sendMessage.ts:693-708, 764-786, 1054-1067), plus the
 /// script, which the reference leaves to its wallet's signer.
-fn check_delivery_output(
+pub fn check_delivery_output(
     tx: &Value,
     server_output: &Value,
     delivery_fee: u64,
@@ -668,6 +733,99 @@ mod tests {
                 (400, "ERR_INVALID_PAYMENT".to_string())
             );
         }
+    }
+
+    // ---- P0-5b: the fee per recipient (M1) and the body bound (H1a) ----
+
+    #[test]
+    fn p0_5b_two_recipients_paying_one_fee_is_refused() {
+        // The reference charges the delivery fee once per recipient
+        // (ts-stack@fb1b2da infra/message-box-server/src/routes/sendMessage.ts:710-722,1707-1713).
+        let tx = tx_json(&[(FEE, payer_script())]);
+        let due = delivery_fee_due(FEE as i32, 2).expect("a fee is due");
+        assert_eq!(
+            refusal_code(check_delivery_output(
+                &tx,
+                &remittance(0, &sender_identity()),
+                due,
+                &sender_identity(),
+                &wallet(SERVER_KEY),
+            )),
+            (400, "ERR_INSUFFICIENT_PAYMENT".to_string())
+        );
+    }
+
+    #[test]
+    fn p0_5b_two_recipients_paying_two_fees_is_accepted() {
+        let tx = tx_json(&[(2 * FEE, payer_script())]);
+        let due = delivery_fee_due(FEE as i32, 2).expect("a fee is due");
+        assert_eq!(
+            check_delivery_output(
+                &tx,
+                &remittance(0, &sender_identity()),
+                due,
+                &sender_identity(),
+                &wallet(SERVER_KEY),
+            ),
+            Ok(2 * FEE)
+        );
+    }
+
+    #[test]
+    fn p0_5b_the_fee_due_is_the_fee_times_the_recipients() {
+        assert_eq!(delivery_fee_due(100, 1), Ok(100));
+        assert_eq!(delivery_fee_due(100, 3), Ok(300));
+        assert_eq!(delivery_fee_due(i32::MAX, 2), Ok(2 * i32::MAX as u64));
+    }
+
+    #[test]
+    fn p0_5b_a_fee_due_that_cannot_be_formed_is_refused() {
+        // As the reference's aggregateDeliveryFee throws (sendMessage.ts:710-722).
+        for (fee, recipients) in [(100, 0), (-1, 1), (i32::MAX, usize::MAX)] {
+            assert_eq!(
+                refusal_code(delivery_fee_due(fee, recipients)),
+                (500, "ERR_INTERNAL".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn p0_5b_a_payment_one_byte_over_the_bound_is_refused_413_in_every_shape() {
+        let over = MAX_PAYMENT_BODY_BYTES + 1;
+        // Not hex and not base64: the bound is read before any decode.
+        for tx in [
+            json!(vec![0u8; over]),
+            json!("z".repeat(2 * over)),
+            json!({ "beef": "!".repeat(4 * over.div_ceil(3)) }),
+        ] {
+            assert_eq!(
+                refusal_code(check_payment_size(&tx).map(|_| 0)),
+                (413, "ERR_BODY_TOO_LARGE".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn p0_5b_a_payment_at_the_bound_is_read() {
+        let at = MAX_PAYMENT_BODY_BYTES;
+        for tx in [
+            json!(vec![0u8; at]),
+            json!("0".repeat(2 * at)),
+            json!({ "beef": base64::engine::general_purpose::STANDARD.encode(vec![0u8; at]) }),
+        ] {
+            assert_eq!(check_payment_size(&tx), Ok(()));
+        }
+    }
+
+    #[test]
+    fn p0_5b_an_r2_object_over_the_bound_is_refused_before_it_is_read() {
+        assert_eq!(payment_size_refusal(MAX_PAYMENT_BODY_BYTES as u64), None);
+        let (body, status) =
+            payment_size_refusal(MAX_PAYMENT_BODY_BYTES as u64 + 1).expect("a refusal");
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (413, Some("ERR_BODY_TOO_LARGE"))
+        );
     }
 
     #[test]
