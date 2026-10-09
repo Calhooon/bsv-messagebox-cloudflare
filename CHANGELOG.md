@@ -4,6 +4,16 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.4.1 (2026-10-10)
+
+### The 0.4 line alone: bsv-middleware-cloudflare 0.5.0, bsv-middleware-rs 0.4.1, one bsv-rs
+- **The BRC-31 layer is bsv-middleware-cloudflare 0.5.0** (on bsv-middleware-core 0.2.0 and bsv-rs 0.4), in place of 0.3.3. The session, the wallet and the auth message it takes are the relay's own bsv-rs 0.4.1 types; the wallet-infra client the fee's internalize opens is that crate's `WorkerStorageClient` over the relay's wallet. The handshake, the served requests and response signing are those of the layer's 0.4.x line, byte for byte by its own CHANGELOG. **One answer a client can see:** since the layer's 0.4.1, an authentication refusal (an identity that is not the session's, a signature that does not verify, a session that never completed its handshake, a replayed nonce) is the layer's own 401 with its code; under 0.3.3 several of these were an error the relay answered 500. A client that re-handshakes on 401 now recovers a stale session.
+- **The request body is still read whole before any route.** 0.5.0 reads it into memory to verify the signature over it (its `src/transport/cloudflare.rs`), so the inline `payment.tx` path is as 0.4.0 left it: decoded a chunk at a time from the JSON value already in memory, its ceiling the platform's. A payment at rest in R2 is unchanged: read as a stream, resumable across requests.
+- **The six words are bsv-middleware-rs 0.4.1's** (was 0.3.0). The door keeps its own reading, the structure, the scripts and the cursor saved between requests, and hands the middleware the subject transaction alone for the output check (`verify_payment_output_only`, over the subject's bytes). The middleware's own full check reads a payment in one pass with no cursor, so it is not what the door calls. The order is that crate's: no header service; the bytes and the spends; the output (script, then amount); a proof; a height no header can carry; the roots, lowest height first.
+- **Answers that changed.** The refusal text of the bytes is the middleware's: invalid bytes read "BEEF is invalid at offset N: Kind" and a refused spend names the transaction, its offset, the input and the interpreter's reason. The codes, the statuses, `offset` and `kind` in the body are unchanged. A BEEF with no transaction is the middleware's `NoTransaction`. A BUMP whose block height no header can carry is refused before any root is asked (a lower root the header service does not carry was the word before).
+- **Dependencies.** bsv-rs 0.4.1 alone: the second copy (0.3.35) is gone, with the `bsv-stream` alias. `tests/middleware_version_guard.rs` holds the pins: bsv-middleware-cloudflare 0.5.0 from crates.io, built on the relay's bsv-rs 0.4.1; bsv-middleware-rs 0.4.1; one bsv-rs.
+- **Operators.** Nothing new: no binding, no var, no migration beyond 0.4.0's four items. The BRC-29 vectors are unchanged, 22 of 22 exact.
+
 ## 0.4.0 (2026-10-09)
 
 ### A BEEF of any size at the payment door (the no-limits program, NL-4)

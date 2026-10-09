@@ -6,7 +6,7 @@
 //! review repository (bsv-stack-lean), which owns the vectors; its README
 //! there gives the schema and the run recipe. Never edit the copy by hand: a
 //! change starts in the canonical file and the copy follows, with
-//! `VECTORS_SHA256` below (the same bytes bsv-middleware-rs 0.3.0 pins under
+//! `VECTORS_SHA256` below (the same bytes bsv-middleware-rs 0.4.1 pins under
 //! its own `tests/vectors/`). `the_vectors_are_the_pinned_bytes` holds the
 //! copy to that digest wherever the tests run, and
 //! `the_pinned_copy_is_the_canonical_file` compares it byte for byte with the

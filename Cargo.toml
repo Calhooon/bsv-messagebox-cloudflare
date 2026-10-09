@@ -1,6 +1,6 @@
 [package]
 name = "rust-message-box"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 
 [lib]
@@ -32,24 +32,21 @@ pkcs8 = { version = "0.10", features = ["pem"] }
 hmac = "0.12"
 
 # BSV
-bsv-middleware-cloudflare = "0.3.3"
-bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
-# The streaming BEEF reader (0.4.0: `verify_stream`, `BeefDecoder`,
+# The BRC-31 layer (0.5.0: on bsv-middleware-core 0.2.0 and bsv-rs 0.4). Its
+# session, wallet and auth message are the relay's own bsv-rs 0.4.1 types.
+bsv-middleware-cloudflare = "0.5.0"
+# The SDK and the streaming BEEF reader (0.4.0: `verify_stream`, `BeefDecoder`,
 # `StreamVerifier`, `Cursor`; 0.4.1: a transaction with no input is invalid
-# bytes, `Kind::NoInputs`). Beside 0.3, not in its place: bsv-middleware-rs
-# 0.3.0 and bsv-middleware-cloudflare 0.3.3 are built on bsv-rs 0.3 and their
-# `ProtoWallet` is that crate's type. bsv-middleware-rs 0.4.0 is on bsv-rs 0.4.0
-# (published 2026-10-09) and is not taken yet: its full check runs the scripts
-# and has no cursor for the R2 resumption. bsv-middleware-cloudflare is on
-# bsv-rs 0.3 at 0.4.1, its newest, so one copy waits on that crate too
-# (`tests/middleware_version_guard.rs` holds the pins).
-# Pinned exactly: the door reads the subject's offset out of the cursor's bytes
-# (`beef_door::tip_of`), a layout of this release.
-bsv-stream = { package = "bsv-rs", version = "=0.4.1", features = ["transaction", "wasm"] }
-# The shared payment check (P0-3): the delivery output compared with the fee,
-# and since 0.3.0 the six-word verdict with the header service as a trait.
-bsv-middleware-rs = "0.3.0"
-# The header service is a trait of bsv-middleware-rs 0.3.0 (`HeaderService`),
+# bytes, `Kind::NoInputs`). Pinned exactly: the door reads the subject's offset
+# out of the cursor's bytes (`beef_door::tip_of`), a layout of this release.
+bsv-rs = { version = "=0.4.1", features = ["auth", "wallet", "transaction", "wasm"] }
+# The shared payment check (P0-3): the six-word verdict, the BRC-29 script and
+# the header service as a trait. 0.4.1 is on bsv-rs 0.4.1, so the words take
+# the relay's own wallet and reader types. The door keeps its own reading (the
+# cursor at rest) and asks the middleware the output check on the subject
+# alone (`verify_payment_output_only`).
+bsv-middleware-rs = "0.4.1"
+# The header service is a trait of bsv-middleware-rs (`HeaderService`),
 # declared with async-trait; the box implements it over the HEADER_SERVICE
 # service binding or the Worker fetch of a URL.
 async-trait = "0.1"
@@ -75,9 +72,3 @@ rusqlite = { version = "0.32", features = ["bundled", "limits"] }
 # removes the 429→500 trigger + adds BRC-104 replay protection. Any further
 # hardening (the bounded KV read-retry) ships as a published 0.3.2, never a
 # local path-patch. WS-1: public bsv-middleware-cloudflare is the canonical lineage.
-
-# bsv-low W-D (2026-09-10): the Durable Object session backend is on the public
-# lineage's branch `do-session-store` (0.3.3, `~/bsv/wt-middleware-do`) until it
-# is PUBLISHED at the promotion; this path patch satisfies the `0.3.2` caret
-# above (a patch to a version OUTSIDE the requirement is silently unused —
-# read cargo's warning). Remove it with the 0.3.3 publish.

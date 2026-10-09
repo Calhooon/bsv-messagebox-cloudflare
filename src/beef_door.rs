@@ -20,20 +20,25 @@
 //! transaction's outputs until an input of the BEEF spends them, so an
 //! output nothing in the BEEF spends is held to the end of the reading.
 //!
-//! The six words stay bsv-middleware-rs 0.3.0's. Its `verify_payment` wants
-//! the whole payment and bounds it (4 MiB, 128 transactions, 32 BUMPs), so
-//! the door reads the structure itself and hands the middleware the one thing
-//! its words are about: the subject transaction, for the output check
-//! (`verify_payment_output_only_with_limits`). The order is the middleware's
-//! (`src/payment_core.rs:349-398`): no header service; then the bytes; then
-//! the output (script, then amount); then the roots, lowest height first, a
-//! root the header does not carry before a lookup that could not answer. No
-//! root is asked before the output is judged, so a payment that does not pay
-//! costs the header service nothing; no payment is accepted with a root
-//! unasked.
+//! The six words are bsv-middleware-rs 0.4.1's. Its `verify_payment` reads
+//! the whole payment in one pass (`verify_stream` behind a tee,
+//! `src/payment_core.rs:350-364`) and keeps no cursor, so a payment at rest
+//! could not be read across requests through it. The door reads the structure
+//! and the scripts itself and hands the middleware the one thing its words
+//! are about: the subject transaction, for the output check
+//! (`verify_payment_output_only`). The order is the middleware's
+//! (`src/payment_core.rs:578-652`): no header service; then the bytes and the
+//! spends (`InvalidBeef`, `SpendRefused`); then the output (script, then
+//! amount); then a proof; then a height no header can carry; then the roots,
+//! lowest height first, a root the header does not carry before a lookup that
+//! could not answer. No root is asked before the output is judged, so a
+//! payment that does not pay costs the header service nothing; no payment is
+//! accepted with a root unasked.
 //!
 //! Two sources: the inline `payment.tx` (`Carrier`, decoded a chunk at a time
-//! from the JSON value the request carried) and an object at rest
+//! from the JSON value the request carried; the BRC-31 layer, bsv-middleware-
+//! cloudflare 0.5.0, has read that body whole before the route runs, as it
+//! signs over it: `src/transport/cloudflare.rs:168-178`) and an object at rest
 //! (`BeefStore`, the R2 bucket in the Worker). Only bytes at rest can be
 //! resumed: `verify_at_rest` reads for one slice of time, saves the cursor
 //! beside the object and answers `Pending`; the next request continues from
@@ -47,11 +52,11 @@ use std::rc::Rc;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use bsv_middleware_rs::{
-    verify_payment_output_only_with_limits, HeaderLookupError, HeaderService, PaymentToVerify,
-    PaymentVerdict, UnverifiableReason, PAYMENT_BEEF_LIMITS,
+    verify_payment_output_only, HeaderLookupError, HeaderService, PaymentToVerify, PaymentVerdict,
+    UnverifiableReason,
 };
-use bsv_stream::transaction::beef_stream::{display_hex, Hash32, SpendRefusal};
-use bsv_stream::transaction::{Cursor, Headers, Kind, Progress, StreamVerifier, Verdict};
+use bsv_rs::transaction::beef_stream::{display_hex, Hash32};
+use bsv_rs::transaction::{Cursor, Headers, Progress, StreamVerifier, Verdict};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -377,76 +382,58 @@ pub enum DoorError {
     Internal(String),
 }
 
-/// A refusal of the reading in the middleware's words: a frame, a BUMP or a
-/// transaction that does not parse (a transaction with no input is one) is a
-/// malformed transaction, a BEEF whose elements do not hold together is
-/// incomplete. Both name the offset and the kind. A spend the interpreter
-/// refused has no word of its own in bsv-middleware-rs 0.3.0: it is a
-/// malformed transaction whose text names the spend, and its kind here is
-/// `SpendRefused`.
+/// A refusal of the reading in the middleware's words, bsv-middleware-rs
+/// 0.4.1's own (`src/payment_core.rs:122-168`): invalid bytes are
+/// `InvalidBeef` with the offset and the kind (a transaction with no input is
+/// one), a spend the interpreter refused is `SpendRefused` at its input. Both
+/// are the payer's side. The route's body names the offset and the kind.
 fn refusal_word(refused: Verdict) -> DoorVerdict {
-    let (offset, kind) = match &refused {
-        Verdict::Invalid { offset, kind, .. } => (*offset, format!("{:?}", kind)),
+    let (reason, named) = match refused {
+        Verdict::Invalid {
+            offset,
+            kind,
+            reason,
+        } => (
+            UnverifiableReason::InvalidBeef {
+                offset,
+                kind,
+                reason,
+            },
+            Named {
+                offset,
+                kind: format!("{:?}", kind),
+            },
+        ),
         Verdict::SpendRefused {
             offset,
             txid,
             input,
             why,
-        } => {
-            let spend = match input {
-                Some(input) => format!("input {} of {}", input, display_hex(txid)),
-                None => display_hex(txid),
-            };
-            let why = match why {
-                SpendRefusal::ParentIsTxidOnly => {
-                    "the BEEF carries the parent by its txid alone".to_string()
-                }
-                SpendRefusal::OutputNotAvailable { vout } => {
-                    format!("the parent has no unspent output {}", vout)
-                }
-                SpendRefusal::Script(e) => format!("the script refuses it: {}", e),
-                SpendRefusal::CreatesValue => "it pays out more than it spends".to_string(),
-            };
-            return DoorVerdict {
-                word: malformed(format!(
-                    "SpendRefused at offset {}: {}: {}",
-                    offset, spend, why
-                )),
-                named: Some(Named {
-                    offset: *offset,
-                    kind: "SpendRefused".to_string(),
-                }),
-                subject: None,
-            };
-        }
+        } => (
+            UnverifiableReason::SpendRefused {
+                offset,
+                txid: display_hex(&txid),
+                input,
+                why,
+            },
+            Named {
+                offset,
+                kind: "SpendRefused".to_string(),
+            },
+        ),
         // A reading that ended valid is no refusal: this cannot come back,
         // and is a refusal if it does.
-        Verdict::Valid { .. } => (0, "Valid".to_string()),
-    };
-    let parse = matches!(
-        refused,
-        Verdict::Invalid {
-            kind: Kind::BadVersion
-                | Kind::BadVarint
-                | Kind::Truncated
-                | Kind::BadFlag
-                | Kind::TreeHeightOver64
-                | Kind::TreeHeightZero
-                | Kind::OffsetOutsideTree
-                | Kind::NoTxidAtLevelZero
-                | Kind::TrailingBytes
-                | Kind::NoInputs,
-            ..
-        }
-    );
-    let reason = if parse {
-        UnverifiableReason::MalformedTransaction(format!("{} at offset {}", kind, offset))
-    } else {
-        UnverifiableReason::IncompleteBeef
+        Verdict::Valid { .. } => (
+            UnverifiableReason::MalformedTransaction("a valid reading refused".to_string()),
+            Named {
+                offset: 0,
+                kind: "Valid".to_string(),
+            },
+        ),
     };
     DoorVerdict {
         word: PaymentVerdict::Unverifiable(reason),
-        named: Some(Named { offset, kind }),
+        named: Some(named),
         subject: None,
     }
 }
@@ -545,27 +532,25 @@ fn subject_raw(mut tail: Vec<u8>, txid: &Hash32) -> Result<Vec<u8>, DoorError> {
 }
 
 /// The middleware's output check on the subject: script first, then amount
-/// (`check_output`, bsv-middleware-rs 0.3.0 `src/payment_core.rs:501-531`).
+/// (`verify_payment_output_only`, bsv-middleware-rs 0.4.1
+/// `src/payment_core.rs:404-441`), over the subject's bytes as a byte source.
 /// The subject is handed over as a BEEF of that one transaction, so a
-/// transaction whose version word is a BEEF's is still read as a transaction;
-/// one transaction is one element, and no budget of that call is reached.
+/// transaction whose version word is a BEEF's is still read as a transaction.
+/// The bytes are in hand, so the source cannot fail; if it did, the word is
+/// the payer's: nothing was read.
 fn output_word(subject: &[u8], terms: &Terms<'_>) -> PaymentVerdict {
     let mut beef = Vec::with_capacity(subject.len() + 7);
     beef.extend_from_slice(&[0x02, 0x00, 0xBE, 0xEF, 0, 1, 0]);
     beef.extend_from_slice(subject);
-    verify_payment_output_only_with_limits(
+    verify_payment_output_only(
         &PaymentToVerify {
-            transaction: &beef,
             output_index: terms.output_index,
             expected_script: terms.expected_script,
             required_satoshis: terms.required_satoshis,
         },
-        usize::MAX,
-        &bsv_rs::transaction::BeefLimits {
-            max_bytes: usize::MAX,
-            ..PAYMENT_BEEF_LIMITS
-        },
+        &beef[..],
     )
+    .unwrap_or_else(|e| malformed(e.to_string()))
 }
 
 /// The roots of a reading, each once, lowest height first.
@@ -588,8 +573,8 @@ enum Rooted {
     Paused(usize),
 }
 
-/// Every root from `from` on asked of the header service
-/// (`payment_core.rs:373-397`): a root the header does not carry is
+/// Every root from `from` on asked of the header service (bsv-middleware-rs
+/// 0.4.1 `src/payment_core.rs:617-652`): a root the header does not carry is
 /// `RootMismatch` at once; a lookup that could not answer is remembered, the
 /// rest are still asked, and the first such is the word; with every root
 /// carried, `Verified`. One lookup per height.
@@ -606,15 +591,19 @@ async fn roots_word(
             failed_at: None,
         };
     }
+    // A height no header can carry is refused before any root is asked
+    // (bsv-middleware-rs 0.4.1 `src/payment_core.rs:620-622`). The roots are
+    // sorted, so it is the last.
+    if let Some((height, _)) = roots.last().filter(|(h, _)| u32::try_from(*h).is_err()) {
+        return Rooted::Word {
+            word: malformed(format!("a BUMP claims the block height {}", height)),
+            failed_at: None,
+        };
+    }
     let mut answers: HashMap<u32, Result<String, HeaderLookupError>> = HashMap::new();
     let mut first_failure = None;
     for (place, (height, root)) in roots.iter().enumerate().skip(from) {
-        let Ok(height) = u32::try_from(*height) else {
-            return Rooted::Word {
-                word: malformed(format!("a BUMP claims the block height {}", height)),
-                failed_at: None,
-            };
-        };
+        let height = *height as u32;
         if !answers.contains_key(&height) {
             if lookups.is_some_and(|max| answers.len() >= max) {
                 return Rooted::Paused(first_failure.map_or(place, |(at, _)| at));
@@ -679,7 +668,7 @@ pub async fn verify_inline(
         }
     };
     let Some((txid, at)) = tip_of(&cursor)? else {
-        return Ok(malformed("No transactions in BEEF").into());
+        return Ok(PaymentVerdict::Unverifiable(UnverifiableReason::NoTransaction).into());
     };
     let subject = subject_raw(carrier.bytes(at, usize::MAX), &txid)?;
     let satoshis = match output_word(&subject, terms) {
@@ -877,7 +866,9 @@ pub async fn verify_at_rest(
     let done = |word: PaymentVerdict| Ok(AtRest::Done(word.into()));
     let Some((txid, at)) = tip_of(&cursor)? else {
         store.clear(&state_key).await.map_err(source)?;
-        return done(malformed("No transactions in BEEF"));
+        return done(PaymentVerdict::Unverifiable(
+            UnverifiableReason::NoTransaction,
+        ));
     };
     // The subject alone is read again: one element.
     let mut tail = Vec::new();
@@ -927,6 +918,7 @@ pub async fn verify_at_rest(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use bsv_rs::transaction::Kind;
     use serde_json::json;
     use std::cell::Cell;
     use std::sync::Mutex;
@@ -1284,12 +1276,26 @@ pub(crate) mod tests {
                 kind: kind.to_string(),
             })
         };
-        let incomplete = PaymentVerdict::Unverifiable(UnverifiableReason::IncompleteBeef);
+        // The word is bsv-middleware-rs 0.4.1's `InvalidBeef`, its offset and
+        // kind the ones the body names.
+        let invalid = |word: &PaymentVerdict, offset: u64, kind: Kind| {
+            assert!(
+                matches!(
+                    word,
+                    PaymentVerdict::Unverifiable(UnverifiableReason::InvalidBeef {
+                        offset: at,
+                        kind: k,
+                        ..
+                    }) if *at == offset && *k == kind
+                ),
+                "{word:?} is not InvalidBeef at {offset}, {kind:?}"
+            )
+        };
         // A raw transaction is not a BEEF: its version word is the byte named.
         let raw = raw_tx(&[9; 32], FEE, PAID);
         let verdict = inline(&raw, &headers).await;
         assert_eq!(verdict.named, named(0, "BadVersion"));
-        assert_eq!(verdict.word, malformed("BadVersion at offset 0"));
+        invalid(&verdict.word, 0, Kind::BadVersion);
         // Nothing at all.
         assert_eq!(inline(&[], &headers).await.named, named(0, "Truncated"));
         // One byte after the frame.
@@ -1313,7 +1319,7 @@ pub(crate) mod tests {
         other[4] ^= 1;
         let verdict = inline(&other, &headers).await;
         assert_eq!(verdict.named, named(4, "SubjectMissing"));
-        assert_eq!(verdict.word, incomplete);
+        invalid(&verdict.word, 4, Kind::SubjectMissing);
         // The payment alone: its input names no element.
         let alone = raw_tx(&[9; 32], FEE, PAID);
         let alone = beef(&[], &[(None, alone.clone())], Some(txid(&alone)));
@@ -1322,8 +1328,38 @@ pub(crate) mod tests {
             verdict.named,
             named(4 + 32 + 4 + 2 + 1 + 5, "InputNamesNoElement")
         );
-        assert_eq!(verdict.word, incomplete);
+        invalid(
+            &verdict.word,
+            4 + 32 + 4 + 2 + 1 + 5,
+            Kind::InputNamesNoElement,
+        );
         assert!(headers.asked().is_empty(), "no refusal asked a root");
+    }
+
+    #[tokio::test]
+    async fn a_height_beyond_the_headers_is_refused_before_any_root_is_asked() {
+        // bsv-middleware-rs 0.4.1 refuses a BUMP whose height no header can
+        // carry before it asks any root (`src/payment_core.rs:620-622`), so a
+        // lower root the header service does not carry is never the word.
+        let beyond = u64::from(u32::MAX) + 1;
+        let headers = Roots::of(&[(HEIGHT, [7; 32])]);
+        let rooted = roots_word(
+            &[(HEIGHT as u64, [8; 32]), (beyond, [9; 32])],
+            0,
+            None,
+            &headers,
+            FEE,
+        )
+        .await;
+        let Rooted::Word { word, failed_at } = rooted else {
+            panic!("no lookup budget was set, so nothing pauses");
+        };
+        assert_eq!(
+            word,
+            malformed(format!("a BUMP claims the block height {}", beyond))
+        );
+        assert_eq!(failed_at, None);
+        assert!(headers.asked().is_empty(), "no root was asked");
     }
 
     #[tokio::test]
@@ -1349,12 +1385,19 @@ pub(crate) mod tests {
                 kind: "NoInputs".to_string()
             })
         );
-        assert_eq!(verdict.word, malformed("NoInputs at offset 43"));
+        assert!(matches!(
+            verdict.word,
+            PaymentVerdict::Unverifiable(UnverifiableReason::InvalidBeef {
+                offset: 43,
+                kind: Kind::NoInputs,
+                ..
+            })
+        ));
         // No transaction at all.
         let empty = beef(&[], &[], None);
         assert_eq!(
             inline(&empty, &headers).await,
-            malformed("No transactions in BEEF").into()
+            PaymentVerdict::Unverifiable(UnverifiableReason::NoTransaction).into()
         );
         assert!(headers.asked().is_empty());
     }

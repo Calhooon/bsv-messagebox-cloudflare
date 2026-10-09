@@ -399,7 +399,7 @@ pub async fn judge_delivery_output(
 }
 
 /// The verdict on the server delivery output, in the six words of
-/// bsv-middleware-rs 0.3.0 (`None` for the header service is
+/// bsv-middleware-rs 0.4.1 (`None` for the header service is
 /// `NoHeaderService`, a lookup that cannot answer is `Unverifiable`, fail
 /// closed). A remittance that is not this sender's wallet payment, or a
 /// transaction that is not bytes, is refused here before any verdict, as
@@ -646,8 +646,8 @@ pub fn door_judged(verdict: DoorVerdict) -> Result<Judged, RouteResult> {
 
 /// The six words to the route's answer, in one match with no catch-all arm:
 /// the satoshis paid on `Verified`, a refusal on every other word. The
-/// statuses are the Axum layer's (bsv-middleware-rs 0.3.0
-/// `src/axum_layer.rs:177-203`), with the box's own code for an underpayment:
+/// statuses are the Axum layer's (bsv-middleware-rs 0.4.1
+/// `src/axum_layer.rs:262-290`), with the box's own code for an underpayment:
 /// a payment the payer must change is 400; no header service is the server's
 /// misconfiguration, 500; a header service that could not answer is 503, so a
 /// client retries the same payment and never pays twice.
@@ -745,7 +745,7 @@ pub struct WorkerHeaderService {
 impl WorkerHeaderService {
     /// The service a configured value names, or `None` when it names none
     /// (unset, blank, a `.invalid` host, a host that cannot be classified:
-    /// `header_service_url`, bsv-middleware-rs 0.3.0). `None` is passed to
+    /// `header_service_url`, bsv-middleware-rs 0.4.1). `None` is passed to
     /// the verifier as it is and answered `NoHeaderService`.
     pub fn configured(configured: Option<&str>) -> Option<Self> {
         Self::over(None, configured)
