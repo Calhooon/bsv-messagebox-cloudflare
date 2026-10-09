@@ -115,6 +115,7 @@ WS Upgrade   → lib.rs (/ws) → BRC-31 auth on upgrade
 | `BEEF_BLOBS` | R2 bucket | Holds large BEEF payloads (>100 MB) uploaded via presigned URL; consumed by `/sendMessage` when `payment.beefR2Key` is supplied. |
 | `BSV_NETWORK` | Var | `mainnet` or `testnet` |
 | `WALLET_STORAGE_URL` | Var | Wallet service for payment internalization |
+| `HEADER_SERVICE_URL` | Var | Header service for the delivery payment's merkle roots (`findHeaderHexForHeight`); none configured refuses every delivery-fee payment 500 (fail closed, 0.3.29) |
 | `R2_BUCKET_NAME` | Var | Bucket name for R2 presigning; matches `BEEF_BLOBS.bucket_name` |
 | `SERVER_PRIVATE_KEY` | Secret | BRC-31 server identity key (hex) |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | Secret | Google SA JSON used to mint FCM tokens in-WASM |

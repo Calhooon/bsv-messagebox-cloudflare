@@ -11,6 +11,10 @@ compatibility_date = "2026-04-07"
 [vars]
 BSV_NETWORK = "mainnet"
 WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
+# HEADER_SERVICE_URL: the header service the delivery payment's merkle roots are
+# checked against (0.3.29). It is not set here: a deployment names its own, and
+# until it does every payment that owes a delivery fee is refused 500
+# ERR_SERVER_MISCONFIGURED (fail closed).
 # Flip to "true" after setting the FIREBASE_SERVICE_ACCOUNT_JSON secret.
 ENABLE_FIREBASE = "false"
 

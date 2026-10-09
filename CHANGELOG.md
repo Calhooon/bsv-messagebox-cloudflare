@@ -4,6 +4,19 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.3.29 (2026-10-09)
+
+### The payment door on bsv-middleware-rs 0.3.0: six words, and a header service (bsv-stack-lean #57, #50)
+- bsv-middleware-rs 0.3.0 (from crates.io). `verify_payment_output` and `PaymentOutputError` are gone from that crate; the delivery check now hands the payment to `verify_payment` and answers its verdict in one match with no catch-all arm (`payments::delivery_verdict`, `payments::delivery_answer`).
+- **The delivery payment's merkle roots are checked.** Every root the payment's BEEF computes is compared with the header service's root at that height, lowest height first, before wallet-infra is asked to record the payment. Until this release nothing on the box's path checked the proof.
+- **A new var, `HEADER_SERVICE_URL`**, names the header service (`GET {base}/findHeaderHexForHeight?height={h}`, answering `{"status":"success","value":{"merkleRoot":...}}`). **A deployment must set it before it takes this release:** with it unset, blank or naming a `.invalid` host, every payment that owes a delivery fee is refused 500 `ERR_SERVER_MISCONFIGURED`. Sends that owe no delivery fee are not affected.
+- The answers. Unchanged: an underpayment is 400 `ERR_INSUFFICIENT_PAYMENT`; a wrong script, a malformed transaction, a missing output or a BEEF over the counts is 400 `ERR_INVALID_PAYMENT`. New: a root the header does not carry is 400 `ERR_INVALID_PAYMENT`; a payment with no merkle proof, or a BEEF that is not structurally complete, is 400 `ERR_INVALID_PAYMENT` (0.3.28 accepted these on the output alone); a header service that could not answer (outage, HTTP error, height not indexed, unreadable reply) is 503 `ERR_PAYMENT_UNAVAILABLE`, so the client retries the same payment: the payment is never accepted unchecked and never answered as unpaid (fail closed, the ruling of 2026-10-08).
+- The refusal text of an invalid delivery output now carries the verdict's words (for a malformed transaction, "payment cannot be verified: transaction is malformed: ..."). The codes are unchanged.
+- Plain BEEF (V1 and V2) is read as well as Atomic BEEF; a raw transaction carries no proof and is refused.
+- No limit changes: the fee per recipient, the 413 above `MAX_PAYMENT_BODY_BYTES` (4 MiB) and the BEEF counts (128 transactions, 32 BUMPs) are those of 0.3.28.
+- The BRC-29 conformance vectors run through the box's payment path (`tests/conformance_brc29.rs`, the canonical file's bytes pinned under `tests/vectors/`): 20 of 20 exact, in each of the three shapes of `tx` the route reads.
+- The deep-BEEF witness (`tests/deep_beef_door.rs`) holds under the full check: a chain over the bound is refused naming it before any lookup; a chain at the bound parses on a 1 MiB thread, its one root is asked once and the fee is judged paid.
+
 ## 0.3.28 (2026-10-08)
 
 ### The payment door: the fee per recipient, the body bound, the SDK re-pin (bsv-low #580 M1 and H1; bsv-stack-lean #57)

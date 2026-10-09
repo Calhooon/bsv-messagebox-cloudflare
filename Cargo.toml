@@ -1,6 +1,6 @@
 [package]
 name = "rust-message-box"
-version = "0.3.28"
+version = "0.3.29"
 edition = "2021"
 
 [lib]
@@ -34,9 +34,12 @@ hmac = "0.12"
 # BSV
 bsv-middleware-cloudflare = "0.3.3"
 bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
-# The shared payment check (P0-3): the delivery output compared with the fee.
-# Published 0.2.1 carries the check.
-bsv-middleware-rs = "0.2.2"
+# The shared payment check (P0-3): the delivery output compared with the fee,
+# and since 0.3.0 the six-word verdict with the header service as a trait.
+bsv-middleware-rs = "0.3.0"
+# The header service is a trait of bsv-middleware-rs 0.3.0 (`HeaderService`),
+# declared with async-trait; the box implements it over the Worker fetch.
+async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

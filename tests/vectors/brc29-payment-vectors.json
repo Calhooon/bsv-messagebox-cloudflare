@@ -1,0 +1,906 @@
+{
+  "cases": [
+    {
+      "crate_result": "Ok(1000)",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "Output 0 pays the derived key exactly the price.",
+      "expected": {
+        "fields": {
+          "satoshis": 1000
+        },
+        "word": "Verified"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": {
+          "answer": "root",
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "exact-amount",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "output",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002eb67805eb6521bc4b19726582976bc251a8de45fb6c2c0ef8041b77d7c57c9c8010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "txid": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+      }
+    },
+    {
+      "crate_result": "Err(Underpaid { satoshis: 999, required: 1000 })",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "Output 0 pays the derived key one satoshi below the price.",
+      "expected": {
+        "fields": {
+          "paid": 999,
+          "required": 1000
+        },
+        "word": "Underpaid"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": {
+          "answer": "root",
+          "height": 850000,
+          "merkle_root": "2c3b71883aa2d5f19708b90bb47457a492e15d11d20efbe4ba18d035dc792879"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "one-sat-under",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "output",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002792879dc35d018bae4fb0ed2115de192a45774b40bb90897f1d5a23a88713b2c010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e7030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 999
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "2c3b71883aa2d5f19708b90bb47457a492e15d11d20efbe4ba18d035dc792879"
+        },
+        "txid": "2c3b71883aa2d5f19708b90bb47457a492e15d11d20efbe4ba18d035dc792879"
+      }
+    },
+    {
+      "crate_result": "Ok(1001)",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "Output 0 pays the derived key one satoshi above the price; overpayment is accepted and the paid amount reported.",
+      "expected": {
+        "fields": {
+          "satoshis": 1001
+        },
+        "word": "Verified"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": {
+          "answer": "root",
+          "height": 850000,
+          "merkle_root": "1147be4062eb269b25c17911de5788018835ce6b9c390005a31a91988156c56b"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "one-sat-over",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "output",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c00010100026bc5568198911aa30500399c6bce3588018857de1179c1259b26eb6240be4711010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e9030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1001
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "1147be4062eb269b25c17911de5788018835ce6b9c390005a31a91988156c56b"
+        },
+        "txid": "1147be4062eb269b25c17911de5788018835ce6b9c390005a31a91988156c56b"
+      }
+    },
+    {
+      "crate_result": "Err(Underpaid { satoshis: 0, required: 1000 })",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "Output 0 carries the derived key's script but zero satoshis.",
+      "expected": {
+        "fields": {
+          "paid": 0,
+          "required": 1000
+        },
+        "word": "Underpaid"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": {
+          "answer": "root",
+          "height": 850000,
+          "merkle_root": "25282f6b89d124a5b152a4fa2690808c5b8eac7e48ef8293ce40ebe077d63b59"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "zero-sat-output",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "output",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002593bd677e0eb40ce9382ef487eac8e5b8c809026faa452b1a524d1896b2f2825010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff0100000000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 0
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "25282f6b89d124a5b152a4fa2690808c5b8eac7e48ef8293ce40ebe077d63b59"
+        },
+        "txid": "25282f6b89d124a5b152a4fa2690808c5b8eac7e48ef8293ce40ebe077d63b59"
+      }
+    },
+    {
+      "crate_result": "Err(WrongScript { expected: \"76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac\", actual: \"76a914348f4a6248ad931e86820924f020a95b4305ce4688ac\" })",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "Output 0 pays the key a DIFFERENT server would derive for the same sender, prefix and suffix (one payment replayed across servers).",
+      "expected": {
+        "fields": {
+          "actual_script": "76a914348f4a6248ad931e86820924f020a95b4305ce4688ac",
+          "expected_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac"
+        },
+        "word": "WrongScript"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": {
+          "answer": "root",
+          "height": 850000,
+          "merkle_root": "efc21de1113963c4a5b0859d93a7255536996ae2c58076706d7476b2bfbf3b4d"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "wrong-script-another-server",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "output",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c00010100024d3bbfbfb276746d707680c5e26a99365525a7939d85b0a5c4633911e11dc2ef010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff0188130000000000001976a914348f4a6248ad931e86820924f020a95b4305ce4688ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914348f4a6248ad931e86820924f020a95b4305ce4688ac",
+            "satoshis": 5000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "efc21de1113963c4a5b0859d93a7255536996ae2c58076706d7476b2bfbf3b4d"
+        },
+        "txid": "efc21de1113963c4a5b0859d93a7255536996ae2c58076706d7476b2bfbf3b4d"
+      }
+    },
+    {
+      "crate_result": "Err(WrongScript { expected: \"76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac\", actual: \"76a9148e4db2428b7d3da7d7a21d05233cb45e7fb1063688ac\" })",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "Output 0 pays this server's key for an older quote's derivation prefix (a paid transaction replayed against a fresh quote).",
+      "expected": {
+        "fields": {
+          "actual_script": "76a9148e4db2428b7d3da7d7a21d05233cb45e7fb1063688ac",
+          "expected_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac"
+        },
+        "word": "WrongScript"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": {
+          "answer": "root",
+          "height": 850000,
+          "merkle_root": "862ce4c4c96d177e4a194283ae55fcf304cf9f62b069f0d06819363a4bfe470a"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "wrong-script-stale-prefix",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "output",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c00010100020a47fe4b3a361968d0f069b0629fcf04f3fc55ae8342194a7e176dc9c4e42c86010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff0188130000000000001976a9148e4db2428b7d3da7d7a21d05233cb45e7fb1063688ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a9148e4db2428b7d3da7d7a21d05233cb45e7fb1063688ac",
+            "satoshis": 5000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "862ce4c4c96d177e4a194283ae55fcf304cf9f62b069f0d06819363a4bfe470a"
+        },
+        "txid": "862ce4c4c96d177e4a194283ae55fcf304cf9f62b069f0d06819363a4bfe470a"
+      }
+    },
+    {
+      "crate_result": "Err(WrongScript { expected: \"76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac\", actual: \"76a91406afd46bcdfd22ef94ac122aa11f241244a37ecc88ac\" })",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "Output 0 pays the sender's own identity key (P2PKH of sender_identity_key): the client keeps the funds.",
+      "expected": {
+        "fields": {
+          "actual_script": "76a91406afd46bcdfd22ef94ac122aa11f241244a37ecc88ac",
+          "expected_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac"
+        },
+        "word": "WrongScript"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": {
+          "answer": "root",
+          "height": 850000,
+          "merkle_root": "74ba62fe67378e84f6a02b58309b58eaae5d4550e0a750907078d0f44ffc9ec0"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "wrong-script-pays-sender",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "output",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002c09efc4ff4d078709050a7e050455daeea589b30582ba0f6848e3767fe62ba74010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff0188130000000000001976a91406afd46bcdfd22ef94ac122aa11f241244a37ecc88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a91406afd46bcdfd22ef94ac122aa11f241244a37ecc88ac",
+            "satoshis": 5000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "74ba62fe67378e84f6a02b58309b58eaae5d4550e0a750907078d0f44ffc9ec0"
+        },
+        "txid": "74ba62fe67378e84f6a02b58309b58eaae5d4550e0a750907078d0f44ffc9ec0"
+      }
+    },
+    {
+      "crate_result": "Err(Underpaid { satoshis: 999, required: 1000 })",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "Reference rule: the payment is output 0 only. Output 0 pays the derived key one sat under the price, output 1 pays it in full; refused.",
+      "expected": {
+        "fields": {
+          "paid": 999,
+          "required": 1000
+        },
+        "word": "Underpaid"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": {
+          "answer": "root",
+          "height": 850000,
+          "merkle_root": "4bf5e54bf33497610acc69fff139ddd8dd8a31cba8d886e7497255647a29fdce"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "first-output-underpays-second-would-pay",
+      "note": "The express payment middleware internalizes outputIndex 0 only; an implementation must not search later outputs for one that pays.",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "output",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002cefd297a64557249e786d8a8cb318addd8dd39f1ff69cc0a619734f34be5f54b010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff02e7030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ace8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 999
+          },
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "4bf5e54bf33497610acc69fff139ddd8dd8a31cba8d886e7497255647a29fdce"
+        },
+        "txid": "4bf5e54bf33497610acc69fff139ddd8dd8a31cba8d886e7497255647a29fdce"
+      }
+    },
+    {
+      "crate_result": "Err(WrongScript { expected: \"76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac\", actual: \"76a91406afd46bcdfd22ef94ac122aa11f241244a37ecc88ac\" })",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "Reference rule: output 0 is change back to the sender, output 1 pays the derived key in full; refused.",
+      "expected": {
+        "fields": {
+          "actual_script": "76a91406afd46bcdfd22ef94ac122aa11f241244a37ecc88ac",
+          "expected_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac"
+        },
+        "word": "WrongScript"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": {
+          "answer": "root",
+          "height": 850000,
+          "merkle_root": "cc88727c3fd2a7691a85fb1af923ae1f1e176a3cb701bf4309fa9e082b4f502a"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "first-output-is-change-second-would-pay",
+      "note": "Same rule as first-output-underpays-second-would-pay, script side.",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "output",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c00010100022a504f2b089efa0943bf01b73c6a171e1fae23f91afb851a69a7d23f7c7288cc010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff0288130000000000001976a91406afd46bcdfd22ef94ac122aa11f241244a37ecc88ace8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a91406afd46bcdfd22ef94ac122aa11f241244a37ecc88ac",
+            "satoshis": 5000
+          },
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "cc88727c3fd2a7691a85fb1af923ae1f1e176a3cb701bf4309fa9e082b4f502a"
+        },
+        "txid": "cc88727c3fd2a7691a85fb1af923ae1f1e176a3cb701bf4309fa9e082b4f502a"
+      }
+    },
+    {
+      "crate_result": "Ok(1000)",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "The sender identity key is the server's own identity key and output 0 pays the key derived for that (server, server, prefix, suffix) tuple.",
+      "expected": {
+        "fields": {
+          "satoshis": 1000
+        },
+        "word": "Verified"
+      },
+      "expected_locking_script": "76a914897bdd3c3779e4c7f10fc466e9cb26ba0e052f7988ac",
+      "header_service": {
+        "lookup": {
+          "answer": "root",
+          "height": 850000,
+          "merkle_root": "f25456b28066d55560e82faefbe79aa73a033d620dda931fcae9c9b2f82a5c2a"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "pay-yourself-sender-is-server",
+      "note": "The verifier does not refuse sender == server: BRC-42 with the counterparty set to one's own key is well defined, the output pays a key the server can spend, so it is a real payment. Refusing self-payment is a policy above the verifier.",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "output",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c00010100022a5c2af8b2c9e9ca1f93da0d623d033aa79ae7fbae2fe86055d56680b25654f2010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e8030000000000001976a914897bdd3c3779e4c7f10fc466e9cb26ba0e052f7988ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914897bdd3c3779e4c7f10fc466e9cb26ba0e052f7988ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "f25456b28066d55560e82faefbe79aa73a033d620dda931fcae9c9b2f82a5c2a"
+        },
+        "txid": "f25456b28066d55560e82faefbe79aa73a033d620dda931fcae9c9b2f82a5c2a"
+      }
+    },
+    {
+      "crate_result": "Err(NoHeaderService)",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "header_url absent (null).",
+      "expected": {
+        "fields": {},
+        "word": "NoHeaderService"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": null,
+        "url": null
+      },
+      "name": "no-header-service-none",
+      "note": "Fail-closed: a deployment misconfiguration, refused before the script, amount or proof is looked at.",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "config",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002eb67805eb6521bc4b19726582976bc251a8de45fb6c2c0ef8041b77d7c57c9c8010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "txid": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+      }
+    },
+    {
+      "crate_result": "Err(NoHeaderService)",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "header_url is the empty string.",
+      "expected": {
+        "fields": {},
+        "word": "NoHeaderService"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": null,
+        "url": ""
+      },
+      "name": "no-header-service-blank",
+      "note": "Fail-closed: a deployment misconfiguration, refused before the script, amount or proof is looked at.",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "config",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002eb67805eb6521bc4b19726582976bc251a8de45fb6c2c0ef8041b77d7c57c9c8010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "txid": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+      }
+    },
+    {
+      "crate_result": "Err(NoHeaderService)",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "header_url is the reserved .invalid placeholder.",
+      "expected": {
+        "fields": {},
+        "word": "NoHeaderService"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": null,
+        "url": "https://chaintracks.invalid"
+      },
+      "name": "no-header-service-placeholder",
+      "note": "Fail-closed: a deployment misconfiguration, refused before the script, amount or proof is looked at.",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "config",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002eb67805eb6521bc4b19726582976bc251a8de45fb6c2c0ef8041b77d7c57c9c8010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "txid": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+      }
+    },
+    {
+      "crate_result": "Err(NoHeaderService)",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "The placeholder as a trailing-dot FQDN.",
+      "expected": {
+        "fields": {},
+        "word": "NoHeaderService"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": null,
+        "url": "https://chaintracks.invalid."
+      },
+      "name": "no-header-service-trailing-dot",
+      "note": "Fail-closed: a deployment misconfiguration, refused before the script, amount or proof is looked at.",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "config",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002eb67805eb6521bc4b19726582976bc251a8de45fb6c2c0ef8041b77d7c57c9c8010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "txid": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+      }
+    },
+    {
+      "crate_result": "Err(NoHeaderService)",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "The placeholder with a percent-encoded dot (a URL parser would decode it).",
+      "expected": {
+        "fields": {},
+        "word": "NoHeaderService"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": null,
+        "url": "https://chaintracks%2Einvalid"
+      },
+      "name": "no-header-service-percent-encoded",
+      "note": "Fail-closed: a deployment misconfiguration, refused before the script, amount or proof is looked at.",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "config",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002eb67805eb6521bc4b19726582976bc251a8de45fb6c2c0ef8041b77d7c57c9c8010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "txid": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+      }
+    },
+    {
+      "crate_result": "Err(NoHeaderService)",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "A backslash before userinfo: a WHATWG parser reads the host as real.example, a naive split as chaintracks.invalid. Refused rather than guessed.",
+      "expected": {
+        "fields": {},
+        "word": "NoHeaderService"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": null,
+        "url": "https://real.example\\@chaintracks.invalid"
+      },
+      "name": "no-header-service-backslash-userinfo",
+      "note": "Fail-closed: a deployment misconfiguration, refused before the script, amount or proof is looked at.",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "config",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002eb67805eb6521bc4b19726582976bc251a8de45fb6c2c0ef8041b77d7c57c9c8010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "txid": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+      }
+    },
+    {
+      "crate_result": "Ok(1000)",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "The header service answers the proof's merkle root at the proof's height.",
+      "expected": {
+        "fields": {
+          "satoshis": 1000
+        },
+        "word": "Verified"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": {
+          "answer": "root",
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "spv-root-match",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": true,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "spv",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002eb67805eb6521bc4b19726582976bc251a8de45fb6c2c0ef8041b77d7c57c9c8010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "txid": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+      }
+    },
+    {
+      "crate_result": "Ok(1000)",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "The header service answers the proof's root in upper-case hex.",
+      "expected": {
+        "fields": {
+          "satoshis": 1000
+        },
+        "word": "Verified"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": {
+          "answer": "root",
+          "height": 850000,
+          "merkle_root": "C8C9577C7DB74180EFC0C2B65FE48D1A25BC7629582697B1C41B52B65E8067EB"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "spv-root-match-uppercase",
+      "note": "Roots compare case-insensitively.",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": true,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "spv",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002eb67805eb6521bc4b19726582976bc251a8de45fb6c2c0ef8041b77d7c57c9c8010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "txid": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+      }
+    },
+    {
+      "crate_result": "Err(RootMismatch { height: 850000, root: \"c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb\" })",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "The header service answers a DIFFERENT merkle root at the proof's height.",
+      "expected": {
+        "fields": {
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "word": "RootMismatch"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": {
+          "answer": "root",
+          "height": 850000,
+          "merkle_root": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "spv-root-mismatch",
+      "note": "Fail-closed: a mismatch is a fraud signal, not an outage.",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": true,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "spv",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002eb67805eb6521bc4b19726582976bc251a8de45fb6c2c0ef8041b77d7c57c9c8010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "txid": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+      }
+    },
+    {
+      "crate_result": "Ok(1000)",
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "The header service cannot answer (HTTP 503).",
+      "expected": {
+        "word": "Unverifiable",
+        "fields": {
+          "height": 850000
+        }
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": {
+          "answer": "error",
+          "reason": "header service HTTP 503 at height 850000"
+        },
+        "url": "https://headers.example"
+      },
+      "name": "spv-lookup-error",
+      "note": "Fail closed (ruled 2026-10-08): the header service errored at height 850000, so the root was not checked and the payment is refused as Unverifiable; fields.height names the height to re-ask (the first erroring root in height order). crate_result is the 0.3.6 producer's answer: it returned Ok(satoshis) and logged a warning (fail open); 0.3.9 and 0.4.x refuse.",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": true,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "spv",
+      "transaction": {
+        "beef_hex": "0200beef01fe50f80c0001010002eb67805eb6521bc4b19726582976bc251a8de45fb6c2c0ef8041b77d7c57c9c8010100010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": {
+          "height": 850000,
+          "merkle_root": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+        },
+        "txid": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
+      }
+    }
+  ],
+  "derivation": {
+    "brc": "BRC-29 over BRC-42/BRC-43",
+    "key_id": "<derivation_prefix> <derivation_suffix>",
+    "locking_script": "P2PKH: 76a914 <hash160(compressed child pubkey)> 88ac",
+    "protocol_id": [
+      2,
+      "3241645161d8"
+    ],
+    "sender_side": "child public key for (sender_private_key, counterparty = server_identity_key, for_self = false); equal by BRC-42",
+    "server_side": "child public key for (server_private_key, counterparty = sender_identity_key, for_self = true)"
+  },
+  "description": "BRC-29 payment verification before internalize: does output `output_index` of the payment transaction pay the server's BRC-29 derived key at least `required_satoshis`, and does its merkle proof tie to a block header? See conformance/README.md.",
+  "producer": "bsv-middleware-cloudflare 0.3.6 tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)",
+  "schema": "brc29-payment-vectors/1",
+  "words": {
+    "NoHeaderService": "Refuse before any other check: no usable header service is configured (fail-closed misconfiguration).",
+    "RootMismatch": "Refuse: the header at the proof's height carries a different merkle root (fail-closed fraud signal). fields.height, fields.merkle_root (the proof's root).",
+    "Underpaid": "Refuse: the output pays the derived key less than required. fields.paid, fields.required.",
+    "Unverifiable": "Refuse: a merkle root could not be checked (fail-closed): the header service errored at fields.height (the first such height in height order), or the BEEF carries no proof at all (no fields).",
+    "Verified": "Accept. fields.satoshis = the output's satoshis.",
+    "WrongScript": "Refuse: the output's locking script is not the expected one. fields.expected_script, fields.actual_script."
+  },
+  "rulings": [
+    {
+      "date": "2026-10-08",
+      "case": "spv-lookup-error",
+      "word": "Unverifiable",
+      "by": "the owner",
+      "why": "fail closed on a header lookup error (the agents side's epoch Rule 27; the north star's second and fifth tests); the Cloudflare crate fails closed in 0.3.9"
+    }
+  ]
+}
