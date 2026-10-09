@@ -94,6 +94,8 @@ WS Upgrade   → lib.rs (/ws) → BRC-31 auth on upgrade
 - **storage.rs** — D1 CRUD for messages, boxes, permissions, fees, devices.
 - **permissions.rs** — Hierarchical resolution (sender-specific → box-wide → default).
 - **payments.rs** — BSV `internalizeAction` via HTTP to `WALLET_STORAGE_URL`.
+- **handoff.rs**: what follows the door's verdict (0.4.0, NL-4b), behind seams (`PaymentStore`, `FeeWallet`, `FeeLedger`, `RowRefs`): the payment's BEEF stays at rest in R2 (an inline payment is spooled), the recipient's row carries the key, the verdict and the txid and never the BEEF (`payment_at_rest`), the list readers stream it back (`serve_body`), and the fee's internalize runs in the request when the BEEF is at most 1 MiB and is otherwise deferred to `fee_internalize` and drained on the cron (`drain_fees`). An object is deleted only when no stored row and no deferred fee names its key (`reclaim`, NL-4c: the row's `beef_key`, the triggers' `beef_released`, `reclaim_released` on the cron). Nothing here answers a size or a count.
+- **beef_door.rs**: the payment door's reader (0.4.0): a payment's BEEF read as a stream with bsv-rs 0.4.1's `StreamVerifier`, one element in hand, never refused for its size or its counts; the scripts of unproven transactions run (`SpendRefused`) and a transaction with no input is invalid bytes (`NoInputs`), NL-4c; the inline `payment.tx` in one pass, an R2 object in slices with its cursor saved under `door-state/<key>` (503 `ERR_PAYMENT_PENDING`, the same request continues).
 - **fcm.rs** — Google FCM v1 push. Signs RS256 JWT in WASM from the full
   service-account JSON (`FIREBASE_SERVICE_ACCOUNT_JSON` secret), exchanges
   for an access token via `oauth2.googleapis.com`, caches the token in KV.
@@ -134,7 +136,8 @@ documents these as authed; matching the TS and Go reference servers).
 | `GET` | `/api-docs` | Public; OpenAPI 3.0 spec |
 | `GET` | `/` or `/health` | BRC-31 required (parity with TS/Go) |
 | `POST` | `/sendMessage` | Single or multi-recipient; payment optional. Accepts `payment.beefR2Key` (Rust-only) as alt to `payment.tx`. |
-| `POST` | `/listMessages` | Caller owns box |
+| `POST` | `/listMessages` | Caller owns box. A paid row's BEEF is streamed back from R2 into `payment.tx` (up to 2,000,000 bytes); a larger one is listed by `payment.beefR2Key`. |
+| `POST` | `/beef/download-url` | Rust-only. `{messageId}`: a presigned R2 GET of a paid message's BEEF, for its recipient. |
 | `POST` | `/acknowledgeMessage` | Delete by messageId |
 | `POST` | `/permissions/set` | Per-sender or box-wide rule |
 | `GET` | `/permissions/get` | Resolved fee (incl. default) |
@@ -248,6 +251,15 @@ Rust-only extension that routes the BEEF through R2 (presigned direct
 upload, up to 5 TB). Clients that target cross-SDK compatibility either
 stay under 100 MB or feature-detect the endpoint.
 
+**Payment sizes (0.4.0):** no payment is refused for its size or its
+counts, inline or from R2; a refusal names the offset and the kind of the
+bytes that are wrong. An R2 object is verified as a stream and never held
+whole while it is verified; a verification one request does not finish is
+`503 ERR_PAYMENT_PENDING` and the same request continues it. Nothing after
+the verdict refuses the sender: the BEEF stays in R2, the row carries its
+key, and a fee whose internalize does not fit one request (or a wallet
+service that cannot answer) is a row of `fee_internalize`, not an error.
+
 **WebSocket / socket.io:** event names and payload shapes are
 byte-compatible with the TS server's `@bsv/authsocket` surface across
 both transports we expose:
@@ -267,7 +279,7 @@ unchanged. See "WebSocket Surface" above for full detail.
 
 ## D1 Schema
 
-Five tables in `migrations/0001_initial.sql`:
+Five tables in `migrations/0001_initial.sql`, plus `fee_internalize` (`0003`: one row per delivery fee still owed to the wallet service, keyed by the R2 object; the cron drains it) and, in `0004`, `messages.beef_key` (the R2 object a row's payment names) and `beef_released` (keys rows have let go of, by trigger; the cron reclaims):
 - `message_boxes` — one per `(identity_key, type)`
 - `messages` — dedup on `message_id`
 - `message_permissions` — `(recipient, sender, message_box)` unique; `sender IS NULL` = box-wide
@@ -283,7 +295,8 @@ Five tables in `migrations/0001_initial.sql`:
   `migrations/0001_initial.sql`). Fee `-1` = blocked → `ERR_DELIVERY_BLOCKED`.
 - **Payment flow**: fee quote → client builds tx with delivery fee at output 0 and
   per-recipient outputs → `sendMessage` body includes `payment`; `payments.rs` posts
-  `internalizeAction` to `WALLET_STORAGE_URL`; per-recipient outputs merged into stored body.
+  `internalizeAction` to `WALLET_STORAGE_URL` (in the request, or deferred to `fee_internalize`);
+  per-recipient outputs merged into the stored body beside the payment's R2 key, never its BEEF.
 - **Timestamps**: stored as SQLite `datetime('now')` strings; normalized to ISO 8601
   via `storage::to_iso8601` for response parity with the TS server.
 - **FCM**: `send_fcm_notification` is fire-and-forget on successful `/sendMessage` for

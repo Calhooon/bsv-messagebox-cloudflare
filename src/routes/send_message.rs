@@ -198,7 +198,7 @@ pub async fn process_send(
     // -- 3. If payment required: resolve R2-backed BEEF (if applicable),
     //       then hand to `payments::process_payment` which calls BRC-100
     //       `internalizeAction` against `WALLET_STORAGE_URL`. --
-    let (per_recipient_outputs, r2_cleanup_key, resolved_payment) = if requires_payment {
+    let (per_recipient_outputs, r2_key, handed) = if requires_payment {
         match &validated.payment {
             None => {
                 return SendOutcome::PaymentFailed {
@@ -211,16 +211,26 @@ pub async fn process_send(
                 };
             }
             Some(payment) => {
-                let (resolved, cleanup) =
-                    match beef_upload::resolve_r2_backed_payment(payment, sender_key, env).await {
-                        Ok(pair) => pair,
-                        Err((body, status)) => return SendOutcome::PaymentFailed { body, status },
-                    };
+                // The object `payment.beefR2Key` names, when the sender owns
+                // it. It is verified from R2 as a stream and inlined only
+                // after the verdict (0.4.0); a verification one request does
+                // not finish is a 503 the same request continues.
+                let r2_key = match beef_upload::decide_r2_fetch(payment, sender_key) {
+                    Ok(key) => key,
+                    Err((body, status)) => return SendOutcome::PaymentFailed { body, status },
+                };
 
-                match payments::process_payment(&resolved, &fee_map, delivery_fee, sender_key, env)
-                    .await
+                match payments::process_payment(
+                    payment,
+                    r2_key.as_deref(),
+                    &fee_map,
+                    delivery_fee,
+                    sender_key,
+                    env,
+                )
+                .await
                 {
-                    Ok(outputs) => (outputs, cleanup, Some(resolved)),
+                    Ok(settled) => (settled.outputs, r2_key, Some(settled.handed)),
                     Err((body, status)) => return SendOutcome::PaymentFailed { body, status },
                 }
             }
@@ -232,6 +242,8 @@ pub async fn process_send(
     // -- 4. Insert per-recipient rows into D1. Same column shape as the
     //       HTTP path — the parity contract. --
     let mut results = Vec::with_capacity(ctx_map.len());
+    // The rows stored so far whose payment names the bytes at rest.
+    let mut rows_naming = 0usize;
     for (recipient, message_id, _fee, box_id_opt) in &ctx_map {
         // #9: the batched read already fetched the box id; only hit D1 to create the box
         // when it doesn't exist yet (first message to this recipient/box).
@@ -249,32 +261,44 @@ pub async fn process_send(
                 );
                 match r {
                     Ok(id) => id,
-                    Err(e) => return classify_store_error(e),
+                    Err(e) => {
+                        payments::forget_unnamed(
+                            env,
+                            rows_naming,
+                            &handed,
+                            r2_key.as_deref(),
+                            true,
+                        )
+                        .await;
+                        return classify_store_error(e);
+                    }
                 }
             }
         };
 
-        // Stored body shape: {"message": body, "payment": ...} — the
-        // resolved payment (post-R2-inline) is what gets durably stored,
-        // not the R2 reference, since the object is deleted shortly.
-        let per_payment = per_recipient_outputs.get(recipient.as_str());
-        let stored_body = match per_payment {
-            Some(payment_data) => {
-                let mut p = resolved_payment
-                    .clone()
-                    .or_else(|| validated.payment.clone())
-                    .unwrap_or(json!({}));
-                if let Some(obj) = p.as_object_mut() {
-                    obj.insert("outputs".to_string(), payment_data.clone());
-                }
-                json!({ "message": validated.body, "payment": p }).to_string()
-            }
-            None => json!({ "message": validated.body }).to_string(),
-        };
+        // Stored body shape: {"message": body, "payment": ...}. The payment
+        // is the hand-off's (`handoff::payment_at_rest`): the R2 key, the
+        // verdict and the subject's txid, never the BEEF.
+        let paid = handed.as_ref().and_then(|handed| {
+            per_recipient_outputs
+                .get(recipient.as_str())
+                .map(|outputs| (&handed.payment, outputs))
+        });
+        // The object the row's payment names: the row's reference to it
+        // (`beef_key`), released when the row is deleted or retired.
+        let beef_key = paid.and_then(|(payment, _)| payment.get("beefR2Key")?.as_str());
+        let stored_body = crate::handoff::stored_body(&validated.body, paid);
 
         let t_ins_start = Date::now().as_millis();
         let ins = store
-            .insert_message(message_id, box_id, sender_key, recipient, &stored_body)
+            .insert_message(
+                message_id,
+                box_id,
+                sender_key,
+                recipient,
+                &stored_body,
+                beef_key,
+            )
             .await;
         console_log!(
             "TRACE_LAT send.insert_message recipient={} msgId={} ms={} dup={}",
@@ -286,13 +310,18 @@ pub async fn process_send(
         match ins {
             Ok(true) => {}
             Ok(false) => {
+                payments::forget_unnamed(env, rows_naming, &handed, r2_key.as_deref(), true).await;
                 return SendOutcome::DuplicateMessage {
                     recipient: recipient.clone(),
                     message_id: message_id.clone(),
                 };
             }
-            Err(e) => return classify_store_error(e),
+            Err(e) => {
+                payments::forget_unnamed(env, rows_naming, &handed, r2_key.as_deref(), true).await;
+                return classify_store_error(e);
+            }
         }
+        rows_naming += usize::from(beef_key.is_some());
 
         results.push(RecipientResult {
             recipient: recipient.clone(),
@@ -322,11 +351,9 @@ pub async fn process_send(
         }
     }
 
-    // -- 5. Best-effort cleanup of the R2-uploaded BEEF. R2 lifecycle
-    //       rules will sweep any leak. --
-    if let Some(key) = r2_cleanup_key {
-        let _ = beef_upload::delete_beef_from_r2(env, &key).await;
-    }
+    // -- 5. The bytes stay at rest while a row or a deferred fee names them
+    //       (`HandedOff::kept`). An object nothing names goes, best-effort. --
+    payments::forget_unnamed(env, rows_naming, &handed, r2_key.as_deref(), false).await;
 
     SendOutcome::Success { results }
 }

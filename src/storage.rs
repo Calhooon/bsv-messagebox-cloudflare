@@ -19,6 +19,136 @@ use crate::d1::Query;
 /// any backlog, and live ceremony messages arrive via WS push regardless.
 const LIST_MESSAGES_LIMIT: u32 = 100;
 
+/// The statement that stores a recipient's row (`insert_message`). The last
+/// value is the R2 key the row's payment names (`beef_key`, migration 0004),
+/// NULL for a row that carries no payment at rest.
+pub const INSERT_MESSAGE_SQL: &str =
+    "INSERT OR IGNORE INTO messages (message_id, message_box_id, sender, recipient, body, beef_key) \
+     VALUES (?, ?, ?, ?, ?, ?)";
+
+/// The statement that lists a recipient's box (`list_messages`).
+pub const LIST_MESSAGES_SQL: &str =
+    "SELECT message_id AS messageId, body, sender, created_at, updated_at \
+     FROM messages WHERE recipient = ? AND message_box_id = ? \
+     AND acknowledged_at IS NULL \
+     LIMIT ?";
+
+/// The statements of the deferred-fee ledger (`fee_internalize`, migration
+/// 0003; `D1Ledger`). Each is idempotent: a deferral is `INSERT OR IGNORE` on
+/// the object's key, so the same request sent again owes nothing twice.
+pub const DEFER_FEE_SQL: &str =
+    "INSERT OR IGNORE INTO fee_internalize (key, etag, txid, args, named, attempts, next_at) \
+     VALUES (?, ?, ?, ?, ?, ?, ?)";
+pub const DUE_FEES_SQL: &str =
+    "SELECT key, etag, txid, args, named, attempts, next_at FROM fee_internalize \
+     WHERE next_at <= ? ORDER BY next_at LIMIT ?";
+pub const SETTLE_FEE_SQL: &str = "DELETE FROM fee_internalize WHERE key = ?";
+pub const PUT_OFF_FEE_SQL: &str =
+    "UPDATE fee_internalize SET attempts = ?, next_at = ?, last_error = ?, \
+     updated_at = datetime('now') WHERE key = ?";
+
+/// The statements of object ownership (migration 0004; `D1Rows`, and
+/// `D1Ledger::owes`). A stored row names its payment's object in `beef_key`;
+/// a retired row (`acknowledged_at` set) no longer does. Each is a seek on an
+/// index: `idx_messages_beef_key`, the ledger's primary key, the queue's.
+pub const ROW_NAMES_KEY_SQL: &str =
+    "SELECT 1 AS named FROM messages WHERE beef_key = ? AND acknowledged_at IS NULL LIMIT 1";
+pub const FEE_OWES_KEY_SQL: &str = "SELECT 1 AS named FROM fee_internalize WHERE key = ? LIMIT 1";
+/// The keys rows have let go of (`beef_released`, filled by the triggers).
+pub const RELEASED_KEYS_SQL: &str = "SELECT key FROM beef_released LIMIT ?";
+pub const FORGET_RELEASED_SQL: &str = "DELETE FROM beef_released WHERE key = ?";
+
+/// What `last_error` keeps of a failure.
+const FEE_ERROR_CHARS: usize = 500;
+
+/// The deferred-fee ledger over D1.
+pub struct D1Ledger<'a> {
+    pub db: &'a D1Database,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeeRow {
+    key: String,
+    etag: String,
+    txid: String,
+    args: String,
+    named: f64,
+    attempts: f64,
+    next_at: f64,
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::handoff::FeeLedger for D1Ledger<'_> {
+    async fn defer(&self, fee: &crate::handoff::DeferredFee) -> Result<(), String> {
+        let q = Query::new(DEFER_FEE_SQL)
+            .bind(fee.key.as_str())
+            .bind(fee.etag.as_str())
+            .bind(fee.txid.as_str())
+            .bind(fee.args.as_str())
+            .bind(i64::from(fee.named))
+            .bind(fee.attempts)
+            .bind(fee.next_at);
+        with_d1_write_retry(|| q.execute(self.db))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn due(&self, now: u64, limit: u32) -> Result<Vec<crate::handoff::DeferredFee>, String> {
+        let q = Query::new(DUE_FEES_SQL).bind(now).bind(limit);
+        let rows: Vec<FeeRow> = with_d1_read_retry(|| q.fetch_all(self.db))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::handoff::DeferredFee {
+                key: row.key,
+                etag: row.etag,
+                txid: row.txid,
+                args: row.args,
+                named: row.named != 0.0,
+                attempts: row.attempts as u32,
+                next_at: row.next_at as u64,
+            })
+            .collect())
+    }
+
+    async fn settle(&self, key: &str) -> Result<(), String> {
+        let q = Query::new(SETTLE_FEE_SQL).bind(key);
+        with_d1_write_retry(|| q.execute(self.db))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn owes(&self, key: &str) -> Result<bool, String> {
+        let q = Query::new(FEE_OWES_KEY_SQL).bind(key);
+        let row: Option<NamedRow> = with_d1_read_retry(|| q.fetch_optional(self.db))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.is_some())
+    }
+
+    async fn put_off(
+        &self,
+        key: &str,
+        attempts: u32,
+        next_at: u64,
+        why: &str,
+    ) -> Result<(), String> {
+        let why: String = why.chars().take(FEE_ERROR_CHARS).collect();
+        let q = Query::new(PUT_OFF_FEE_SQL)
+            .bind(attempts)
+            .bind(next_at)
+            .bind(why)
+            .bind(key);
+        with_d1_write_retry(|| q.execute(self.db))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Attempts (1 initial + retries) for an idempotent D1 read before giving up.
 /// Bounded so a genuinely-down D1 fails fast (≤ ~150ms of added backoff) instead
 /// of hanging the request in an unbounded loop.
@@ -111,6 +241,50 @@ pub struct DeviceDbRow {
 #[derive(Debug, Deserialize)]
 pub struct CountRow {
     pub count: Option<f64>,
+}
+
+/// The stored rows as what names an object at rest (`handoff::RowRefs`), over
+/// D1.
+pub struct D1Rows<'a> {
+    pub db: &'a D1Database,
+}
+
+#[derive(Debug, Deserialize)]
+struct NamedRow {
+    #[allow(dead_code)]
+    named: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyRow {
+    key: String,
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::handoff::RowRefs for D1Rows<'_> {
+    async fn names(&self, key: &str) -> Result<bool, String> {
+        let q = Query::new(ROW_NAMES_KEY_SQL).bind(key);
+        let row: Option<NamedRow> = with_d1_read_retry(|| q.fetch_optional(self.db))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.is_some())
+    }
+
+    async fn released(&self, limit: u32) -> Result<Vec<String>, String> {
+        let q = Query::new(RELEASED_KEYS_SQL).bind(limit);
+        let rows: Vec<KeyRow> = with_d1_read_retry(|| q.fetch_all(self.db))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(|row| row.key).collect())
+    }
+
+    async fn forget(&self, key: &str) -> Result<(), String> {
+        let q = Query::new(FORGET_RELEASED_SQL).bind(key);
+        with_d1_write_retry(|| q.execute(self.db))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// #9: the per-send context resolved in ONE D1 batch round-trip (recipient fee +
@@ -210,6 +384,9 @@ impl<'a> Storage<'a> {
     /// a SUCCESS, not a spurious duplicate. Only a CLEAN first-attempt `0`
     /// (`retried == false`) is a genuine duplicate `messageId`, preserving the
     /// existing duplicate-detection behaviour exactly.
+    ///
+    /// `beef_key` is the R2 key the body's payment names, when it names one:
+    /// the row's reference to the object (migration 0004).
     pub async fn insert_message(
         &self,
         message_id: &str,
@@ -217,18 +394,34 @@ impl<'a> Storage<'a> {
         sender: &str,
         recipient: &str,
         body: &str,
+        beef_key: Option<&str>,
     ) -> worker::Result<bool> {
-        let insert = Query::new(
-            "INSERT OR IGNORE INTO messages (message_id, message_box_id, sender, recipient, body) \
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(message_id)
-        .bind(message_box_id)
-        .bind(sender)
-        .bind(recipient)
-        .bind(body);
+        let insert = Query::new(INSERT_MESSAGE_SQL)
+            .bind(message_id)
+            .bind(message_box_id)
+            .bind(sender)
+            .bind(recipient)
+            .bind(body)
+            .bind(beef_key);
         let (meta, retried) = with_d1_write_retry(|| insert.execute(self.db)).await?;
         Ok(insert_changes_mean_stored(meta.changes, retried))
+    }
+
+    /// The body of one of a recipient's rows, by its message id.
+    pub async fn message_body(
+        &self,
+        recipient: &str,
+        message_id: &str,
+    ) -> worker::Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct Row {
+            body: Option<String>,
+        }
+        let q = Query::new("SELECT body FROM messages WHERE message_id = ? AND recipient = ?")
+            .bind(message_id)
+            .bind(recipient);
+        let row: Option<Row> = with_d1_read_retry(|| q.fetch_optional(self.db)).await?;
+        Ok(row.and_then(|row| row.body))
     }
 
     /// List messages for a recipient in a given message box type.
@@ -262,15 +455,10 @@ impl<'a> Storage<'a> {
         // Same bounded transient-retry as `find_message_box`: this is the second
         // (and only other) D1 touch on the `/listMessages` cold path and is an
         // equally-idempotent read, so a cold-start blip here self-heals in-request.
-        let q = Query::new(
-            "SELECT message_id AS messageId, body, sender, created_at, updated_at \
-             FROM messages WHERE recipient = ? AND message_box_id = ? \
-             AND acknowledged_at IS NULL \
-             LIMIT ?",
-        )
-        .bind(identity_key)
-        .bind(box_id)
-        .bind(LIST_MESSAGES_LIMIT);
+        let q = Query::new(LIST_MESSAGES_SQL)
+            .bind(identity_key)
+            .bind(box_id)
+            .bind(LIST_MESSAGES_LIMIT);
         with_d1_read_retry(|| q.fetch_all(self.db)).await
     }
 
@@ -1330,5 +1518,320 @@ mod iso_tests {
             to_iso8601(Some("2026-04-12X13:23:01")),
             "2026-04-12X13:23:01"
         );
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+
+    // The deferred-fee ledger (NL-4b): the statements `D1Ledger` runs, on a real SQLite with the real
+    // migrations (rusqlite, dev-only), as the acknowledge statements are in
+    // `retention.rs`.
+
+    fn ledger_db() -> rusqlite::Connection {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        for migration in [
+            include_str!("../migrations/0001_initial.sql"),
+            include_str!("../migrations/0002_transcript_retention.sql"),
+            include_str!("../migrations/0003_fee_internalize.sql"),
+        ] {
+            db.execute_batch(migration).unwrap();
+        }
+        db
+    }
+
+    fn defer(db: &rusqlite::Connection, key: &str, next_at: i64) -> usize {
+        db.execute(
+            DEFER_FEE_SQL,
+            rusqlite::params![key, "etag-1", "ab".repeat(32), "{}", 1, 0, next_at],
+        )
+        .unwrap()
+    }
+
+    fn due(db: &rusqlite::Connection, now: i64, limit: i64) -> Vec<(String, i64, i64)> {
+        db.prepare(DUE_FEES_SQL)
+            .unwrap()
+            .query_map(rusqlite::params![now, limit], |row| {
+                Ok((row.get(0)?, row.get(5)?, row.get(6)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_migration_runs_twice_and_the_drain_reads_by_the_index() {
+        let db = ledger_db();
+        db.execute_batch(include_str!("../migrations/0003_fee_internalize.sql"))
+            .unwrap();
+        let plan: String = db
+            .query_row(
+                &format!("EXPLAIN QUERY PLAN {DUE_FEES_SQL}"),
+                rusqlite::params![0, 10],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("idx_fee_internalize_next"), "{plan}");
+    }
+
+    #[test]
+    fn a_fee_is_deferred_once_per_object_and_read_when_it_is_due() {
+        let db = ledger_db();
+        assert_eq!(defer(&db, "02abc/b.beef", 200), 1);
+        assert_eq!(defer(&db, "02abc/a.beef", 100), 1);
+        // The same request sent again owes nothing twice, and does not move
+        // a fee already put off.
+        assert_eq!(defer(&db, "02abc/a.beef", 999), 0);
+
+        assert!(due(&db, 99, 10).is_empty(), "not before next_at");
+        assert_eq!(due(&db, 100, 10), [("02abc/a.beef".to_string(), 0, 100)]);
+        // The longest waiting leads, and the batch is bounded.
+        let both = due(&db, 200, 10);
+        assert_eq!(both[0].0, "02abc/a.beef");
+        assert_eq!(both[1].0, "02abc/b.beef");
+        assert_eq!(due(&db, 200, 1).len(), 1);
+    }
+
+    #[test]
+    fn a_fee_put_off_stays_with_its_attempts_and_a_fee_settled_is_cleared() {
+        let db = ledger_db();
+        defer(&db, "02abc/a.beef", 100);
+        let changed = db
+            .execute(
+                PUT_OFF_FEE_SQL,
+                rusqlite::params![3, 580, "wallet-infra answered 502", "02abc/a.beef"],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert!(due(&db, 579, 10).is_empty());
+        assert_eq!(due(&db, 580, 10), [("02abc/a.beef".to_string(), 3, 580)]);
+        let why: String = db
+            .query_row("SELECT last_error FROM fee_internalize", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(why, "wallet-infra answered 502");
+
+        assert_eq!(
+            db.execute(SETTLE_FEE_SQL, ["02abc/a.beef"]).unwrap(),
+            1,
+            "cleared"
+        );
+        assert!(due(&db, i64::MAX, 10).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::retention::{
+        ack_delete_sql, ack_update_sql, purge_delete_sql, sweep_delete_messages_sql,
+        RetentionConfig,
+    };
+
+    // Object ownership (NL-4c): the statements `D1Rows` and `D1Ledger::owes`
+    // run, and the triggers of migration 0004 under every statement of the
+    // relay that deletes or retires a row, on a real SQLite with the real
+    // migrations (rusqlite, dev-only).
+
+    const KEY: &str = "02abc/a.beef";
+    const ME: &str = "02recipient";
+
+    /// The four migrations, a retained box (1, `low_game_7`) and a plain one
+    /// (2, `inbox`), both the recipient's.
+    fn db() -> rusqlite::Connection {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        for migration in [
+            include_str!("../migrations/0001_initial.sql"),
+            include_str!("../migrations/0002_transcript_retention.sql"),
+            include_str!("../migrations/0003_fee_internalize.sql"),
+            include_str!("../migrations/0004_beef_key.sql"),
+        ] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.execute_batch(
+            "INSERT INTO message_boxes (message_box_id, type, identity_key) VALUES \
+             (1, 'low_game_7', '02recipient'), (2, 'inbox', '02recipient');",
+        )
+        .unwrap();
+        db
+    }
+
+    fn insert(db: &rusqlite::Connection, id: &str, box_id: i64, key: Option<&str>) {
+        let stored = db
+            .execute(
+                INSERT_MESSAGE_SQL,
+                rusqlite::params![id, box_id, "02sender", ME, "{}", key],
+            )
+            .unwrap();
+        assert_eq!(stored, 1);
+    }
+
+    fn names(db: &rusqlite::Connection, key: &str) -> bool {
+        db.prepare(ROW_NAMES_KEY_SQL)
+            .unwrap()
+            .exists([key])
+            .unwrap()
+    }
+
+    /// The released keys, and the queue cleared.
+    fn released(db: &rusqlite::Connection) -> Vec<String> {
+        let keys: Vec<String> = db
+            .prepare(RELEASED_KEYS_SQL)
+            .unwrap()
+            .query_map([100], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for key in &keys {
+            assert_eq!(db.execute(FORGET_RELEASED_SQL, [key]).unwrap(), 1);
+        }
+        keys
+    }
+
+    fn plan(db: &rusqlite::Connection, sql: &str, binds: &[&dyn rusqlite::ToSql]) -> String {
+        db.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(binds, |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+    }
+
+    #[test]
+    fn who_names_a_key_is_a_seek_and_never_a_scan() {
+        let db = db();
+        let named = plan(&db, ROW_NAMES_KEY_SQL, &[&KEY]);
+        assert!(named.contains("idx_messages_beef_key"), "{named}");
+        assert!(!named.contains("SCAN"), "{named}");
+        let owed = plan(&db, FEE_OWES_KEY_SQL, &[&KEY]);
+        assert!(owed.contains("SEARCH") && !owed.contains("SCAN"), "{owed}");
+    }
+
+    #[test]
+    fn a_row_names_its_object_until_it_is_deleted_or_retired() {
+        let db = db();
+        assert!(!names(&db, KEY));
+        // A row with no payment at rest names nothing.
+        insert(&db, "unpaid", 2, None);
+        assert!(!names(&db, KEY));
+        insert(&db, "m-1", 2, Some(KEY));
+        insert(&db, "m-2", 1, Some(KEY));
+        assert!(names(&db, KEY));
+        assert!(!names(&db, "02abc/another.beef"));
+        // One of two rows goes: the other still names the object.
+        db.execute("DELETE FROM messages WHERE message_id = 'm-1'", [])
+            .unwrap();
+        assert!(names(&db, KEY));
+        // The other is retired: the row stays and names nothing.
+        db.execute(
+            "UPDATE messages SET acknowledged_at = datetime('now') WHERE message_id = 'm-2'",
+            [],
+        )
+        .unwrap();
+        assert!(!names(&db, KEY));
+        let rows: i64 = db
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            rows, 2,
+            "the retired row and the unpaid one are still stored"
+        );
+    }
+
+    #[test]
+    fn every_statement_that_deletes_or_retires_a_row_releases_its_key() {
+        let db = db();
+        let retention = RetentionConfig::parse(Some("low_game_"));
+        let patterns = retention.like_patterns();
+        let pattern = patterns[0].as_str();
+
+        // Nothing is released by storing a row, paid or not.
+        insert(&db, "unpaid", 2, None);
+        insert(&db, "m-ack", 2, Some("k/ack"));
+        assert!(released(&db).is_empty());
+
+        // The consumer's acknowledge, retention off: the legacy delete.
+        let n = db
+            .execute(&ack_delete_sql(2, 0), [ME, "m-ack", "unpaid"])
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(released(&db), ["k/ack"], "and nothing for the unpaid row");
+
+        // The acknowledge with retention on: a plain box's row is deleted, a
+        // retained box's row is marked. Both release.
+        insert(&db, "m-plain", 2, Some("k/plain"));
+        insert(&db, "m-kept", 1, Some("k/kept"));
+        for sql in [ack_update_sql(2, 1), ack_delete_sql(2, 1)] {
+            db.execute(&sql, [ME, "m-plain", "m-kept", pattern])
+                .unwrap();
+        }
+        let mut both = released(&db);
+        both.sort();
+        assert_eq!(both, ["k/kept", "k/plain"]);
+        // Acknowledging the marked row again changes nothing and releases
+        // nothing.
+        let again = db
+            .execute(&ack_update_sql(1, 1), [ME, "m-kept", pattern])
+            .unwrap();
+        assert_eq!(again, 0);
+        assert!(released(&db).is_empty());
+
+        // A transcript purge deletes the retired row and an unread one: the
+        // unread row's key is released, and the retired row's once more (the
+        // reclaim looks again and finds nothing to do).
+        insert(&db, "m-unread", 1, Some("k/unread"));
+        let purged = db.execute(&purge_delete_sql(), [ME, "low_game_7"]).unwrap();
+        assert_eq!(purged, 2);
+        let mut purged = released(&db);
+        purged.sort();
+        assert_eq!(purged, ["k/kept", "k/unread"]);
+
+        // The TTL sweep over retained boxes.
+        insert(&db, "m-old", 1, Some("k/old"));
+        db.execute(
+            "UPDATE messages SET created_at = datetime('now', '-30 days') WHERE message_id = 'm-old'",
+            [],
+        )
+        .unwrap();
+        let swept = db
+            .execute(&sweep_delete_messages_sql(1), ["-14 days", pattern])
+            .unwrap();
+        assert_eq!(swept, 1);
+        assert_eq!(released(&db), ["k/old"]);
+
+        // A box deleted from under its rows (the cascade), and an operator's
+        // own DELETE.
+        insert(&db, "m-box", 1, Some("k/box"));
+        insert(&db, "m-op", 2, Some("k/op"));
+        db.execute("DELETE FROM message_boxes WHERE message_box_id = 1", [])
+            .unwrap();
+        assert_eq!(released(&db), ["k/box"]);
+        db.execute("DELETE FROM messages WHERE message_id = 'm-op'", [])
+            .unwrap();
+        assert_eq!(released(&db), ["k/op"]);
+
+        // Two rows of one object released together are one entry.
+        insert(&db, "m-a", 2, Some(KEY));
+        insert(&db, "m-b", 2, Some(KEY));
+        db.execute("DELETE FROM messages WHERE beef_key = ?", [KEY])
+            .unwrap();
+        assert_eq!(released(&db), [KEY]);
+    }
+
+    #[test]
+    fn a_deferred_fee_names_its_object_until_it_is_settled() {
+        let db = db();
+        let owes = |key: &str| db.prepare(FEE_OWES_KEY_SQL).unwrap().exists([key]).unwrap();
+        assert!(!owes(KEY));
+        db.execute(
+            DEFER_FEE_SQL,
+            rusqlite::params![KEY, "etag-1", "ab".repeat(32), "{}", 0, 0, 100],
+        )
+        .unwrap();
+        assert!(owes(KEY));
+        assert!(!owes("02abc/another.beef"));
+        db.execute(SETTLE_FEE_SQL, [KEY]).unwrap();
+        assert!(!owes(KEY));
     }
 }

@@ -13,14 +13,18 @@
 //!   2. Server returns `{ url, key, expiresAt }`.
 //!   3. Client PUTs BEEF bytes to `url` (direct to R2, up to 5 TB).
 //!   4. Client POSTs `/sendMessage` with `payment.beefR2Key = key`.
-//!   5. Server fetches from R2, internalizes, deletes the object.
+//!   5. Server verifies the object as a stream from R2, internalizes,
+//!      deletes the object.
 //!
-//! Step 5 lives in `payments.rs`; this module covers steps 1–2 AND the
-//! later fetch/resolve/cleanup helpers used when a `sendMessage` body
-//! references an R2-backed BEEF.
+//! Step 5 lives in `payments.rs` and `beef_door.rs` (0.4.0: the object is
+//! never refused for its size and never held whole while it is verified; a
+//! verification one request cannot finish saves its cursor beside the object
+//! and the same request again continues). This module covers steps 1–2 AND
+//! the R2 side of step 5: the door's store, the spool and the cleanup.
 
+use crate::beef_door::{BeefStore, Chunks, Stamp};
+use crate::handoff::PaymentStore;
 use crate::r2_presign::{presign_r2_put, PresignInput};
-use base64::{engine::general_purpose::STANDARD as B64_STANDARD, Engine as _};
 use serde_json::{json, Value};
 use worker::Env;
 
@@ -127,58 +131,205 @@ pub fn build_upload_response(
     })
 }
 
-/// Fetch an R2 object's bytes by key, using the wrangler R2 binding.
-///
-/// Returns the raw bytes if the object exists and is within the payment
-/// bound. An object above `payments::MAX_PAYMENT_BODY_BYTES` is refused 413
-/// from its size, before its body is read (P0-5b); any other failure is an
-/// `ERR_BEEF_KEY_NOT_FOUND` 400.
-pub async fn fetch_beef_from_r2(env: &Env, key: &str) -> Result<Vec<u8>, (Value, u16)> {
-    let not_found = |e: String| {
-        (
-            json!({
-                "status": "error",
-                "code": "ERR_BEEF_KEY_NOT_FOUND",
-                "description": format!("Could not fetch BEEF from R2: {}", e),
-            }),
-            400,
-        )
-    };
-    let bucket = env
-        .bucket(R2_BINDING)
-        .map_err(|e| not_found(format!("R2 binding {}: {}", R2_BINDING, e)))?;
-    let object = bucket
-        .get(key)
-        .execute()
-        .await
-        .map_err(|e| not_found(format!("R2 get: {}", e)))?
-        .ok_or_else(|| not_found("R2 object not found".to_string()))?;
-    if let Some(refusal) = crate::payments::payment_size_refusal(object.size()) {
-        return Err(refusal);
-    }
-    let body = object
-        .body()
-        .ok_or_else(|| not_found("R2 object body missing".to_string()))?;
-    body.bytes()
-        .await
-        .map_err(|e| not_found(format!("R2 body read: {}", e)))
+/// The `BEEF_BLOBS` bucket as the door's store (`beef_door::BeefStore`): an
+/// uploaded BEEF read as a stream from an offset, and the door's state beside
+/// it under `beef_door::state_key`.
+pub struct R2Store<'a> {
+    env: &'a Env,
 }
 
-/// Delete an R2 object. Best-effort: failures are logged but do not fail
-/// the caller (the upload URL will expire on its own).
-pub async fn delete_beef_from_r2(env: &Env, key: &str) -> Result<(), String> {
-    let bucket = env
-        .bucket(R2_BINDING)
-        .map_err(|e| format!("R2 binding: {}", e))?;
-    bucket
-        .delete(key)
-        .await
-        .map_err(|e| format!("R2 delete: {}", e))
+impl<'a> R2Store<'a> {
+    pub fn new(env: &'a Env) -> Self {
+        Self { env }
+    }
+
+    fn bucket(&self) -> Result<worker::Bucket, String> {
+        self.env
+            .bucket(R2_BINDING)
+            .map_err(|e| format!("R2 binding {}: {}", R2_BINDING, e))
+    }
+}
+
+/// An R2 object's body, a chunk at a time as R2 hands them, and the bytes
+/// still due. `worker::ByteStream` ends quietly on an aborted read; a body
+/// that ends short of the object's size is the store's failure here, never
+/// the end of the BEEF.
+struct R2Chunks {
+    stream: Option<std::pin::Pin<Box<worker::ByteStream>>>,
+    due: u64,
+}
+
+#[async_trait::async_trait(?Send)]
+impl Chunks for R2Chunks {
+    async fn next(&mut self) -> Result<Option<Vec<u8>>, String> {
+        use futures_util::StreamExt as _;
+        let chunk = match self.stream.as_mut() {
+            None => None,
+            Some(stream) => stream
+                .next()
+                .await
+                .transpose()
+                .map_err(|e| format!("R2 body read: {}", e))?,
+        };
+        match &chunk {
+            Some(chunk) => self.due = self.due.saturating_sub(chunk.len() as u64),
+            None if self.due > 0 => {
+                return Err(format!("R2 body ended {} bytes short", self.due));
+            }
+            None => {}
+        }
+        Ok(chunk)
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl BeefStore for R2Store<'_> {
+    async fn stamp(&self, key: &str) -> Result<Option<Stamp>, String> {
+        let object = self
+            .bucket()?
+            .head(key)
+            .await
+            .map_err(|e| format!("R2 head: {}", e))?;
+        Ok(object.map(|o| Stamp {
+            size: o.size(),
+            etag: o.etag(),
+        }))
+    }
+
+    async fn open(&self, key: &str, from: u64, stamp: &Stamp) -> Result<Box<dyn Chunks>, String> {
+        // A range that starts at the object's end has no bytes, and R2 has
+        // no such range.
+        if from >= stamp.size {
+            return Ok(Box::new(R2Chunks {
+                stream: None,
+                due: 0,
+            }));
+        }
+        let object = self
+            .bucket()?
+            .get(key)
+            .range(worker::Range::OffsetToEnd { offset: from })
+            .execute()
+            .await
+            .map_err(|e| format!("R2 get: {}", e))?
+            .ok_or("R2 object not found")?;
+        if object.etag() != stamp.etag {
+            return Err("the R2 object changed while it was read".to_string());
+        }
+        let stream = object
+            .body()
+            .ok_or("R2 object body missing")?
+            .stream()
+            .map_err(|e| format!("R2 body: {}", e))?;
+        Ok(Box::new(R2Chunks {
+            stream: Some(Box::pin(stream)),
+            due: stamp.size - from,
+        }))
+    }
+
+    async fn load(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        let object = self
+            .bucket()?
+            .get(key)
+            .execute()
+            .await
+            .map_err(|e| format!("R2 get: {}", e))?;
+        match object.as_ref().and_then(|o| o.body()) {
+            None => Ok(None),
+            Some(body) => body
+                .bytes()
+                .await
+                .map(Some)
+                .map_err(|e| format!("R2 body read: {}", e)),
+        }
+    }
+
+    async fn save(&self, key: &str, state: Vec<u8>) -> Result<(), String> {
+        self.bucket()?
+            .put(key, state)
+            .execute()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("R2 put: {}", e))
+    }
+
+    async fn clear(&self, key: &str) -> Result<(), String> {
+        self.bucket()?
+            .delete(key)
+            .await
+            .map_err(|e| format!("R2 delete: {}", e))
+    }
+}
+
+/// The size of one part of a spooled payment. R2 takes the parts of a
+/// multipart upload in one size, the last one aside, of 5 MiB or more; a
+/// payment of one part or less is one `put`. A part is what the spool holds
+/// at a time, never the payment.
+const SPOOL_PART_BYTES: usize = 8 * 1024 * 1024;
+
+#[async_trait::async_trait(?Send)]
+impl PaymentStore for R2Store<'_> {
+    async fn spool(&self, key: &str, chunks: &mut dyn Chunks, size: u64) -> Result<Stamp, String> {
+        let bucket = self.bucket()?;
+        let stamp = |object: worker::Object| Stamp {
+            size: object.size(),
+            etag: object.etag(),
+        };
+        let mut part = Vec::with_capacity(SPOOL_PART_BYTES.min(size as usize));
+        if size as usize <= SPOOL_PART_BYTES {
+            while let Some(chunk) = chunks.next().await? {
+                part.extend_from_slice(&chunk);
+            }
+            return bucket
+                .put(key, part)
+                .execute()
+                .await
+                .map_err(|e| format!("R2 put: {}", e))?
+                .map(stamp)
+                .ok_or_else(|| "R2 put: no object".to_string());
+        }
+        let upload = bucket
+            .create_multipart_upload(key)
+            .execute()
+            .await
+            .map_err(|e| format!("R2 multipart: {}", e))?;
+        let mut parts = Vec::new();
+        let mut ended = false;
+        while !ended {
+            match chunks.next().await {
+                Ok(Some(chunk)) => part.extend_from_slice(&chunk),
+                Ok(None) => ended = true,
+                Err(e) => {
+                    let _ = upload.abort().await;
+                    return Err(e);
+                }
+            }
+            while part.len() >= SPOOL_PART_BYTES || (ended && !part.is_empty()) {
+                let rest = part.split_off(SPOOL_PART_BYTES.min(part.len()));
+                let number = parts.len() as u16 + 1;
+                match upload
+                    .upload_part(number, std::mem::replace(&mut part, rest))
+                    .await
+                {
+                    Ok(uploaded) => parts.push(uploaded),
+                    Err(e) => {
+                        let _ = upload.abort().await;
+                        return Err(format!("R2 part {}: {}", number, e));
+                    }
+                }
+            }
+        }
+        upload
+            .complete(parts)
+            .await
+            .map(stamp)
+            .map_err(|e| format!("R2 multipart complete: {}", e))
+    }
 }
 
 /// Decide whether a payment references an R2-backed BEEF, and if so,
 /// validate ownership and return the key to fetch. This is the pure-logic
-/// portion of `resolve_r2_backed_payment` — no Env required, so it's fully
+/// portion of resolving an R2-backed payment: no Env required, so it's fully
 /// unit-testable.
 ///
 /// Returns:
@@ -213,40 +364,90 @@ pub fn decide_r2_fetch(
     Ok(Some(key))
 }
 
-/// Rewrite a payment JSON value to inline `tx: { beef: <base64> }` and
-/// strip `beefR2Key`. Pure function — separated so unit tests can exercise
-/// the rewriting independently of the R2 fetch.
-pub fn inline_beef_into_payment(payment: &Value, beef_bytes: &[u8]) -> Value {
-    let mut rewritten = payment.clone();
-    let beef_b64 = B64_STANDARD.encode(beef_bytes);
-    if let Some(obj) = rewritten.as_object_mut() {
-        obj.insert("tx".to_string(), json!({ "beef": beef_b64 }));
-        obj.remove("beefR2Key");
-    }
-    rewritten
+/// The answer of `/beef/download-url` for a row's body: a presigned GET of
+/// the object the row's payment names, with what the row says of it. `None`
+/// when the row names no bytes at rest.
+pub fn build_download_response(cfg: &UploadConfig, row_body: &str, now_secs: u64) -> Option<Value> {
+    let row: Value = serde_json::from_str(row_body).ok()?;
+    let payment = row.get("payment")?;
+    let (key, stamp, _) = crate::handoff::rest_of(payment)?;
+    let presigned = crate::r2_presign::presign_r2_get(&PresignInput {
+        access_key_id: &cfg.access_key_id,
+        secret_access_key: &cfg.secret_access_key,
+        account_id: &cfg.account_id,
+        bucket: &cfg.bucket,
+        key,
+        amz_date: &format_amz_date(now_secs),
+        expires_secs: URL_EXPIRES_SECS,
+    });
+    Some(json!({
+        "status": "success",
+        "url": presigned.url,
+        "key": presigned.key,
+        "size": stamp.size,
+        "etag": stamp.etag,
+        "txid": payment.get("txid"),
+        "verdict": payment.get("verdict"),
+        "expiresAt": now_secs + URL_EXPIRES_SECS as u64,
+    }))
 }
 
-/// Inspect a `payment` JSON value for a `beefR2Key`. If present, validate
-/// ownership against `identity_key`, fetch the object from R2, and return a
-/// rewritten payment with `tx.beef` populated from the fetched bytes. The
-/// second return value is the R2 key the caller should delete on success.
-///
-/// Returns Ok((payment, None)) if the payment is inline (no beefR2Key) —
-/// caller should use `payment` unchanged and skip cleanup.
-pub async fn resolve_r2_backed_payment(
-    payment: &Value,
+/// Handle a POST /beef/download-url request, body `{"messageId": ".."}`: the
+/// recipient of a paid message is handed a presigned R2 GET URL for the
+/// payment's BEEF, which it reads from the bucket as a stream. Only the
+/// row's recipient is answered; the key is never taken from the request.
+pub async fn handle_download_url(
+    raw_body: &[u8],
     identity_key: &str,
     env: &Env,
-) -> Result<(Value, Option<String>), (Value, u16)> {
-    let key = match decide_r2_fetch(payment, identity_key)? {
-        Some(k) => k,
-        None => return Ok((payment.clone(), None)),
+    store: &crate::storage::Storage<'_>,
+) -> (Value, u16) {
+    let error = |status: u16, code: &str, description: &str| {
+        (
+            json!({ "status": "error", "code": code, "description": description }),
+            status,
+        )
     };
-
-    let bytes = fetch_beef_from_r2(env, &key).await?;
-
-    let rewritten = inline_beef_into_payment(payment, &bytes);
-    Ok((rewritten, Some(key)))
+    let message_id = serde_json::from_slice::<Value>(raw_body)
+        .ok()
+        .and_then(|body| body.get("messageId")?.as_str().map(String::from))
+        .filter(|id| !id.is_empty());
+    let Some(message_id) = message_id else {
+        return error(
+            400,
+            "ERR_MESSAGE_ID_REQUIRED",
+            "Please provide the messageId of a paid message.",
+        );
+    };
+    let row = match store.message_body(identity_key, &message_id).await {
+        Ok(row) => row,
+        Err(e) => {
+            return error(
+                503,
+                "ERR_D1_UNAVAILABLE",
+                &format!("The relay is momentarily unavailable; please retry: {}", e),
+            )
+        }
+    };
+    let cfg = match load_upload_config(env) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return error(
+                500,
+                "ERR_SERVER_MISCONFIGURED",
+                &format!("R2 upload config missing: {}", e),
+            )
+        }
+    };
+    let now = (js_sys::Date::now() / 1000.0) as u64;
+    match row.and_then(|body| build_download_response(&cfg, &body, now)) {
+        Some(body) => (body, 200),
+        None => error(
+            404,
+            "ERR_BEEF_KEY_NOT_FOUND",
+            "No message of yours with that messageId carries a payment at rest.",
+        ),
+    }
 }
 
 /// Handle a POST /beef/upload-url request.
@@ -351,6 +552,44 @@ mod tests {
         assert_eq!(body_a["key"], body_b["key"]);
     }
 
+    #[test]
+    fn a_download_url_is_for_the_object_the_row_names_and_no_other() {
+        let stamp = Stamp {
+            size: 6_100_113,
+            etag: "e1".into(),
+        };
+        let payment = crate::handoff::payment_at_rest(
+            &json!({}),
+            "02abc/u.beef",
+            &stamp,
+            crate::handoff::TxShape::Base64,
+            Some("aa"),
+        );
+        let row = crate::handoff::stored_body(&json!("m"), Some((&payment, &json!([]))));
+        let body = build_download_response(&test_cfg(), &row, 1_776_772_800).unwrap();
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["key"], "02abc/u.beef");
+        assert_eq!(body["size"], 6_100_113);
+        assert_eq!(body["txid"], "aa");
+        assert_eq!(body["verdict"], "verified");
+        assert_eq!(body["expiresAt"], 1_776_773_400u64);
+        let url = body["url"].as_str().unwrap();
+        assert!(url.starts_with("https://abc123.r2.cloudflarestorage.com/beef-blobs/02abc/u.beef?"));
+        // A row with no payment, a payment with no bytes at rest, and a
+        // message that only speaks of a key name nothing.
+        for row in [
+            r#"{"message":"m"}"#,
+            r#"{"message":"m","payment":{"tx":"00"}}"#,
+            r#"{"message":{"payment":{"beefR2Key":"02abc/u.beef"}}}"#,
+            "not json",
+        ] {
+            assert!(
+                build_download_response(&test_cfg(), row, 0).is_none(),
+                "{row}"
+            );
+        }
+    }
+
     // -- decide_r2_fetch --
 
     #[test]
@@ -388,43 +627,5 @@ mod tests {
         let payment = json!({ "beefR2Key": "02abcde/upload-id.beef" });
         let err = decide_r2_fetch(&payment, "02a").expect_err("must be forbidden");
         assert_eq!(err.0["code"], "ERR_BEEF_KEY_FORBIDDEN");
-    }
-
-    // -- inline_beef_into_payment --
-
-    #[test]
-    fn inline_beef_replaces_tx_and_drops_key() {
-        let payment = json!({
-            "beefR2Key": "02abc/u.beef",
-            "outputs": [{"outputIndex": 0}],
-            "description": "test"
-        });
-        let bytes = b"raw BEEF bytes here";
-        let out = inline_beef_into_payment(&payment, bytes);
-
-        // beefR2Key stripped, outputs/description preserved, tx.beef populated.
-        assert!(out.get("beefR2Key").is_none());
-        assert_eq!(out["description"], "test");
-        assert!(out["outputs"].is_array());
-        let beef = out["tx"]["beef"].as_str().expect("beef string");
-        assert_eq!(
-            beef,
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        );
-    }
-
-    #[test]
-    fn inline_beef_overwrites_existing_inline_tx() {
-        // If the caller mistakenly included both an inline tx and a
-        // beefR2Key, the R2 fetch wins.
-        let payment = json!({
-            "beefR2Key": "02abc/u.beef",
-            "tx": { "beef": "old-stale-inline" }
-        });
-        let out = inline_beef_into_payment(&payment, b"new");
-        assert_eq!(
-            out["tx"]["beef"].as_str().unwrap(),
-            base64::engine::general_purpose::STANDARD.encode(b"new")
-        );
     }
 }

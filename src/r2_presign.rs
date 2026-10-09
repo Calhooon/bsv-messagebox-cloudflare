@@ -62,6 +62,16 @@ pub struct PresignedUpload {
 
 /// Presign a PUT URL for Cloudflare R2.
 pub fn presign_r2_put(input: &PresignInput) -> PresignedUpload {
+    presign_r2("PUT", input)
+}
+
+/// Presign a GET URL for Cloudflare R2: the holder reads the object straight
+/// from the bucket, a stream of any size with no Worker in its path.
+pub fn presign_r2_get(input: &PresignInput) -> PresignedUpload {
+    presign_r2("GET", input)
+}
+
+fn presign_r2(method: &str, input: &PresignInput) -> PresignedUpload {
     let host = format!("{}.r2.cloudflarestorage.com", input.account_id);
     let canonical_key = normalize_key(input.key);
     let canonical_path = format!("/{}/{}", input.bucket, encode_key_path(&canonical_key));
@@ -96,8 +106,8 @@ pub fn presign_r2_put(input: &PresignInput) -> PresignedUpload {
     let payload_hash = "UNSIGNED-PAYLOAD";
 
     let canonical_request = format!(
-        "PUT\n{}\n{}\n{}\n{}\n{}",
-        canonical_path, canonical_query, canonical_headers, signed_headers, payload_hash
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method, canonical_path, canonical_query, canonical_headers, signed_headers, payload_hash
     );
 
     let hashed_canonical = hex::encode(Sha256::digest(canonical_request.as_bytes()));
@@ -278,6 +288,24 @@ mod tests {
         let b = presign_r2_put(&input);
         assert_eq!(a.url, b.url);
         assert_eq!(a.key, b.key);
+    }
+
+    #[test]
+    fn a_get_url_is_the_put_url_with_its_own_signature() {
+        let input = PresignInput {
+            access_key_id: "k",
+            secret_access_key: "s",
+            account_id: "acct",
+            bucket: "b",
+            key: "02abc/u.beef",
+            amz_date: "20260421T120000Z",
+            expires_secs: 600,
+        };
+        let (put, get) = (presign_r2_put(&input), presign_r2_get(&input));
+        let unsigned = |url: &str| url[..url.rfind("X-Amz-Signature=").unwrap()].to_string();
+        assert_eq!(unsigned(&put.url), unsigned(&get.url));
+        assert_ne!(put.url, get.url, "the method is signed");
+        assert_eq!(get.url, presign_r2_get(&input).url);
     }
 
     #[test]

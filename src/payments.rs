@@ -3,67 +3,93 @@
 
 use std::collections::{HashMap, HashSet};
 
-use base64::Engine as _;
 use bsv_middleware_cloudflare::WorkerStorageClient;
 use bsv_middleware_rs::{
-    brc29_locking_script, header_service_url, verify_payment, HeaderLookupError, HeaderService,
-    PaymentToVerify, PaymentVerdict,
+    brc29_locking_script, header_service_url, HeaderLookupError, HeaderService, PaymentVerdict,
 };
 use bsv_rs::primitives::PrivateKey;
 use bsv_rs::wallet::ProtoWallet;
 use serde_json::{json, Value};
 use worker::Env;
 
+use crate::beef_door::{
+    verify_at_rest, verify_inline, AtRest, BeefStore, Carrier, DoorError, DoorVerdict, Pending,
+    Slice, Slices, Terms, ROOT_LOOKUPS_PER_PASS, VERIFY_SLICE_MILLIS,
+};
+
+use crate::handoff::{
+    drain_fees, hand_off, reclaim_released, FeeWallet, HandedOff, Paid, Seams, DRAIN_BATCH,
+    RECLAIM_BATCH,
+};
+
 type RouteResult = (Value, u16);
 
-/// Process payment for sendMessage. Returns per-recipient output mappings.
+/// A payment the route has settled: each paid recipient's outputs, and what
+/// the hand-off made of the payment.
+pub struct Settled {
+    pub outputs: HashMap<String, Value>,
+    pub handed: HandedOff,
+}
+
+/// The door's verdict on a verified payment: what the delivery output pays
+/// and the subject's txid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Judged {
+    pub satoshis: u64,
+    pub txid: String,
+}
+
+/// Process payment for sendMessage. Returns per-recipient output mappings
+/// and the payment as the hand-off left it (`handoff::hand_off`).
 ///
 /// fee_map: Vec of (recipient, messageId, fee) for non-blocked recipients.
 /// delivery_fee: the box's server delivery fee per recipient; output[0] must
 /// carry it once for every entry of `fee_map` (P0-5b) when it is > 0.
-/// A payment transaction above `MAX_PAYMENT_BODY_BYTES` is refused 413
-/// before anything reads it. The delivery output is verified against the
-/// header service the `HEADER_SERVICE` binding or `HEADER_SERVICE_URL` names
-/// (0.3.29, 0.3.30); a deployment that names none refuses every payment that
-/// owes a delivery fee.
+/// r2_key: the object `payment.beefR2Key` names, when it names one the sender
+/// owns (`beef_upload::decide_r2_fetch`); the payment's BEEF is then read
+/// from R2 and `payment.tx` is not looked at.
+///
+/// No payment is refused for its size or its counts (0.4.0): the BEEF is read
+/// as a stream, one element in hand (`beef_door`), and a refusal names the
+/// offset and the kind of the bytes that are wrong. The delivery output is
+/// verified against the header service the `HEADER_SERVICE` binding or
+/// `HEADER_SERVICE_URL` names (0.3.29, 0.3.30); a deployment that names none
+/// refuses every payment that owes a delivery fee. An object at rest that one
+/// request cannot finish reading is answered 503 `ERR_PAYMENT_PENDING` with
+/// its cursor saved; the same request again continues.
 pub async fn process_payment(
     payment: &Value,
+    r2_key: Option<&str>,
     fee_map: &[(String, String, i32)],
     delivery_fee: i32,
     sender_key: &str,
     env: &Env,
-) -> Result<HashMap<String, Value>, RouteResult> {
+) -> Result<Settled, RouteResult> {
     // Validate payment structure
-    let tx = payment.get("tx").ok_or_else(|| {
+    let missing_tx = || {
         err(
             400,
             "ERR_MISSING_PAYMENT_TX",
             "Payment transaction data is required for payable delivery.",
         )
-    })?;
-    check_payment_size(tx)?;
+    };
+    if r2_key.is_none() && payment.get("tx").is_none() {
+        return Err(missing_tx());
+    }
     let outputs = payment
         .get("outputs")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            err(
-                400,
-                "ERR_MISSING_PAYMENT_TX",
-                "Payment transaction data is required for payable delivery.",
-            )
-        })?;
+        .ok_or_else(missing_tx)?;
 
     // Server delivery fee — output[0]
-    if delivery_fee > 0 {
-        if outputs.is_empty() {
-            return Err(err(
+    let judged = if delivery_fee > 0 {
+        let server_output = outputs.first().ok_or_else(|| {
+            err(
                 400,
                 "ERR_MISSING_DELIVERY_OUTPUT",
                 "Delivery fee required but no outputs were provided.",
-            ));
-        }
-
-        let server_output = &outputs[0];
+            )
+        })?;
 
         // P0-3: read the delivery output and compare it with the fee before
         // wallet-infra is asked to record it; wallet-infra checks neither the
@@ -79,56 +105,97 @@ pub async fn process_payment(
                 )
             })?;
         let headers = WorkerHeaderService::from_env(env);
-        check_delivery_output(
-            tx,
-            server_output,
-            delivery_fee_due(delivery_fee, fee_map.len())?,
-            sender_key,
-            &server_wallet,
-            headers.as_ref().map(|h| h as &dyn HeaderService),
-        )
-        .await?;
-
-        // Internalize server delivery output via wallet-infra
-        match internalize_server_fee(tx, server_output, payment, env).await {
-            Ok(accepted) => {
-                if !accepted {
-                    return Err(err(
-                        400,
-                        "ERR_INSUFFICIENT_PAYMENT",
-                        "Payment was not accepted by the server.",
-                    ));
-                }
+        let headers = headers.as_ref().map(|h| h as &dyn HeaderService);
+        let due = delivery_fee_due(delivery_fee, fee_map.len())?;
+        let judged = match r2_key {
+            Some(key) => {
+                let store = crate::beef_upload::R2Store::new(env);
+                let clock = || worker::Date::now().as_millis();
+                let slices = Slices {
+                    time: Slice {
+                        clock: &clock,
+                        millis: VERIFY_SLICE_MILLIS,
+                    },
+                    lookups: ROOT_LOOKUPS_PER_PASS,
+                };
+                judge_delivery_at_rest(
+                    &store,
+                    key,
+                    server_output,
+                    due,
+                    sender_key,
+                    &server_wallet,
+                    headers,
+                    &slices,
+                )
+                .await?
             }
-            Err(e) => {
-                return Err(err(
-                    500,
-                    "ERR_INTERNALIZE_FAILED",
-                    &format!("Failed to internalize payment: {}", e),
-                ));
+            None => {
+                let tx = payment.get("tx").ok_or_else(missing_tx)?;
+                judge_delivery_output(tx, server_output, due, sender_key, &server_wallet, headers)
+                    .await?
             }
-        }
-    }
+        };
+        Some((server_output, judged))
+    } else {
+        None
+    };
 
-    // Per-recipient output routing
+    // Per-recipient output routing, before the hand-off: a payment whose
+    // outputs do not cover its recipients is refused with nothing put at
+    // rest and no fee recorded for a message that is not delivered.
     let fee_recipients: Vec<&str> = fee_map
         .iter()
         .filter(|(_, _, f)| *f > 0)
         .map(|(r, _, _)| r.as_str())
         .collect();
-
-    if fee_recipients.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    // Slice off server delivery output if present
-    let recipient_outputs = if delivery_fee > 0 {
-        &outputs[1..]
+    let routed = if fee_recipients.is_empty() {
+        HashMap::new()
     } else {
-        &outputs[..]
+        // Slice off server delivery output if present
+        let recipient_outputs = if delivery_fee > 0 {
+            &outputs[1..]
+        } else {
+            &outputs[..]
+        };
+        route_outputs_to_recipients(recipient_outputs, &fee_recipients)?
     };
 
-    route_outputs_to_recipients(recipient_outputs, &fee_recipients)
+    // The hand-off (`handoff`). The verdict is in.
+    let blobs = crate::beef_upload::R2Store::new(env);
+    let wallet = WalletInfra { env };
+    let db = env
+        .d1("DB")
+        .map_err(|e| err(503, "ERR_D1_UNAVAILABLE", &format!("D1 binding: {}", e)))?;
+    let ledger = crate::storage::D1Ledger { db: &db };
+    let rows = crate::storage::D1Rows { db: &db };
+    let spool_key = crate::beef_upload::build_upload_key(
+        sender_key,
+        &uuid::Uuid::new_v4().simple().to_string(),
+    );
+    let handed = hand_off(
+        &Seams {
+            blobs: &blobs,
+            wallet: &wallet,
+            ledger: &ledger,
+            rows: &rows,
+        },
+        &Paid {
+            payment,
+            r2_key,
+            spool_key: &spool_key,
+            server_output: judged.as_ref().map(|(output, _)| *output),
+            txid: judged.as_ref().map(|(_, judged)| judged.txid.as_str()),
+            rows: !fee_recipients.is_empty(),
+            now: worker::Date::now().as_millis() / 1000,
+        },
+    )
+    .await?;
+
+    Ok(Settled {
+        outputs: routed,
+        handed,
+    })
 }
 
 /// Route payment outputs to fee-requiring recipients.
@@ -274,51 +341,6 @@ fn delivery_fee_due(delivery_fee: i32, recipients: usize) -> Result<u64, RouteRe
         .ok_or_else(|| err(500, "ERR_INTERNAL", "Invalid aggregate delivery fee."))
 }
 
-/// The largest payment transaction the payment path reads, in bytes: 4 MiB,
-/// the reference message box's request body limit at its default profile
-/// (ts-stack@fb1b2da `infra/message-box-server/src/app.ts:171,195-208`, the
-/// `standard` value; `src/security/edgePolicy.ts:135-156`). Every payment the
-/// reference accepts arrives in a body of at most that size, so its
-/// transaction is no larger: this bound refuses nothing the reference serves.
-/// Above it the payment is refused 413 before it is decoded or parsed.
-pub const MAX_PAYMENT_BODY_BYTES: usize = 4 * 1024 * 1024;
-
-/// The 413 for a payment transaction of `len` bytes above the bound, in the
-/// reference's code (`edgePolicy.ts:613-633`, `ERR_BODY_TOO_LARGE`).
-pub(crate) fn payment_size_refusal(len: u64) -> Option<RouteResult> {
-    (len > MAX_PAYMENT_BODY_BYTES as u64).then(|| {
-        err(
-            413,
-            "ERR_BODY_TOO_LARGE",
-            &format!(
-                "The payment transaction exceeds {} bytes.",
-                MAX_PAYMENT_BODY_BYTES
-            ),
-        )
-    })
-}
-
-/// The bound, read from the length of the encoded transaction before any
-/// decode: a byte array's length, half a hex string's, three quarters of a
-/// base64 string's less its padding. A shape that is none of these is left
-/// to `payment_tx_bytes`, which refuses it.
-fn check_payment_size(tx: &Value) -> Result<(), RouteResult> {
-    let len = match tx {
-        Value::Array(items) => items.len(),
-        Value::String(h) => h.len().div_ceil(2),
-        Value::Object(o) => match o.get("beef").and_then(|b| b.as_str()) {
-            Some(b) => (b.len() / 4 * 3 + b.len() % 4 * 3 / 4)
-                .saturating_sub(b.bytes().rev().take(2).filter(|c| *c == b'=').count()),
-            None => 0,
-        },
-        _ => 0,
-    };
-    match payment_size_refusal(len as u64) {
-        Some(refusal) => Err(refusal),
-        None => Ok(()),
-    }
-}
-
 /// The server delivery output, read before it is internalized (P0-3), and
 /// the payment's merkle roots checked with the header service (0.3.29).
 ///
@@ -330,6 +352,9 @@ fn check_payment_size(tx: &Value) -> Result<(), RouteResult> {
 /// internalizing (message-box-server sendMessage.ts:693-708, 764-786,
 /// 1054-1067), plus the script, which the reference leaves to its wallet's
 /// signer, and the roots, which it leaves to its wallet's chain tracker.
+///
+/// The BEEF is read as a stream of its elements (0.4.0): of any size and any
+/// counts, and a refusal of its bytes carries their offset and their kind.
 pub async fn check_delivery_output(
     tx: &Value,
     server_output: &Value,
@@ -338,8 +363,30 @@ pub async fn check_delivery_output(
     server_wallet: &ProtoWallet,
     header_service: Option<&dyn HeaderService>,
 ) -> Result<u64, RouteResult> {
-    delivery_answer(
-        delivery_verdict(
+    judge_delivery_output(
+        tx,
+        server_output,
+        delivery_fee,
+        sender_key,
+        server_wallet,
+        header_service,
+    )
+    .await
+    .map(|judged| judged.satoshis)
+}
+
+/// `check_delivery_output`, with the subject's txid beside the satoshis: what
+/// the hand-off keeps of the verdict.
+pub async fn judge_delivery_output(
+    tx: &Value,
+    server_output: &Value,
+    delivery_fee: u64,
+    sender_key: &str,
+    server_wallet: &ProtoWallet,
+    header_service: Option<&dyn HeaderService>,
+) -> Result<Judged, RouteResult> {
+    door_judged(
+        delivery_reading(
             tx,
             server_output,
             delivery_fee,
@@ -352,11 +399,11 @@ pub async fn check_delivery_output(
 }
 
 /// The verdict on the server delivery output, in the six words of
-/// bsv-middleware-rs 0.3.0 (`verify_payment`, the full check: `None` for the
-/// header service is `NoHeaderService`, a lookup that cannot answer is
-/// `Unverifiable`, fail closed). A remittance that is not this sender's
-/// wallet payment, or a transaction that is not bytes, is refused here
-/// before any verdict, as before.
+/// bsv-middleware-rs 0.3.0 (`None` for the header service is
+/// `NoHeaderService`, a lookup that cannot answer is `Unverifiable`, fail
+/// closed). A remittance that is not this sender's wallet payment, or a
+/// transaction that is not bytes, is refused here before any verdict, as
+/// before.
 pub async fn delivery_verdict(
     tx: &Value,
     server_output: &Value,
@@ -365,7 +412,28 @@ pub async fn delivery_verdict(
     server_wallet: &ProtoWallet,
     header_service: Option<&dyn HeaderService>,
 ) -> Result<PaymentVerdict, RouteResult> {
-    let invalid = |description: &str| err(400, "ERR_INVALID_PAYMENT", description);
+    delivery_reading(
+        tx,
+        server_output,
+        delivery_fee,
+        sender_key,
+        server_wallet,
+        header_service,
+    )
+    .await
+    .map(|verdict| verdict.word)
+}
+
+fn invalid(description: &str) -> RouteResult {
+    err(400, "ERR_INVALID_PAYMENT", description)
+}
+
+/// The output the remittance names and the sender's two derivation strings,
+/// or the refusal of a remittance that is not this sender's wallet payment.
+fn delivery_remittance<'a>(
+    server_output: &'a Value,
+    sender_key: &str,
+) -> Result<(u32, &'a str, &'a str), RouteResult> {
     if server_output.get("protocol").and_then(|v| v.as_str()) != Some("wallet payment") {
         return Err(invalid(
             "The server delivery output must be a wallet payment.",
@@ -394,25 +462,186 @@ pub async fn delivery_verdict(
             "The delivery payment remittance is invalid for the authenticated sender.",
         ));
     }
-    let tx_bytes =
-        payment_tx_bytes(tx).ok_or_else(|| invalid("Payment must contain a valid Atomic BEEF."))?;
-    let expected_script =
-        brc29_locking_script(server_wallet, prefix, suffix, sender_key).map_err(|e| {
-            invalid(&format!(
-                "The delivery payment remittance is invalid: {}",
-                e
-            ))
-        })?;
-    Ok(verify_payment(
-        &PaymentToVerify {
-            transaction: &tx_bytes,
-            output_index,
-            expected_script: &expected_script,
-            required_satoshis: delivery_fee,
-        },
+    Ok((output_index, prefix, suffix))
+}
+
+/// The script the delivery output must carry: the server's BRC-29 key for
+/// this remittance.
+fn delivery_script(
+    server_wallet: &ProtoWallet,
+    prefix: &str,
+    suffix: &str,
+    sender_key: &str,
+) -> Result<Vec<u8>, RouteResult> {
+    brc29_locking_script(server_wallet, prefix, suffix, sender_key).map_err(|e| {
+        invalid(&format!(
+            "The delivery payment remittance is invalid: {}",
+            e
+        ))
+    })
+}
+
+/// The door could not answer: the server's side, never a word about the
+/// payment. A source that failed is retried by the same request.
+fn door_error(error: DoorError) -> RouteResult {
+    match error {
+        DoorError::Source(e) => err(
+            503,
+            "ERR_PAYMENT_UNAVAILABLE",
+            &format!("The payment's BEEF could not be read: {}", e),
+        ),
+        DoorError::Internal(e) => err(500, "ERR_INTERNAL", &e),
+    }
+}
+
+/// The inline payment through the door (`beef_door::verify_inline`): the
+/// verdict with the bytes it names, when it names any.
+async fn delivery_reading(
+    tx: &Value,
+    server_output: &Value,
+    delivery_fee: u64,
+    sender_key: &str,
+    server_wallet: &ProtoWallet,
+    header_service: Option<&dyn HeaderService>,
+) -> Result<DoorVerdict, RouteResult> {
+    let (output_index, prefix, suffix) = delivery_remittance(server_output, sender_key)?;
+    let carrier =
+        Carrier::of(tx).ok_or_else(|| invalid("Payment must contain a valid Atomic BEEF."))?;
+    let expected_script = delivery_script(server_wallet, prefix, suffix, sender_key)?;
+    let terms = Terms {
+        output_index,
+        expected_script: &expected_script,
+        required_satoshis: delivery_fee,
+    };
+    verify_inline(&carrier, &terms, header_service)
+        .await
+        .map_err(door_error)
+}
+
+/// The delivery check on a payment whose BEEF is an object at rest
+/// (`payment.beefR2Key`), for one request's slices
+/// (`beef_door::verify_at_rest`): the satoshis paid, a refusal, or 503
+/// `ERR_PAYMENT_PENDING` with how far the reading has come; the same request
+/// again continues from the saved cursor. No object at the key is 400
+/// `ERR_BEEF_KEY_NOT_FOUND`, as before.
+#[allow(clippy::too_many_arguments)]
+pub async fn check_delivery_at_rest(
+    store: &dyn BeefStore,
+    key: &str,
+    server_output: &Value,
+    delivery_fee: u64,
+    sender_key: &str,
+    server_wallet: &ProtoWallet,
+    header_service: Option<&dyn HeaderService>,
+    slices: &Slices<'_>,
+) -> Result<u64, RouteResult> {
+    judge_delivery_at_rest(
+        store,
+        key,
+        server_output,
+        delivery_fee,
+        sender_key,
+        server_wallet,
         header_service,
+        slices,
     )
-    .await)
+    .await
+    .map(|judged| judged.satoshis)
+}
+
+/// `check_delivery_at_rest`, with the subject's txid beside the satoshis.
+#[allow(clippy::too_many_arguments)]
+pub async fn judge_delivery_at_rest(
+    store: &dyn BeefStore,
+    key: &str,
+    server_output: &Value,
+    delivery_fee: u64,
+    sender_key: &str,
+    server_wallet: &ProtoWallet,
+    header_service: Option<&dyn HeaderService>,
+    slices: &Slices<'_>,
+) -> Result<Judged, RouteResult> {
+    let (output_index, prefix, suffix) = delivery_remittance(server_output, sender_key)?;
+    let expected_script = delivery_script(server_wallet, prefix, suffix, sender_key)?;
+    let terms = Terms {
+        output_index,
+        expected_script: &expected_script,
+        required_satoshis: delivery_fee,
+    };
+    match verify_at_rest(store, key, &terms, header_service, slices)
+        .await
+        .map_err(door_error)?
+    {
+        AtRest::Done(verdict) => door_judged(verdict),
+        AtRest::Pending(pending) => Err(pending_answer(&pending)),
+        AtRest::NotFound => Err(err(
+            400,
+            "ERR_BEEF_KEY_NOT_FOUND",
+            "Could not fetch BEEF from R2: R2 object not found",
+        )),
+    }
+}
+
+/// A verification that one request did not finish: 503, so a client that
+/// retries a 503 continues it, with the place the reading has come to.
+fn pending_answer(pending: &Pending) -> RouteResult {
+    let description = if pending.roots > 0 {
+        format!(
+            "The payment's BEEF is read ({} elements, {} bytes); {} of its {} merkle roots are checked. Send the same request again to continue.",
+            pending.elements, pending.size, pending.roots_asked, pending.roots
+        )
+    } else {
+        format!(
+            "The payment's BEEF is being verified: {} elements and {} of {} bytes read. Send the same request again to continue.",
+            pending.elements, pending.offset, pending.size
+        )
+    };
+    (
+        json!({
+            "status": "error",
+            "code": "ERR_PAYMENT_PENDING",
+            "description": description,
+            "elements": pending.elements,
+            "offset": pending.offset,
+            "size": pending.size,
+            "rootsChecked": pending.roots_asked,
+            "roots": pending.roots,
+        }),
+        503,
+    )
+}
+
+/// The door's verdict to the route's answer: `delivery_answer` on the word,
+/// and a refusal of the bytes carries the offset and the kind it names, in
+/// the text and as fields.
+pub fn door_answer(verdict: DoorVerdict) -> Result<u64, RouteResult> {
+    let DoorVerdict { word, named, .. } = verdict;
+    delivery_answer(word).map_err(|(mut body, status)| {
+        if let Some(named) = named {
+            let text = body["description"].as_str().unwrap_or_default();
+            body["description"] = json!(format!(
+                "{} ({} at offset {})",
+                text, named.kind, named.offset
+            ));
+            body["offset"] = json!(named.offset);
+            body["kind"] = json!(named.kind);
+        }
+        (body, status)
+    })
+}
+
+/// `door_answer`, keeping the subject's txid the door names on `Verified`.
+pub fn door_judged(verdict: DoorVerdict) -> Result<Judged, RouteResult> {
+    let txid = verdict.txid();
+    let satoshis = door_answer(verdict)?;
+    let txid = txid.ok_or_else(|| {
+        err(
+            500,
+            "ERR_INTERNAL",
+            "The door verified a payment and named no subject.",
+        )
+    })?;
+    Ok(Judged { satoshis, txid })
 }
 
 /// The six words to the route's answer, in one match with no catch-all arm:
@@ -604,25 +833,6 @@ fn header_root_from_response(body: &str, height: u32) -> Result<String, String> 
         .ok_or_else(|| "response missing merkleRoot".to_string())
 }
 
-/// The payment transaction's bytes, in the shapes this server receives:
-/// a JSON byte array (BRC-100), a hex string (both of which wallet-infra
-/// accepts), or `{ "beef": <base64> }` (an R2 upload inlined by
-/// `beef_upload`). Anything else, or a byte above 255, is `None`.
-fn payment_tx_bytes(tx: &Value) -> Option<Vec<u8>> {
-    match tx {
-        Value::Array(items) => items
-            .iter()
-            .map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()))
-            .collect(),
-        Value::String(h) => hex::decode(h).ok(),
-        Value::Object(o) => o
-            .get("beef")?
-            .as_str()
-            .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok()),
-        _ => None,
-    }
-}
-
 /// The SERVER_PRIVATE_KEY secret, parsed.
 fn server_private_key(env: &Env) -> Result<PrivateKey, String> {
     let server_key = env
@@ -632,13 +842,92 @@ fn server_private_key(env: &Env) -> Result<PrivateKey, String> {
     PrivateKey::from_hex(&server_key).map_err(|e| format!("Invalid key: {}", e))
 }
 
-/// Internalize the server delivery fee via WorkerStorageClient → wallet-infra.
-async fn internalize_server_fee(
-    tx: &Value,
-    server_output: &Value,
-    payment: &Value,
+/// Scheduled (cron) entry: the drain of the deferred fees (`fee_internalize`,
+/// `handoff::drain_fees`). A deployment with no cron never drains; one whose
+/// table is empty reads one indexed row range and returns.
+pub async fn run_fee_drain(env: &Env) {
+    let db = match env.d1("DB") {
+        Ok(db) => db,
+        Err(e) => {
+            worker::console_error!("AUDIT fee.drain D1 binding unavailable: {e}");
+            return;
+        }
+    };
+    let blobs = crate::beef_upload::R2Store::new(env);
+    let wallet = WalletInfra { env };
+    let ledger = crate::storage::D1Ledger { db: &db };
+    let rows = crate::storage::D1Rows { db: &db };
+    let seams = Seams {
+        blobs: &blobs,
+        wallet: &wallet,
+        ledger: &ledger,
+        rows: &rows,
+    };
+    let now = worker::Date::now().as_millis() / 1000;
+    match drain_fees(&seams, now, DRAIN_BATCH).await {
+        Ok(drained) if drained == Default::default() => {}
+        Ok(drained) => worker::console_log!(
+            "AUDIT fee.drain settled={} put_off={} held={}",
+            drained.settled,
+            drained.put_off,
+            drained.held
+        ),
+        Err(e) => worker::console_error!("AUDIT fee.drain FAILED: {e}"),
+    }
+    // The objects rows have let go of (`handoff::reclaim_released`): one
+    // indexed read when there are none.
+    match reclaim_released(&seams, RECLAIM_BATCH).await {
+        Ok(reclaimed) if reclaimed == Default::default() => {}
+        Ok(reclaimed) => worker::console_log!(
+            "AUDIT beef.reclaim deleted={} named={} put_off={}",
+            reclaimed.deleted,
+            reclaimed.named,
+            reclaimed.put_off
+        ),
+        Err(e) => worker::console_error!("AUDIT beef.reclaim FAILED: {e}"),
+    }
+}
+
+/// After a send (`handoff::forget_unnamed`), over the Worker's stores:
+/// best-effort, and never an answer to the sender.
+pub async fn forget_unnamed(
     env: &Env,
-) -> Result<bool, String> {
+    rows_naming: usize,
+    handed: &Option<crate::handoff::HandedOff>,
+    r2_key: Option<&str>,
+    failed: bool,
+) {
+    let (Some(handed), Ok(db)) = (handed, env.d1("DB")) else {
+        return;
+    };
+    let blobs = crate::beef_upload::R2Store::new(env);
+    let wallet = WalletInfra { env };
+    let ledger = crate::storage::D1Ledger { db: &db };
+    let rows = crate::storage::D1Rows { db: &db };
+    let seams = Seams {
+        blobs: &blobs,
+        wallet: &wallet,
+        ledger: &ledger,
+        rows: &rows,
+    };
+    crate::handoff::forget_unnamed(&seams, rows_naming, handed, r2_key, failed).await;
+}
+
+/// wallet-infra behind `WALLET_STORAGE_URL`, as the hand-off's `FeeWallet`.
+pub struct WalletInfra<'a> {
+    pub env: &'a Env,
+}
+
+#[async_trait::async_trait(?Send)]
+impl FeeWallet for WalletInfra<'_> {
+    async fn internalize(&self, tx: &Value, args: &Value) -> Result<bool, String> {
+        internalize_server_fee(tx, args, self.env).await
+    }
+}
+
+/// Internalize the server delivery fee via WorkerStorageClient → wallet-infra.
+/// `fee` is `handoff::fee_args`: the output, the description, the labels.
+async fn internalize_server_fee(tx: &Value, fee: &Value, env: &Env) -> Result<bool, String> {
     let private_key = server_private_key(env)?;
     let storage_url = env
         .var("WALLET_STORAGE_URL")
@@ -658,11 +947,9 @@ async fn internalize_server_fee(
     // Build internalization args
     let args = json!({
         "tx": tx,
-        "outputs": [server_output],
-        "description": payment.get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("MessageBox delivery payment"),
-        "labels": payment.get("labels").unwrap_or(&json!([])),
+        "outputs": fee.get("outputs").unwrap_or(&json!([])),
+        "description": fee.get("description").unwrap_or(&json!("MessageBox delivery payment")),
+        "labels": fee.get("labels").unwrap_or(&json!([])),
         "seekPermission": false
     });
     let auth = json!({
@@ -690,6 +977,7 @@ fn err(status: u16, code: &str, description: &str) -> RouteResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use serde_json::json;
 
     const KEY1: &str = "028d37b941208cd6b8a4c28288eda5f2f16c2b3ab0fcb6d13c18b47fe37b971fc1";
@@ -829,13 +1117,22 @@ mod tests {
         p2pkh(&PublicKey::from_hex(&derived.public_key).unwrap().hash160())
     }
 
-    /// The crafted parent every payment here spends.
+    /// The crafted parent every payment here spends. It has one input, naming
+    /// a transaction the BEEF does not carry (its proof vouches for it): a
+    /// transaction with no input is invalid bytes to bsv-rs 0.4.1's reader.
     fn parent() -> Transaction {
         let mut parent = Transaction::new();
         parent
+            .add_input(TransactionInput {
+                source_txid: Some("11".repeat(32)),
+                source_output_index: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        parent
             .add_output(TransactionOutput::new(
                 10_000,
-                LockingScript::from_binary(&p2pkh(&[7u8; 20])).unwrap(),
+                LockingScript::from_binary(&[0x51]).unwrap(),
             ))
             .unwrap();
         parent
@@ -1307,43 +1604,139 @@ mod tests {
         }
     }
 
-    #[test]
-    fn p0_5b_a_payment_one_byte_over_the_bound_is_refused_413_in_every_shape() {
-        let over = MAX_PAYMENT_BODY_BYTES + 1;
-        // Not hex and not base64: the bound is read before any decode.
-        for tx in [
-            json!(vec![0u8; over]),
-            json!("z".repeat(2 * over)),
-            json!({ "beef": "!".repeat(4 * over.div_ceil(3)) }),
-        ] {
+    // ---- NL-4: no door by size or count (0.3.31: 413 ERR_BODY_TOO_LARGE) ----
+
+    const THE_OLD_DOOR: usize = 4 * 1024 * 1024;
+
+    /// A payment over the old door: output 0 as given, and a second output
+    /// of ballast nothing spends.
+    fn over_the_old_door(satoshis: u64) -> Vec<u8> {
+        let bytes = atomic_beef(&[(satoshis, payer_script()), (0, vec![0x6a; THE_OLD_DOOR])]);
+        assert!(bytes.len() > THE_OLD_DOOR);
+        bytes
+    }
+
+    fn shapes(bytes: &[u8]) -> [Value; 3] {
+        [
+            json!(bytes),
+            json!(hex::encode(bytes)),
+            json!({ "beef": base64::engine::general_purpose::STANDARD.encode(bytes) }),
+        ]
+    }
+
+    #[tokio::test]
+    async fn nl4_a_payment_over_the_old_door_is_judged_like_any_other_in_every_shape() {
+        let output = remittance(0, &sender_identity());
+        for tx in shapes(&over_the_old_door(FEE)) {
+            assert_eq!(check(&tx, &output).await, Ok(FEE));
+        }
+        for tx in shapes(&over_the_old_door(FEE - 1)) {
             assert_eq!(
-                refusal_code(check_payment_size(&tx).map(|_| 0)),
-                (413, "ERR_BODY_TOO_LARGE".to_string())
+                refusal_code(check(&tx, &output).await),
+                (400, "ERR_INSUFFICIENT_PAYMENT".to_string())
             );
         }
     }
 
-    #[test]
-    fn p0_5b_a_payment_at_the_bound_is_read() {
-        let at = MAX_PAYMENT_BODY_BYTES;
-        for tx in [
-            json!(vec![0u8; at]),
-            json!("0".repeat(2 * at)),
-            json!({ "beef": base64::engine::general_purpose::STANDARD.encode(vec![0u8; at]) }),
-        ] {
-            assert_eq!(check_payment_size(&tx), Ok(()));
+    #[tokio::test]
+    async fn nl4_bytes_over_the_old_door_that_are_no_beef_are_refused_for_the_byte_not_the_size() {
+        for tx in shapes(&vec![0u8; THE_OLD_DOOR + 1]) {
+            let (body, status) = check(&tx, &remittance(0, &sender_identity()))
+                .await
+                .expect_err("zeros are no BEEF");
+            assert_eq!(
+                (status, body["code"].as_str()),
+                (400, Some("ERR_INVALID_PAYMENT"))
+            );
+            assert_eq!(
+                (&body["offset"], &body["kind"]),
+                (&json!(0), &json!("BadVersion"))
+            );
+            assert!(
+                body["description"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("(BadVersion at offset 0)"),
+                "{body}"
+            );
         }
     }
 
-    #[test]
-    fn p0_5b_an_r2_object_over_the_bound_is_refused_before_it_is_read() {
-        assert_eq!(payment_size_refusal(MAX_PAYMENT_BODY_BYTES as u64), None);
-        let (body, status) =
-            payment_size_refusal(MAX_PAYMENT_BODY_BYTES as u64 + 1).expect("a refusal");
+    const R2_KEY: &str = "02abc/upload.beef";
+
+    async fn check_at_rest(
+        store: &crate::beef_door::tests::MemStore,
+        slice_millis: u64,
+    ) -> Result<u64, RouteResult> {
+        let clock = || 0u64;
+        check_delivery_at_rest(
+            store,
+            R2_KEY,
+            &remittance(0, &sender_identity()),
+            FEE,
+            &sender_identity(),
+            &wallet(SERVER_KEY),
+            Some(&StubHeaders::honest()),
+            &Slices {
+                time: Slice {
+                    clock: &clock,
+                    millis: slice_millis,
+                },
+                lookups: ROOT_LOOKUPS_PER_PASS,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn nl4_an_object_at_rest_over_the_old_door_is_judged_and_not_refused_for_its_size() {
+        use crate::beef_door::tests::MemStore;
         assert_eq!(
-            (status, body["code"].as_str()),
-            (413, Some("ERR_BODY_TOO_LARGE"))
+            check_at_rest(&MemStore::with(R2_KEY, &over_the_old_door(FEE)), u64::MAX).await,
+            Ok(FEE)
         );
+        assert_eq!(
+            refusal_code(
+                check_at_rest(
+                    &MemStore::with(R2_KEY, &over_the_old_door(FEE - 1)),
+                    u64::MAX
+                )
+                .await
+            ),
+            (400, "ERR_INSUFFICIENT_PAYMENT".to_string())
+        );
+        assert_eq!(
+            refusal_code(check_at_rest(&MemStore::default(), u64::MAX).await),
+            (400, "ERR_BEEF_KEY_NOT_FOUND".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn nl4_an_object_at_rest_is_pending_503_until_its_slices_are_done() {
+        use crate::beef_door::tests::MemStore;
+        let bytes = over_the_old_door(FEE);
+        let store = MemStore::with(R2_KEY, &bytes);
+        let mut offsets = Vec::new();
+        let paid = loop {
+            match check_at_rest(&store, 0).await {
+                Ok(paid) => break paid,
+                Err((body, status)) => {
+                    assert_eq!(
+                        (status, body["code"].as_str()),
+                        (503, Some("ERR_PAYMENT_PENDING")),
+                        "{body}"
+                    );
+                    assert_eq!(body["size"], json!(bytes.len()));
+                    assert_eq!(body["elements"], json!(offsets.len() + 1));
+                    offsets.push(body["offset"].as_u64().unwrap());
+                }
+            }
+        };
+        assert_eq!(paid, FEE);
+        // The BUMP, the parent, the subject; a last pass reads the end.
+        assert_eq!(offsets.len(), 3);
+        assert!(offsets.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(offsets[2], bytes.len() as u64);
     }
 
     #[test]

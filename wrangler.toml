@@ -57,9 +57,27 @@ id = "<your-kv-namespace-id>"
 # R2 bucket used by /beef/upload-url + sendMessage to handle BEEFs larger
 # than the 100 MB Workers body cap. Clients upload via presigned URL (S3 v4
 # signed in-WASM via r2_presign.rs), server fetches by key via this binding.
+# Since 0.4.0 a paid message's BEEF stays at rest here: the recipient's D1 row
+# carries the key and never the bytes, and a deferred delivery fee names them
+# (the fee_internalize table, migration 0003). A lifecycle rule on this bucket
+# must not expire an object a row or a deferred fee still names; the relay
+# deletes an object itself, and only when no stored row (messages.beef_key,
+# migration 0004) and no deferred fee names its key.
 [[r2_buckets]]
 binding = "BEEF_BLOBS"
 bucket_name = "bsv-messagebox-beefs"
+
+# The drain of the deferred delivery fees runs on the scheduled event. A fee
+# is deferred when its BEEF is more than one request hands wallet-infra, or
+# when wallet-infra could not answer; the message is delivered either way.
+# The same event reclaims the payment objects that acknowledged, purged or
+# expired rows have let go of (beef_released), 25 a firing.
+# With no cron no deferred fee is ever recorded and no object is reclaimed. A deployment sets its own
+# cadence (every minute here); the transcript-retention sweep shares the
+# event and is a no-op without RETAIN_BOX_PREFIXES.
+#
+# [triggers]
+# crons = ["* * * * *"]
 
 # MessageHub — per-identity hibernatable WebSocket DO (M9). Routing via
 # idFromName(identity_key); WS lifecycle and event surface land in

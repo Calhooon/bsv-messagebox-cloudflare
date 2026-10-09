@@ -87,3 +87,30 @@ fn cargo_toml_has_no_patch_section() {
          code). Ship fixes as published versions instead."
     );
 }
+
+/// NL-4b: the payment words and the two copies of bsv-rs. bsv-middleware-rs
+/// 0.4.0 (on bsv-rs 0.4.0) was published on 2026-10-09 and is not what this
+/// release is built on: its full check runs the scripts and reorders the
+/// words, and the door's resumption has no counterpart in it. bsv-rs 0.3
+/// stays while bsv-middleware-cloudflare (the BRC-31 layer) is built on it.
+/// The reader is bsv-rs 0.4.1 (NL-4c): a transaction with no input is invalid
+/// bytes there, which is how the door refuses a no-input ancestry.
+/// A move of either is a move of this test in the same commit.
+#[test]
+fn the_payment_words_are_bsv_middleware_rs_0_3_0_and_bsv_rs_is_two_copies() {
+    let lock = manifest_file("Cargo.lock");
+    let versions = |name: &str| -> Vec<String> {
+        lock.split("[[package]]")
+            .skip(1)
+            .filter(|block| block.contains(&format!("name = \"{name}\"\n")))
+            .filter_map(|block| {
+                block
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix("version = \""))
+                    .map(|v| v.trim_end_matches('"').to_string())
+            })
+            .collect()
+    };
+    assert_eq!(versions("bsv-middleware-rs"), ["0.3.0"]);
+    assert_eq!(versions("bsv-rs"), ["0.3.35", "0.4.1"]);
+}

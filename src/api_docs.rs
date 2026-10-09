@@ -474,6 +474,7 @@ fn paths() -> Value {
     m.insert("/registerDevice".into(), path_register_device());
     m.insert("/devices".into(), path_devices());
     m.insert("/beef/upload-url".into(), path_beef_upload_url());
+    m.insert("/beef/download-url".into(), path_beef_download_url());
     m.insert("/listTranscript".into(), path_list_transcript());
     m.insert("/purgeTranscript".into(), path_purge_transcript());
     Value::Object(m)
@@ -576,11 +577,62 @@ fn path_purge_transcript() -> Value {
     })
 }
 
+fn path_beef_download_url() -> Value {
+    json!({
+        "post": {
+            "summary": "[RUST-ONLY EXTENSION] Presigned R2 URL to read a paid message's BEEF",
+            "description": "**Not available on TS or Go reference servers.** A paid message's BEEF rests in R2 and the recipient's stored row carries its key (`payment.beefR2Key`), the verdict (`payment.verdict`) and the subject's txid (`payment.txid`), never the BEEF. `/listMessages` hands a payment of up to 2,000,000 bytes back inside `payment.tx`, in the shape the sender sent it, as before. A larger payment is listed without `payment.tx`; its recipient calls this route with the `messageId` and reads the BEEF from the presigned GET URL as a stream. Only the message's recipient is answered.",
+            "operationId": "beefDownloadUrl",
+            "tags": ["Messages"],
+            "security": [{ "BRC31Auth": [] }],
+            "requestBody": {
+                "required": true,
+                "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["messageId"],
+                    "properties": { "messageId": { "type": "string" } }
+                }}}
+            },
+            "responses": {
+                "200": {
+                    "description": "Presigned URL valid for 10 minutes. Read with `GET`.",
+                    "content": { "application/json": { "schema": {
+                        "type": "object",
+                        "required": ["status", "url", "key", "size", "expiresAt"],
+                        "properties": {
+                            "status": { "type": "string", "enum": ["success"] },
+                            "url": { "type": "string", "description": "Presigned R2 GET URL (S3 v4 signed)." },
+                            "key": { "type": "string", "description": "The R2 object key the row names." },
+                            "size": { "type": "integer", "description": "The BEEF's size in bytes." },
+                            "etag": { "type": "string", "description": "The etag of the object the door verified." },
+                            "txid": { "type": "string", "description": "The subject's txid, when the door judged the payment." },
+                            "verdict": { "type": "string", "enum": ["verified", "notJudged"] },
+                            "expiresAt": { "type": "integer", "description": "Unix timestamp (seconds) at which the presigned URL expires." }
+                        }
+                    }}}
+                },
+                "400": {
+                    "description": "ERR_MESSAGE_ID_REQUIRED.",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+                },
+                "404": {
+                    "description": "ERR_BEEF_KEY_NOT_FOUND: no message of the caller's with that id carries a payment at rest.",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+                },
+                "500": {
+                    "description": "ERR_SERVER_MISCONFIGURED: the R2 credentials are not set.",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+                }
+            }
+        }
+    })
+}
+
 fn path_beef_upload_url() -> Value {
     json!({
         "post": {
             "summary": "[RUST-ONLY EXTENSION] Presigned R2 URL for BEEFs >100 MB",
-            "description": "**Not available on TS or Go reference servers.** Cloudflare Workers cap request bodies at 100 MB; the TS and Go ports have no equivalent cap. To handle larger BEEF payloads, this Rust server exposes an opt-in extension: call `/beef/upload-url` to receive a presigned R2 PUT URL, upload the BEEF bytes directly to R2 (up to 5 TB), then POST `/sendMessage` with `payment.beefR2Key = <key>` instead of `payment.tx`. Clients that stay under 100 MB should continue to use the inline `payment.tx` flow for universal compatibility across TS, Go, and Rust servers.",
+            "description": "**Not available on TS or Go reference servers.** Cloudflare Workers cap request bodies at 100 MB; the TS and Go ports have no equivalent cap. To handle larger BEEF payloads, this Rust server exposes an opt-in extension: call `/beef/upload-url` to receive a presigned R2 PUT URL, upload the BEEF bytes directly to R2 (up to 5 TB), then POST `/sendMessage` with `payment.beefR2Key = <key>` instead of `payment.tx`. Clients that stay under 100 MB should continue to use the inline `payment.tx` flow for universal compatibility across TS, Go, and Rust servers. Since 0.4.0 no payment is refused for its size: the object is verified from R2 as a stream, and a verification one request does not finish is answered `503 ERR_PAYMENT_PENDING` (send the same `/sendMessage` again to continue).",
             "operationId": "beefUploadUrl",
             "tags": ["Messages"],
             "security": [{ "BRC31Auth": [] }],
@@ -1031,6 +1083,7 @@ mod tests {
             "/registerDevice",
             "/devices",
             "/beef/upload-url",
+            "/beef/download-url",
             "/listTranscript",
             "/purgeTranscript",
         ];
@@ -1062,6 +1115,7 @@ mod tests {
             ("/registerDevice", "post"),
             ("/devices", "get"),
             ("/beef/upload-url", "post"),
+            ("/beef/download-url", "post"),
             ("/listTranscript", "post"),
             ("/purgeTranscript", "post"),
         ];

@@ -182,7 +182,7 @@ fn retained_box_exists_sql(n_prefixes: usize) -> String {
 /// like re-acking an already-deleted one).
 ///
 /// Bind order: identity_key, message_ids..., like_patterns...
-pub(crate) fn ack_update_sql(n_ids: usize, n_prefixes: usize) -> String {
+pub fn ack_update_sql(n_ids: usize, n_prefixes: usize) -> String {
     format!(
         "UPDATE messages SET acknowledged_at = datetime('now'), updated_at = datetime('now') \
          WHERE recipient = ? AND acknowledged_at IS NULL AND message_id IN ({}) \
@@ -197,7 +197,7 @@ pub(crate) fn ack_update_sql(n_ids: usize, n_prefixes: usize) -> String {
 /// excluded via NOT IN over the same subquery the UPDATE uses.
 ///
 /// Bind order: identity_key, message_ids..., [like_patterns...]
-pub(crate) fn ack_delete_sql(n_ids: usize, n_prefixes: usize) -> String {
+pub fn ack_delete_sql(n_ids: usize, n_prefixes: usize) -> String {
     if n_prefixes == 0 {
         return format!(
             "DELETE FROM messages WHERE recipient = ? AND message_id IN ({})",
@@ -262,7 +262,7 @@ fn participant_check_sql() -> String {
 /// power over the peer's un-consumed messages that acknowledge never granted,
 /// and a transcript-rewriting vector for the peer's future rejoin).
 /// Bind order: identity_key, box_type.
-fn purge_delete_sql() -> String {
+pub(crate) fn purge_delete_sql() -> String {
     "DELETE FROM messages WHERE recipient = ? AND message_box_id IN \
      (SELECT message_box_id FROM message_boxes WHERE type = ?)"
         .to_string()
@@ -304,7 +304,7 @@ fn sweep_tombstone_sql(n_prefixes: usize) -> String {
 /// TTL sweep step 2: delete expired rows — RESTRICTED to retained boxes. The
 /// sweep must never touch a non-retained mailbox (those keep today's
 /// no-time-expiry contract). Bind order: days_ago_modifier, like_patterns...
-fn sweep_delete_messages_sql(n_prefixes: usize) -> String {
+pub(crate) fn sweep_delete_messages_sql(n_prefixes: usize) -> String {
     format!(
         "DELETE FROM messages WHERE created_at < datetime('now', ?) \
          AND message_box_id IN ({})",
@@ -564,6 +564,7 @@ pub async fn handle_list_transcript(
     identity_key: &str,
     cfg: &RetentionConfig,
     store: &Storage<'_>,
+    blobs: &dyn crate::beef_door::BeefStore,
 ) -> (Value, u16) {
     let validated = match validate_list_messages(raw_body) {
         Ok(v) => v,
@@ -572,13 +573,30 @@ pub async fn handle_list_transcript(
     if !cfg.retains(&validated.message_box) {
         return not_retained_response(&validated.message_box);
     }
-    let rows = match store
+    let mut rows = match store
         .list_transcript(identity_key, &validated.message_box)
         .await
     {
         Ok(r) => r,
         Err(_e) => return internal_error_response("listing the transcript"),
     };
+    // A paid row carries the R2 key of its payment and never the BEEF
+    // (NL-4b); the bytes are streamed back as in `/listMessages`. A
+    // transcript is the whole chain, so a row past the response's share is
+    // served as stored, by its key, and not left out.
+    let mut budget = crate::handoff::ListBudget::default();
+    for row in rows.iter_mut() {
+        let served = match row.body.as_deref() {
+            Some(body) => match crate::handoff::serve_body(body, blobs, &mut budget).await {
+                crate::handoff::Served::Body(std::borrow::Cow::Owned(served)) => Some(served),
+                _ => None,
+            },
+            None => None,
+        };
+        if served.is_some() {
+            row.body = served;
+        }
+    }
     // A failed tombstone read must NOT degrade to "never purged" (the #313
     // could-not-look-vs-absent lesson): error out instead of omitting.
     let tombstone = match store
@@ -778,6 +796,12 @@ mod tests {
         db.execute_batch(include_str!("../migrations/0001_initial.sql"))
             .unwrap();
         db.execute_batch(include_str!("../migrations/0002_transcript_retention.sql"))
+            .unwrap();
+        // The later migrations too (0004 adds a column, an index and two
+        // triggers on `messages`): the plans below hold under the whole schema.
+        db.execute_batch(include_str!("../migrations/0003_fee_internalize.sql"))
+            .unwrap();
+        db.execute_batch(include_str!("../migrations/0004_beef_key.sql"))
             .unwrap();
         // 3,000 boxes (a third retained), 12,000 messages across 40 recipients.
         // The plans below are a function of schema and statement only: without

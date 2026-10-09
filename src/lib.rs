@@ -27,12 +27,17 @@ mod storage;
 mod types;
 mod validation;
 
+/// The payment door's reader (0.4.0): a payment's BEEF as a stream, one
+/// element in hand, a cursor at rest for an object in R2. Public beside
+/// `payments`, whose check takes its store and its slices.
+pub mod beef_door;
 mod beef_upload;
 mod devices;
 mod fcm;
 mod fcm_cache;
 mod fcm_jwt;
 mod fcm_token;
+pub mod handoff;
 /// The payment door. Public so the deep-BEEF witness
 /// (`tests/deep_beef_door.rs`, P0-5b) runs the delivery check itself.
 pub mod payments;
@@ -79,7 +84,12 @@ async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     })
 }
 
-/// Cron entry — the transcript-retention TTL backstop (bsv-low #252 stage E).
+/// Cron entry. Two sweeps share it: the drain of the deferred delivery fees
+/// (NL-4b, `payments::run_fee_drain`: a fee whose internalize could not run
+/// in its request is recorded here, retried with a backoff, never dropped;
+/// and, NL-4c, the payment objects that stored rows have let go of are
+/// deleted there when nothing names them), and the transcript-retention TTL
+/// backstop (bsv-low #252 stage E).
 /// Deployments without a `[triggers]` cron never invoke this; deployments with
 /// a cron but no `RETAIN_BOX_PREFIXES` no-op inside the sweep. Retained rows
 /// older than `RETAIN_TTL_DAYS` (default 14) are tombstoned then deleted so
@@ -87,6 +97,7 @@ async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     init_panic_hook();
+    payments::run_fee_drain(&env).await;
     retention::run_scheduled_sweep(&env).await;
 }
 
@@ -442,7 +453,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
             }
         }
         (Method::Post, "/listMessages") => {
-            handle_list_messages(&request_body, identity_key, &store).await
+            handle_list_messages(&request_body, identity_key, &env, &store).await
         }
         (Method::Post, "/acknowledgeMessage") => {
             handle_acknowledge_message(&request_body, identity_key, &retention_cfg, &store).await
@@ -454,8 +465,14 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // purges its rows once the game is terminal. Both 403 for boxes
         // outside the deployment's RETAIN_BOX_PREFIXES class.
         (Method::Post, "/listTranscript") => {
-            retention::handle_list_transcript(&request_body, identity_key, &retention_cfg, &store)
-                .await
+            retention::handle_list_transcript(
+                &request_body,
+                identity_key,
+                &retention_cfg,
+                &store,
+                &beef_upload::R2Store::new(&env),
+            )
+            .await
         }
         (Method::Post, "/purgeTranscript") => {
             retention::handle_purge_transcript(&request_body, identity_key, &retention_cfg, &store)
@@ -485,6 +502,12 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
 
         (Method::Post, "/beef/upload-url") => {
             beef_upload::handle_upload_url(identity_key, &env).await
+        }
+        // NL-4b: a paid message's BEEF rests in R2 and its row carries the
+        // key. One larger than a row ever was is read by its recipient from
+        // the bucket, through a presigned GET.
+        (Method::Post, "/beef/download-url") => {
+            beef_upload::handle_download_url(&request_body, identity_key, &env, &store).await
         }
 
         // #40 peer-presence polling fallback: is the OWNER of `?room=`
@@ -816,6 +839,7 @@ async fn handle_send_message(
 async fn handle_list_messages(
     raw_body: &[u8],
     identity_key: &str,
+    env: &Env,
     store: &storage::Storage<'_>,
 ) -> (serde_json::Value, u16) {
     let validated = match validation::validate_list_messages(raw_body) {
@@ -839,19 +863,30 @@ async fn handle_list_messages(
         }
     };
 
-    // Format response — camelCase, body as raw string, timestamps as ISO 8601 for Node parity
-    let formatted: Vec<serde_json::Value> = messages
-        .iter()
-        .map(|row| {
-            json!({
-                "messageId": row.message_id.as_deref().unwrap_or(""),
-                "body": row.body.as_deref().unwrap_or(""),
-                "sender": row.sender.as_deref().unwrap_or(""),
-                "createdAt": storage::to_iso8601(row.created_at.as_deref()),
-                "updatedAt": storage::to_iso8601(row.updated_at.as_deref()),
-            })
-        })
-        .collect();
+    // Format response: camelCase, body as raw string, timestamps as ISO 8601 for Node parity.
+    // A paid row carries the R2 key of its payment and never the BEEF
+    // (NL-4b): `handoff::serve_body` streams the bytes back into `payment.tx`
+    // for a payment no larger than a row ever was. A body with no such key
+    // is not parsed and the bucket is never asked.
+    let blobs = beef_upload::R2Store::new(env);
+    let mut budget = handoff::ListBudget::default();
+    let mut formatted: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
+    for row in &messages {
+        let stored = row.body.as_deref().unwrap_or("");
+        let body = match handoff::serve_body(stored, &blobs, &mut budget).await {
+            handoff::Served::Body(body) => body,
+            // In the next listing, whole: never served without its payment
+            // to a client that would acknowledge it.
+            handoff::Served::NextListing => continue,
+        };
+        formatted.push(json!({
+            "messageId": row.message_id.as_deref().unwrap_or(""),
+            "body": body,
+            "sender": row.sender.as_deref().unwrap_or(""),
+            "createdAt": storage::to_iso8601(row.created_at.as_deref()),
+            "updatedAt": storage::to_iso8601(row.updated_at.as_deref()),
+        }));
+    }
 
     (json!({ "status": "success", "messages": formatted }), 200)
 }

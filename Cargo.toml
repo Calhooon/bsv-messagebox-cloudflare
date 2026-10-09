@@ -1,6 +1,6 @@
 [package]
 name = "rust-message-box"
-version = "0.3.31"
+version = "0.4.0"
 edition = "2021"
 
 [lib]
@@ -34,6 +34,18 @@ hmac = "0.12"
 # BSV
 bsv-middleware-cloudflare = "0.3.3"
 bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
+# The streaming BEEF reader (0.4.0: `verify_stream`, `BeefDecoder`,
+# `StreamVerifier`, `Cursor`; 0.4.1: a transaction with no input is invalid
+# bytes, `Kind::NoInputs`). Beside 0.3, not in its place: bsv-middleware-rs
+# 0.3.0 and bsv-middleware-cloudflare 0.3.3 are built on bsv-rs 0.3 and their
+# `ProtoWallet` is that crate's type. bsv-middleware-rs 0.4.0 is on bsv-rs 0.4.0
+# (published 2026-10-09) and is not taken yet: its full check runs the scripts
+# and has no cursor for the R2 resumption. bsv-middleware-cloudflare is on
+# bsv-rs 0.3 at 0.4.1, its newest, so one copy waits on that crate too
+# (`tests/middleware_version_guard.rs` holds the pins).
+# Pinned exactly: the door reads the subject's offset out of the cursor's bytes
+# (`beef_door::tip_of`), a layout of this release.
+bsv-stream = { package = "bsv-rs", version = "=0.4.1", features = ["transaction", "wasm"] }
 # The shared payment check (P0-3): the delivery output compared with the fee,
 # and since 0.3.0 the six-word verdict with the header service as a trait.
 bsv-middleware-rs = "0.3.0"
@@ -41,6 +53,8 @@ bsv-middleware-rs = "0.3.0"
 # declared with async-trait; the box implements it over the HEADER_SERVICE
 # service binding or the Worker fetch of a URL.
 async-trait = "0.1"
+# `StreamExt::next` on the R2 object's body stream (`worker::ByteStream`).
+futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
@@ -48,7 +62,7 @@ tokio = { version = "1", features = ["rt", "macros"] }
 rand = "0.8"
 # Dev-only: the ack statements are planned and executed on a real SQLite with the
 # real migrations (retention.rs tests). Never compiled into the worker.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "limits"] }
 
 # 2026-07-23 (#249): the 429-fix (lazy + best-effort BRC-31 session-liveness
 # touch) is NOW in PUBLISHED bsv-middleware-cloudflare 0.3.0 — the dep above is

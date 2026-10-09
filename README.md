@@ -39,7 +39,15 @@ Cloudflare Workers caps request bodies at 100 MB. The TS and Go servers have no 
 2. Server returns a presigned R2 URL and an object `key`, both scoped to the caller's identity key.
 3. Client `PUT`s the BEEF bytes directly to R2 (up to 5 TB per object — R2's only ceiling).
 4. Client POSTs `/sendMessage` with `payment.beefR2Key = "<key>"` instead of `payment.tx`.
-5. Server fetches the object from R2, inlines it into the internalize request, deletes the object on success.
+5. Server verifies the object from R2 as a stream. The object stays at rest: the recipient's row and, when the fee's internalize is deferred, a row of `fee_internalize` name it by its key.
+
+### No payment is refused for its size (0.4.0)
+
+A valid payment's BEEF is never refused for its size or for how many transactions or BUMPs it carries, inline or from R2. A refusal is for invalid bytes, or for a spend no script allows, and names them: the error carries `offset` and `kind` beside `code` and `description`. The door runs the scripts of unproven transactions (`kind: "SpendRefused"` at the input), and a transaction with no input is invalid bytes (`kind: "NoInputs"`).
+
+Nothing after the verdict refuses the sender either. A paid message's BEEF stays at rest in R2 (an inline payment is spooled there), and the recipient's stored row carries the key, the verdict and the subject's txid, never the BEEF. `/listMessages` hands a payment of up to 2,000,000 bytes back inside `payment.tx` as before, streamed from R2; a larger one is listed by its key, and its recipient reads it through `POST /beef/download-url` (a presigned R2 GET). The delivery fee's internalize into the wallet service runs in the request when the BEEF is at most 1 MiB, and is otherwise deferred to the `fee_internalize` table, which the scheduled event drains with a backoff; the message is delivered on the verdict either way. An object in R2 belongs to what names it: it is deleted only when no stored row and no deferred fee names its key, so a key sent again cannot take the bytes from a row, and the object of an acknowledged message is reclaimed by the scheduled event once nothing names it.
+
+An R2 object is read one element at a time and is never held whole while it is verified (the reader keeps an output until an input of the BEEF spends it, so outputs nothing spends are held to the end of the reading). When one request cannot finish the reading, the server saves its place beside the object and answers `503 ERR_PAYMENT_PENDING` with `elements`, `offset`, `size`, `rootsChecked` and `roots`; send the same `/sendMessage` again and it continues from there. An inline `payment.tx` is verified in one request, since its bytes are not at rest.
 
 ### Compatibility rules
 
@@ -130,6 +138,7 @@ WebSocket frames (inside the MessageHub DO)
 - **storage.rs** — D1 read/write for messages, boxes, permissions, fees, devices
 - **permissions.rs** — Hierarchical permission resolution and fee quoting
 - **payments.rs** — BSV payment internalization via HTTP to wallet storage
+- **beef_door.rs**: the payment door's reader: a payment's BEEF as a stream of its elements, the cursor at rest for an R2 object
 - **fcm.rs / fcm_jwt.rs / fcm_token.rs / fcm_cache.rs** — Google FCM v1 push delivery, in-WASM JWT signing, OAuth2 token cache
 - **beef_upload.rs / r2_presign.rs** — `/beef/upload-url` handler and S3 v4 presigner for the R2 extension
 - **validation.rs** — Request body validation (shape + field checks)
@@ -156,7 +165,7 @@ WebSocket frames (inside the MessageHub DO)
 
 ## D1 Schema
 
-Five tables in `migrations/0001_initial.sql`:
+Five tables in `migrations/0001_initial.sql`, the transcript retention columns of `0002`, `fee_internalize` in `0003` (the delivery fees whose recording in the wallet service is still owed; drained by the scheduled event), and in `0004` the `messages.beef_key` column (the R2 object a row's payment names) with `beef_released` (the keys rows have let go of, filled by two triggers and read by the scheduled event):
 
 - `message_boxes` — one per `(identity_key, type)`
 - `messages` — message storage, dedup on `message_id`
