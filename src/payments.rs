@@ -1118,8 +1118,9 @@ mod tests {
     }
 
     /// The crafted parent every payment here spends. It has one input, naming
-    /// a transaction the BEEF does not carry (its proof vouches for it): a
-    /// transaction with no input is invalid bytes to bsv-rs 0.4.1's reader.
+    /// a transaction the BEEF does not carry (its proof vouches for it), and
+    /// one output: a transaction with no input is invalid bytes to bsv-rs's
+    /// reader since 0.4.1, and one with no output since 0.4.3.
     fn parent() -> Transaction {
         let mut parent = Transaction::new();
         parent

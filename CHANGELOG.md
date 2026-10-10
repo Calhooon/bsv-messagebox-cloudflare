@@ -4,6 +4,17 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.4.3 (2026-10-10)
+
+### bsv-rs 0.4.3: a transaction with no output is invalid bytes at the door (bsv-stack-lean #59)
+- **bsv-rs is 0.4.3**, pinned exactly (was 0.4.1), one copy in the graph: bsv-middleware-cloudflare 0.5.0, bsv-middleware-core 0.2.0 and bsv-middleware-rs 0.4.1 are built on it. Nothing else in the lock moved.
+- **A payment whose BEEF carries a transaction with an input and no output is refused as invalid bytes**, `InvalidBeef` with the transaction's leading byte and the kind `NoOutputs`, inline and at rest, before any root is asked, as a transaction with no input has been since bsv-rs 0.4.1 (`NoInputs`; one with neither is `NoInputs`, the node's order). Through 0.4.2 the reader read such a transaction as valid and the door went on to its words. The rule is the node's (`checkTransactionCommon`: `vinEmpty`, then `voutEmpty`), cited by bsv-rs 0.4.3's CHANGELOG. The reader's kinds are twenty; the door's refusal names any of them, so no answer's shape changes: the code, the status, `offset` and `kind` in the body are as before.
+- **Witness.** `beef_door::tests::a_transaction_with_no_output_is_refused_naming_it_and_asks_nothing`: a proven parent's `OP_TRUE` spent by a transaction with no output, refused at offset 147 with `NoOutputs` and no root asked. Red at bsv-rs 0.4.1 (nothing named), green at 0.4.3.
+- **Fixtures.** None of the relay's carries a transaction with no output (every hand-built transaction has one output or two; the crafted parent of the payment tests has its one input and its one output), so no expectation moved. `Transaction::verify`, which 0.4.3 also holds to both counts, is not called by the relay.
+- **The door's reading of the cursor is unchanged**: `Cursor::to_binary`, which `beef_door::tip_of` reads the subject from, is byte for byte 0.4.1's in 0.4.3.
+- `tests/middleware_version_guard.rs` holds bsv-rs 0.4.3, one copy, and the BRC-31 layer on it.
+- **Operators.** Nothing: no binding, no var, no migration. A stored payment is held to the rule on its next read; the BRC-29 vectors are unchanged, 22 of 22 exact.
+
 ## 0.4.2 (2026-10-10)
 
 ### The drain hands wallet-infra the reference, never the bytes (the no-limits program, NL-7b)

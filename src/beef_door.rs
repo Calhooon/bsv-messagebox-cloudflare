@@ -2,18 +2,21 @@
 //! read as a stream, one element in hand, never refused for its size or its
 //! counts.
 //!
-//! The reader is bsv-rs 0.4.1's `StreamVerifier`
-//! (`src/transaction/beef_stream.rs:2575-2692`): one step per element, a
+//! The reader is bsv-rs 0.4.3's `StreamVerifier`
+//! (`src/transaction/beef_stream.rs:2641-2758`): one step per element, a
 //! `Cursor` between any two. What it holds is the element in hand and its
 //! index (one entry per element); what it refuses is invalid bytes, at an
-//! offset, by one of nineteen kinds, none of which is a size or a count. The
+//! offset, by one of twenty kinds, none of which is a size or a count. The
 //! nineteenth is 0.4.1's: a transaction with no input is no transaction
-//! (`Kind::NoInputs`, at its leading byte), with or without a BUMP.
+//! (`Kind::NoInputs`, at its leading byte), with or without a BUMP. The
+//! twentieth is 0.4.3's (#59): a transaction with an input and no output is
+//! no transaction either (`Kind::NoOutputs`, at its leading byte); one with
+//! neither is `NoInputs`, the node's order.
 //!
 //! The reading runs the scripts (NL-4c): every input of an unproven
 //! transaction is executed against the parent output the index kept, and an
 //! unproven transaction may not pay out more than it spends
-//! (`StreamVerifier::new`, `BeefIndex::check_spends_of`, `:1997-2101`). A
+//! (`StreamVerifier::new`, `BeefIndex::check_spends_of`, `:2063-2167`). A
 //! spend the interpreter refuses is refused here, at the input's offset
 //! (`SpendRefused`): a payment whose ancestry nobody signed is no payment.
 //! What that costs is said plainly: beside the index the reader keeps each
@@ -197,8 +200,8 @@ impl Chunks for CarrierChunks<'_> {
 /// What the verifier reads from: the one chunk the door has fetched and not
 /// yet handed over. Empty and not ended is `WouldBlock`: the door fetches the
 /// next chunk and steps again (`BeefStream::next_element` keeps its decoder
-/// across a failed read, bsv-rs 0.4.1 `beef_stream.rs:1505-1534`, and
-/// `StreamVerifier::step` latches no verdict on one, `:2655-2682`).
+/// across a failed read, bsv-rs 0.4.3 `beef_stream.rs:1570-1599`, and
+/// `StreamVerifier::step` latches no verdict on one, `:2721-2748`).
 #[derive(Clone, Default)]
 struct Feed(Rc<RefCell<FeedState>>);
 
@@ -318,7 +321,7 @@ async fn read(
 // ---------------------------------------------------------------------------
 
 /// The bytes a refusal names: the stream offset and the kind (one of the
-/// reader's nineteen, or `SpendRefused` at the offset of the input whose
+/// reader's twenty, or `SpendRefused` at the offset of the input whose
 /// spend the interpreter refused).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Named {
@@ -384,8 +387,8 @@ pub enum DoorError {
 
 /// A refusal of the reading in the middleware's words, bsv-middleware-rs
 /// 0.4.1's own (`src/payment_core.rs:122-168`): invalid bytes are
-/// `InvalidBeef` with the offset and the kind (a transaction with no input is
-/// one), a spend the interpreter refused is `SpendRefused` at its input. Both
+/// `InvalidBeef` with the offset and the kind (a transaction with no input or
+/// no output is one), a spend the interpreter refused is `SpendRefused` at its input. Both
 /// are the payer's side. The route's body names the offset and the kind.
 fn refusal_word(refused: Verdict) -> DoorVerdict {
     let (reason, named) = match refused {
@@ -443,10 +446,10 @@ fn malformed(what: impl Into<String>) -> PaymentVerdict {
 }
 
 /// The last raw transaction a reading folded and the offset of its leading
-/// byte: the subject. bsv-rs 0.4.1's verifier does not hand out the element
+/// byte: the subject. bsv-rs 0.4.3's verifier does not hand out the element
 /// it stepped, so this is read from the cursor's own bytes
-/// (`Cursor::to_binary`, `beef_stream.rs:2256-2296`: the magic `BSC1`, the
-/// frame, then the index's `last_raw`). The door holds the bytes it then
+/// (`Cursor::to_binary`, `beef_stream.rs:2322-2362`, byte for byte 0.4.1's:
+/// the magic `BSC1`, the frame, then the index's `last_raw`). The door holds the bytes it then
 /// fetches to this txid (`subject_raw`), so a cursor laid out otherwise is an
 /// error here and never a wrong answer.
 fn tip_of(cursor: &Cursor) -> Result<Option<(Hash32, u64)>, DoorError> {
@@ -1400,6 +1403,49 @@ pub(crate) mod tests {
             PaymentVerdict::Unverifiable(UnverifiableReason::NoTransaction).into()
         );
         assert!(headers.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transaction_with_no_output_is_refused_naming_it_and_asks_nothing() {
+        let headers = Roots::of(&[]);
+        // A transaction with no output is no transaction, as one with no
+        // input (bsv-rs 0.4.3, #59; the node's `voutEmpty`). Here it spends
+        // a proven parent's `OP_TRUE` with an empty unlock, so its input and
+        // its spend are sound and the one thing wrong is the count. Through
+        // bsv-rs 0.4.2 the reader read it as valid and the door went on to
+        // its words; it is invalid bytes, named at its leading byte.
+        let parent = raw_tx(&[0x11; 32], 1_000, SPENT);
+        let mut spent = 1u32.to_le_bytes().to_vec();
+        spent.push(1);
+        spent.extend_from_slice(&txid(&parent));
+        spent.extend_from_slice(&0u32.to_le_bytes());
+        spent.push(0);
+        spent.extend_from_slice(&u32::MAX.to_le_bytes());
+        spent.push(0);
+        spent.extend_from_slice(&0u32.to_le_bytes());
+        let bytes = beef(
+            &[(HEIGHT, txid(&parent))],
+            &[(Some(0), parent), (None, spent.clone())],
+            Some(txid(&spent)),
+        );
+        let offset = (bytes.len() - spent.len()) as u64;
+        let verdict = inline(&bytes, &headers).await;
+        assert_eq!(
+            verdict.named,
+            Some(Named {
+                offset,
+                kind: "NoOutputs".to_string()
+            })
+        );
+        match verdict.word {
+            PaymentVerdict::Unverifiable(UnverifiableReason::InvalidBeef {
+                offset: at,
+                kind,
+                ..
+            }) => assert_eq!((at, format!("{kind:?}")), (offset, "NoOutputs".into())),
+            word => panic!("invalid bytes expected, got {word:?}"),
+        }
+        assert!(headers.asked().is_empty(), "no root was asked");
     }
 
     // ---- bytes at rest ----

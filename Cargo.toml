@@ -1,6 +1,6 @@
 [package]
 name = "rust-message-box"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 
 [lib]
@@ -33,16 +33,19 @@ hmac = "0.12"
 
 # BSV
 # The BRC-31 layer (0.5.0: on bsv-middleware-core 0.2.0 and bsv-rs 0.4). Its
-# session, wallet and auth message are the relay's own bsv-rs 0.4.1 types.
+# session, wallet and auth message are the relay's own bsv-rs 0.4.3 types.
 bsv-middleware-cloudflare = "0.5.0"
 # The SDK and the streaming BEEF reader (0.4.0: `verify_stream`, `BeefDecoder`,
 # `StreamVerifier`, `Cursor`; 0.4.1: a transaction with no input is invalid
-# bytes, `Kind::NoInputs`). Pinned exactly: the door reads the subject's offset
-# out of the cursor's bytes (`beef_door::tip_of`), a layout of this release.
-bsv-rs = { version = "=0.4.1", features = ["auth", "wallet", "transaction", "wasm"] }
+# bytes, `Kind::NoInputs`; 0.4.3: a transaction with no output is invalid
+# bytes, `Kind::NoOutputs`, #59). Pinned exactly: the door reads the subject's
+# offset out of the cursor's bytes (`beef_door::tip_of`), a layout of this
+# release.
+bsv-rs = { version = "=0.4.3", features = ["auth", "wallet", "transaction", "wasm"] }
 # The shared payment check (P0-3): the six-word verdict, the BRC-29 script and
-# the header service as a trait. 0.4.1 is on bsv-rs 0.4.1, so the words take
-# the relay's own wallet and reader types. The door keeps its own reading (the
+# the header service as a trait. 0.4.1 asks bsv-rs ^0.4.1, so it is built on
+# the relay's 0.4.3 and the words take the relay's own wallet and reader
+# types. The door keeps its own reading (the
 # cursor at rest) and asks the middleware the output check on the subject
 # alone (`verify_payment_output_only`).
 bsv-middleware-rs = "0.4.1"
