@@ -13,13 +13,14 @@ use serde_json::{json, Value};
 use worker::Env;
 
 use crate::beef_door::{
-    verify_at_rest, verify_inline, AtRest, BeefStore, Carrier, DoorError, DoorVerdict, Pending,
-    Slice, Slices, Terms, ROOT_LOOKUPS_PER_PASS, VERIFY_SLICE_MILLIS,
+    inline_spool_key, judge_output_inline, structure_inline, verify_inline, AtRest, BeefStore,
+    Carrier, DoorError, DoorVerdict, Pending, Slice, Slices, Terms, ROOT_LOOKUPS_PER_PASS,
+    SCRIPT_INPUTS_PER_PASS, SCRIPT_WEIGHT_PER_PASS, VERIFY_SLICE_MILLIS,
 };
 
 use crate::handoff::{
-    drain_fees, hand_off, reclaim_released, FeeWallet, HandedOff, Paid, Seams, DRAIN_BATCH,
-    RECLAIM_BATCH,
+    drain_fees, hand_off, reask_announces, reclaim, reclaim_released, Announcer, FeeWallet,
+    HandedOff, Hint, Paid, PaymentStore, Seams, Subject, DRAIN_BATCH, RECLAIM_BATCH,
 };
 
 type RouteResult = (Value, u16);
@@ -37,6 +38,9 @@ pub struct Settled {
 pub struct Judged {
     pub satoshis: u64,
     pub txid: String,
+    /// The stamp of the object the door read, when it read one at rest
+    /// (0.4.4, bsv-low #591 L1): the hand-off holds what it records to it.
+    pub stamp: Option<crate::beef_door::Stamp>,
 }
 
 /// Process payment for sendMessage. Returns per-recipient output mappings
@@ -81,6 +85,15 @@ pub async fn process_payment(
         .and_then(|v| v.as_array())
         .ok_or_else(missing_tx)?;
 
+    // The reader every object of the payment names: the relay, the recipient
+    // of the delivery fee (`handoff::READER_METADATA`).
+    let reader = server_private_key(env)
+        .map(|key| key.public_key().to_hex())
+        .map_err(|e| err(500, "ERR_INTERNAL", &e))?;
+    // Where the relay put an inline payment's bytes at rest before its
+    // scripts ran, when it did.
+    let mut spooled: Option<String> = None;
+
     // Server delivery fee — output[0]
     let judged = if delivery_fee > 0 {
         let server_output = outputs.first().ok_or_else(|| {
@@ -107,17 +120,19 @@ pub async fn process_payment(
         let headers = WorkerHeaderService::from_env(env);
         let headers = headers.as_ref().map(|h| h as &dyn HeaderService);
         let due = delivery_fee_due(delivery_fee, fee_map.len())?;
+        let store = crate::beef_upload::R2Store::new(env);
+        let clock = || worker::Date::now().as_millis();
+        let slices = Slices {
+            time: Slice {
+                clock: &clock,
+                millis: VERIFY_SLICE_MILLIS,
+            },
+            lookups: ROOT_LOOKUPS_PER_PASS,
+            inputs: SCRIPT_INPUTS_PER_PASS,
+            weight: SCRIPT_WEIGHT_PER_PASS,
+        };
         let judged = match r2_key {
             Some(key) => {
-                let store = crate::beef_upload::R2Store::new(env);
-                let clock = || worker::Date::now().as_millis();
-                let slices = Slices {
-                    time: Slice {
-                        clock: &clock,
-                        millis: VERIFY_SLICE_MILLIS,
-                    },
-                    lookups: ROOT_LOOKUPS_PER_PASS,
-                };
                 judge_delivery_at_rest(
                     &store,
                     key,
@@ -130,6 +145,44 @@ pub async fn process_payment(
                 )
                 .await?
             }
+            // An inline payment is spooled after its output and before its
+            // scripts (0.4.4, bsv-low #591 H1), so the slice and the 503
+            // resume cover it as they cover an upload. Where no bucket is
+            // bound it is read in the request, the output still first.
+            None if store.bound() => {
+                let tx = payment.get("tx").ok_or_else(missing_tx)?;
+                let db = env
+                    .d1("DB")
+                    .map_err(|e| err(503, "ERR_D1_UNAVAILABLE", &format!("D1 binding: {}", e)))?;
+                let minted = crate::storage::D1Rows { db: &db };
+                let (judged, key) = judge_delivery_inline_at_rest(
+                    &store,
+                    tx,
+                    server_output,
+                    due,
+                    sender_key,
+                    &server_wallet,
+                    headers,
+                    &slices,
+                    &reader,
+                    Some((&minted, worker::Date::now().as_millis() / 1000)),
+                )
+                .await;
+                match judged {
+                    Ok(judged) => {
+                        spooled = key;
+                        judged
+                    }
+                    Err(refused) => {
+                        // A refusal ends the spool; a pending reading keeps
+                        // it for the same request again.
+                        if let (Some(key), false) = (&key, is_pending(&refused)) {
+                            forget_spool(env, &store, key).await;
+                        }
+                        return Err(refused);
+                    }
+                }
+            }
             None => {
                 let tx = payment.get("tx").ok_or_else(missing_tx)?;
                 judge_delivery_output(tx, server_output, due, sender_key, &server_wallet, headers)
@@ -140,6 +193,12 @@ pub async fn process_payment(
     } else {
         None
     };
+
+    // A body no delivery fee judges is kept in its row, never spooled (0.4.4,
+    // bsv-low #591 M3): its structure is read and the row's bound holds it.
+    if let (None, None, Some(_)) = (&judged, r2_key, payment.get("tx")) {
+        check_unjudged(payment).await?;
+    }
 
     // Per-recipient output routing, before the hand-off: a payment whose
     // outputs do not cover its recipients is refused with nothing put at
@@ -169,27 +228,28 @@ pub async fn process_payment(
         .map_err(|e| err(503, "ERR_D1_UNAVAILABLE", &format!("D1 binding: {}", e)))?;
     let ledger = crate::storage::D1Ledger { db: &db };
     let rows = crate::storage::D1Rows { db: &db };
-    // The reader every object of the payment names: the relay, the recipient
-    // of the delivery fee (`handoff::READER_METADATA`).
-    let reader = server_private_key(env)
-        .map(|key| key.public_key().to_hex())
-        .map_err(|e| err(500, "ERR_INTERNAL", &e))?;
     let spool_key = crate::beef_upload::build_upload_key(
         sender_key,
         &uuid::Uuid::new_v4().simple().to_string(),
     );
+    let arc = ArcAnnouncer::from_env(env);
     let handed = hand_off(
         &Seams {
             blobs: &blobs,
             wallet: &wallet,
             ledger: &ledger,
             rows: &rows,
+            announcer: arc.as_ref().map(|arc| arc as &dyn Announcer),
         },
         &Paid {
             payment,
             r2_key,
+            spooled: spooled.as_deref(),
             spool_key: &spool_key,
             server_output: judged.as_ref().map(|(output, _)| *output),
+            stamp: judged
+                .as_ref()
+                .and_then(|(_, judged)| judged.stamp.as_ref()),
             txid: judged.as_ref().map(|(_, judged)| judged.txid.as_str()),
             rows: !fee_recipients.is_empty(),
             reader: &reader,
@@ -574,18 +634,162 @@ pub async fn judge_delivery_at_rest(
         expected_script: &expected_script,
         required_satoshis: delivery_fee,
     };
-    match verify_at_rest(store, key, &terms, header_service, slices)
+    match crate::beef_door::verify_at_rest_stamped(store, key, &terms, header_service, slices)
         .await
         .map_err(door_error)?
     {
-        AtRest::Done(verdict) => door_judged(verdict),
-        AtRest::Pending(pending) => Err(pending_answer(&pending)),
-        AtRest::NotFound => Err(err(
+        (AtRest::Done(verdict), stamp) => {
+            door_judged(verdict).map(|judged| Judged { stamp, ..judged })
+        }
+        (AtRest::Pending(pending), _) => Err(pending_answer(&pending)),
+        (AtRest::NotFound, _) => Err(err(
             400,
             "ERR_BEEF_KEY_NOT_FOUND",
             "Could not fetch BEEF from R2: R2 object not found",
         )),
     }
+}
+
+/// A payment a box keeps unjudged (no delivery fee), held as 0.3.x held
+/// every payment (0.4.4, bsv-low #591 M3): one of the three shapes of bytes;
+/// its text no longer than a row holds (`handoff::LIST_INLINE_OBJECT_BYTES`,
+/// D1's 2,000,000 bytes), measured before a byte is read, 413
+/// `ERR_BODY_TOO_LARGE` beyond it; and its structure a BEEF's (bsv-rs
+/// 0.4.3's reader with no script and no root), a refusal naming the offset
+/// and the kind otherwise. A box that owes a delivery fee judges the payment
+/// whole and refuses nothing for its size; this one judges nothing, so it
+/// keeps nothing larger than its row.
+pub async fn check_unjudged(payment: &Value) -> Result<(), RouteResult> {
+    let carrier = payment
+        .get("tx")
+        .and_then(Carrier::of)
+        .ok_or_else(|| invalid("Payment must contain a valid Atomic BEEF."))?;
+    let shape = crate::handoff::TxShape::sent(payment, &carrier);
+    let text = crate::handoff::encoded_len(carrier.len(), shape);
+    if text > crate::handoff::LIST_INLINE_OBJECT_BYTES {
+        return Err(err(
+            413,
+            "ERR_BODY_TOO_LARGE",
+            &format!(
+                "A payment this box does not judge (it owes no delivery fee) is kept in its row, and a row holds {} bytes; this one is {} bytes as sent. Upload it (/beef/upload-url) or send it to a box that judges it.",
+                crate::handoff::LIST_INLINE_OBJECT_BYTES,
+                text
+            ),
+        ));
+    }
+    match structure_inline(&carrier).await.map_err(door_error)? {
+        None => Ok(()),
+        Some(refused) => door_answer(refused).map(|_| ()),
+    }
+}
+
+/// Whether a refusal is a reading one request did not finish.
+fn is_pending(answer: &RouteResult) -> bool {
+    answer.0["code"] == "ERR_PAYMENT_PENDING"
+}
+
+/// The spool of a refused inline payment, gone when nothing names it
+/// (`handoff::reclaim`: the same bytes sent before may rest under a row).
+/// Best-effort: an object left is reclaimed by its deadline.
+async fn forget_spool(env: &Env, store: &crate::beef_upload::R2Store<'_>, key: &str) {
+    let Ok(db) = env.d1("DB") else {
+        return;
+    };
+    let wallet = WalletInfra { env };
+    let ledger = crate::storage::D1Ledger { db: &db };
+    let rows = crate::storage::D1Rows { db: &db };
+    let seams = Seams {
+        blobs: store,
+        wallet: &wallet,
+        ledger: &ledger,
+        rows: &rows,
+        announcer: None,
+    };
+    let _ = reclaim(&seams, key).await;
+}
+
+/// The inline payment through the door with its bytes at rest (0.4.4,
+/// bsv-low #591 H1): the structure and the paying output are read in the
+/// request (no script runs for a body that pays nothing, and nothing is put
+/// at rest for it); a payment that pays is spooled to
+/// `beef_door::inline_spool_key` with the relay as its reader, and read from
+/// there for its scripts and its roots in slices (`judge_delivery_at_rest`).
+/// The same request sent again finds its bytes at the same key and resumes
+/// from the saved cursor; the verdict is the verdict of the whole.
+///
+/// The answer, and the key the bytes rest at when they were put there.
+#[allow(clippy::too_many_arguments)]
+pub async fn judge_delivery_inline_at_rest(
+    store: &dyn PaymentStore,
+    tx: &Value,
+    server_output: &Value,
+    delivery_fee: u64,
+    sender_key: &str,
+    server_wallet: &ProtoWallet,
+    header_service: Option<&dyn HeaderService>,
+    slices: &Slices<'_>,
+    reader: &str,
+    minted: Option<(&dyn crate::handoff::RowRefs, u64)>,
+) -> (Result<Judged, RouteResult>, Option<String>) {
+    let spooled = async || -> Result<String, RouteResult> {
+        let (output_index, prefix, suffix) = delivery_remittance(server_output, sender_key)?;
+        let carrier =
+            Carrier::of(tx).ok_or_else(|| invalid("Payment must contain a valid Atomic BEEF."))?;
+        if header_service.is_none() {
+            return Err(delivery_answer(PaymentVerdict::NoHeaderService).unwrap_err());
+        }
+        let expected_script = delivery_script(server_wallet, prefix, suffix, sender_key)?;
+        let terms = Terms {
+            output_index,
+            expected_script: &expected_script,
+            required_satoshis: delivery_fee,
+        };
+        if let Some(refused) = judge_output_inline(&carrier, &terms)
+            .await
+            .map_err(door_error)?
+        {
+            door_answer(refused)?;
+        }
+        let key = inline_spool_key(sender_key, &carrier).await;
+        let unavailable = |e: String| {
+            err(
+                503,
+                "ERR_PAYMENT_UNAVAILABLE",
+                &format!("The payment's BEEF could not be put at rest: {}", e),
+            )
+        };
+        let at_rest = store.stamp(&key).await.map_err(unavailable)?;
+        if at_rest.is_none_or(|stamp| stamp.size != carrier.len()) {
+            // Recorded before it is written (0.4.4, bsv-low #591 L3): a spool
+            // no send comes back for is reclaimed after its deadline.
+            if let Some((rows, now)) = minted {
+                rows.mint(&key, now + crate::handoff::MINTED_MARGIN_SECS)
+                    .await
+                    .map_err(unavailable)?;
+            }
+            store
+                .spool(&key, &mut carrier.chunks(0), carrier.len(), reader)
+                .await
+                .map_err(unavailable)?;
+        }
+        Ok(key)
+    };
+    let key = match spooled().await {
+        Ok(key) => key,
+        Err(refused) => return (Err(refused), None),
+    };
+    let judged = judge_delivery_at_rest(
+        store,
+        &key,
+        server_output,
+        delivery_fee,
+        sender_key,
+        server_wallet,
+        header_service,
+        slices,
+    )
+    .await;
+    (judged, Some(key))
 }
 
 /// A verification that one request did not finish: 503, so a client that
@@ -596,10 +800,15 @@ fn pending_answer(pending: &Pending) -> RouteResult {
             "The payment's BEEF is read ({} elements, {} bytes); {} of its {} merkle roots are checked. Send the same request again to continue.",
             pending.elements, pending.size, pending.roots_asked, pending.roots
         )
+    } else if let Some(input) = pending.input {
+        format!(
+            "The payment's BEEF is being verified ({}): {} elements read, and the scripts of the next, at byte {} of {}, run to its input {}. Send the same request again to continue from that input.",
+            pending.phase.name(), pending.elements, pending.offset, pending.size, input
+        )
     } else {
         format!(
-            "The payment's BEEF is being verified: {} elements and {} of {} bytes read. Send the same request again to continue.",
-            pending.elements, pending.offset, pending.size
+            "The payment's BEEF is being verified ({}): {} elements and {} of {} bytes read. Send the same request again to continue.",
+            pending.phase.name(), pending.elements, pending.offset, pending.size
         )
     };
     (
@@ -607,7 +816,9 @@ fn pending_answer(pending: &Pending) -> RouteResult {
             "status": "error",
             "code": "ERR_PAYMENT_PENDING",
             "description": description,
+            "phase": pending.phase.name(),
             "elements": pending.elements,
+            "input": pending.input,
             "offset": pending.offset,
             "size": pending.size,
             "rootsChecked": pending.roots_asked,
@@ -647,7 +858,11 @@ pub fn door_judged(verdict: DoorVerdict) -> Result<Judged, RouteResult> {
             "The door verified a payment and named no subject.",
         )
     })?;
-    Ok(Judged { satoshis, txid })
+    Ok(Judged {
+        satoshis,
+        txid,
+        stamp: None,
+    })
 }
 
 /// The six words to the route's answer, in one match with no catch-all arm:
@@ -839,6 +1054,12 @@ fn header_root_from_response(body: &str, height: u32) -> Result<String, String> 
         .ok_or_else(|| "response missing merkleRoot".to_string())
 }
 
+/// The relay's identity key: the reader every object of a paid message names
+/// (`handoff::READER_METADATA`).
+pub(crate) fn relay_identity(env: &Env) -> Result<String, String> {
+    server_private_key(env).map(|key| key.public_key().to_hex())
+}
+
 /// The SERVER_PRIVATE_KEY secret, parsed.
 fn server_private_key(env: &Env) -> Result<PrivateKey, String> {
     let server_key = env
@@ -863,22 +1084,47 @@ pub async fn run_fee_drain(env: &Env) {
     let wallet = WalletInfra { env };
     let ledger = crate::storage::D1Ledger { db: &db };
     let rows = crate::storage::D1Rows { db: &db };
+    let arc = ArcAnnouncer::from_env(env);
     let seams = Seams {
         blobs: &blobs,
         wallet: &wallet,
         ledger: &ledger,
         rows: &rows,
+        announcer: arc.as_ref().map(|arc| arc as &dyn Announcer),
     };
     let now = worker::Date::now().as_millis() / 1000;
+    // The announcements a broadcaster refused, or did not answer, asked
+    // again (0.4.4, bsv-low #591 M2).
+    match reask_announces(&seams, now, DRAIN_BATCH).await {
+        Ok(reasked) if reasked == Default::default() => {}
+        Ok(reasked) => worker::console_log!(
+            "AUDIT announce.reask accepted={} put_off={}",
+            reasked.accepted,
+            reasked.put_off
+        ),
+        Err(e) => worker::console_error!("AUDIT announce.reask FAILED: {e}"),
+    }
     match drain_fees(&seams, now, DRAIN_BATCH).await {
         Ok(drained) if drained == Default::default() => {}
         Ok(drained) => worker::console_log!(
-            "AUDIT fee.drain settled={} put_off={} held={}",
+            "AUDIT fee.drain settled={} put_off={} ended={}",
             drained.settled,
             drained.put_off,
-            drained.held
+            drained.ended
         ),
         Err(e) => worker::console_error!("AUDIT fee.drain FAILED: {e}"),
+    }
+    // The keys the relay minted that no send named by their deadline
+    // (`handoff::reclaim_minted`, 0.4.4 bsv-low #591 L3).
+    match crate::handoff::reclaim_minted(&seams, now, RECLAIM_BATCH).await {
+        Ok(expired) if expired == Default::default() => {}
+        Ok(expired) => worker::console_log!(
+            "AUDIT beef.minted deleted={} named={} put_off={}",
+            expired.deleted,
+            expired.named,
+            expired.put_off
+        ),
+        Err(e) => worker::console_error!("AUDIT beef.minted FAILED: {e}"),
     }
     // The objects rows have let go of (`handoff::reclaim_released`): one
     // indexed read when there are none.
@@ -915,8 +1161,155 @@ pub async fn forget_unnamed(
         wallet: &wallet,
         ledger: &ledger,
         rows: &rows,
+        announcer: None,
     };
+    // A row written while a reclaim held its key, whose bytes are gone: the
+    // one case the claim cannot spare, logged with its key (0.4.4, bsv-low
+    // #591 L2).
+    if let (false, Some(key)) = (failed, handed.kept.as_deref()) {
+        if crate::handoff::orphaned(&seams, key).await {
+            worker::console_error!(
+                "AUDIT beef.orphan key={key} rows={rows_naming}: a reclaim held the key as the send named it, and its bytes are gone"
+            );
+        }
+    }
     crate::handoff::forget_unnamed(&seams, rows_naming, handed, r2_key, failed).await;
+}
+
+/// The broadcaster a verified payment's subject is announced to (0.4.4,
+/// bsv-low #591 M2): an ARC named by the `ARC_URL` var, with the
+/// `ARC_API_KEY` secret as a bearer token when it is set. A deployment that
+/// names none announces nothing and says so on the row.
+///
+/// The body is the BEEF as bytes, `application/octet-stream`, to `/v1/tx`:
+/// ARC tells a BEEF by its bytes (V1 or V2) and has no case for the Atomic
+/// prefix, so the 36 bytes of the prefix are left off (`[SRC] arc@e7efc5b
+/// internal/api/handler/parsers.go:20-61`, `internal/beef/beef.go:24-34`, read
+/// in bsv-stack-lean `docs/readings/broadcast-body-forms.md`; wallet-infra's
+/// stream of a BEEF at rest does the same, `src/broadcast_at_rest.rs:32-38`).
+/// Bytes at rest are handed to the fetch as R2's own stream, never read into
+/// the Worker. The answer is a hint: 2xx is taken, anything else is not, and
+/// the word is the status and what ARC said.
+pub struct ArcAnnouncer<'a> {
+    env: &'a Env,
+    url: String,
+}
+
+/// The Atomic BEEF prefix (BRC-95): its magic, then the subject's txid.
+const ATOMIC_PREFIX: [u8; 4] = [0x01, 0x01, 0x01, 0x01];
+const ATOMIC_PREFIX_LEN: u64 = 36;
+
+/// What an ARC word keeps of its body.
+const ARC_WORD_CHARS: usize = 300;
+
+impl<'a> ArcAnnouncer<'a> {
+    pub fn from_env(env: &'a Env) -> Option<Self> {
+        let url = env.var("ARC_URL").ok()?.to_string();
+        let url = url.trim().trim_end_matches('/').to_string();
+        (!url.is_empty()).then_some(Self { env, url })
+    }
+
+    async fn post(&self, body: wasm_bindgen::JsValue) -> Result<Hint, String> {
+        let headers = worker::Headers::new();
+        headers
+            .set("Content-Type", "application/octet-stream")
+            .map_err(|e| e.to_string())?;
+        if let Ok(key) = self.env.secret("ARC_API_KEY") {
+            headers
+                .set("Authorization", &format!("Bearer {}", key))
+                .map_err(|e| e.to_string())?;
+        }
+        let mut init = worker::RequestInit::new();
+        init.with_method(worker::Method::Post)
+            .with_headers(headers)
+            .with_body(Some(body));
+        let request = worker::Request::new_with_init(&format!("{}/v1/tx", self.url), &init)
+            .map_err(|e| e.to_string())?;
+        let response = worker::Fetch::Request(request)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let (status, text) = status_and_body(response).await?;
+        let said: String = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v.get("txStatus")
+                    .or_else(|| v.get("title"))
+                    .and_then(|w| w.as_str().map(str::to_string))
+            })
+            .unwrap_or(text)
+            .chars()
+            .take(ARC_WORD_CHARS)
+            .collect();
+        Ok(Hint {
+            accepted: (200..300).contains(&status),
+            word: format!("ARC {}: {}", status, said),
+        })
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Announcer for ArcAnnouncer<'_> {
+    async fn announce(&self, subject: Subject<'_>) -> Result<Hint, String> {
+        match subject {
+            Subject::InHand(carrier) => {
+                let mut bytes = carrier.bytes(0, carrier.len() as usize);
+                if bytes.starts_with(&ATOMIC_PREFIX) {
+                    bytes.drain(..(ATOMIC_PREFIX_LEN as usize).min(bytes.len()));
+                }
+                self.post(js_sys::Uint8Array::from(&bytes[..]).into()).await
+            }
+            Subject::AtRest { key, stamp } => {
+                let bucket = self
+                    .env
+                    .bucket("BEEF_BLOBS")
+                    .map_err(|e| format!("R2 binding BEEF_BLOBS: {}", e))?;
+                let lead = bucket
+                    .get(key)
+                    .range(worker::Range::OffsetWithLength {
+                        offset: 0,
+                        length: 4,
+                    })
+                    .execute()
+                    .await
+                    .map_err(|e| format!("R2 get: {}", e))?
+                    .ok_or("R2 object not found")?;
+                let lead = lead
+                    .body()
+                    .ok_or("R2 object body missing")?
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("R2 body read: {}", e))?;
+                let from = if lead.starts_with(&ATOMIC_PREFIX) {
+                    ATOMIC_PREFIX_LEN
+                } else {
+                    0
+                };
+                let object = bucket
+                    .get(key)
+                    .range(worker::Range::OffsetToEnd { offset: from })
+                    .execute()
+                    .await
+                    .map_err(|e| format!("R2 get: {}", e))?
+                    .ok_or("R2 object not found")?;
+                if object.etag() != stamp.etag {
+                    return Err("the R2 object changed".to_string());
+                }
+                let body = object
+                    .body()
+                    .ok_or("R2 object body missing")?
+                    .response_body()
+                    .map_err(|e| format!("R2 body: {}", e))?;
+                match body {
+                    worker::ResponseBody::Stream(stream) => self.post(stream.into()).await,
+                    worker::ResponseBody::Body(bytes) => {
+                        self.post(js_sys::Uint8Array::from(&bytes[..]).into()).await
+                    }
+                    worker::ResponseBody::Empty => Err("R2 object body empty".to_string()),
+                }
+            }
+        }
+    }
 }
 
 /// wallet-infra behind `WALLET_STORAGE_URL`, as the hand-off's `FeeWallet`.
@@ -1684,6 +2077,8 @@ mod tests {
                     millis: slice_millis,
                 },
                 lookups: ROOT_LOOKUPS_PER_PASS,
+                inputs: u64::MAX,
+                weight: u64::MAX,
             },
         )
         .await
@@ -1718,6 +2113,7 @@ mod tests {
         let bytes = over_the_old_door(FEE);
         let store = MemStore::with(R2_KEY, &bytes);
         let mut offsets = Vec::new();
+        let mut phases = Vec::new();
         let paid = loop {
             match check_at_rest(&store, 0).await {
                 Ok(paid) => break paid,
@@ -1728,16 +2124,58 @@ mod tests {
                         "{body}"
                     );
                     assert_eq!(body["size"], json!(bytes.len()));
-                    assert_eq!(body["elements"], json!(offsets.len() + 1));
+                    assert_eq!(body["elements"], json!(offsets.len() % 3 + 1));
                     offsets.push(body["offset"].as_u64().unwrap());
+                    phases.push(body["phase"].as_str().unwrap().to_string());
                 }
             }
         };
         assert_eq!(paid, FEE);
-        // The BUMP, the parent, the subject; a last pass reads the end.
-        assert_eq!(offsets.len(), 3);
-        assert!(offsets.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(offsets[2], bytes.len() as u64);
+        // The BUMP, the parent, the subject, read for the structure and
+        // then for the scripts (0.4.4); a last pass reads the end.
+        assert_eq!(
+            phases,
+            ["structure"; 3]
+                .iter()
+                .chain(&["scripts"; 3])
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        for read in offsets.chunks(3) {
+            assert!(read.windows(2).all(|w| w[0] < w[1]));
+            assert_eq!(read[2], bytes.len() as u64);
+        }
+    }
+
+    // ---- M3: a body no delivery fee judges ----
+
+    #[tokio::test]
+    async fn an_unjudged_body_is_read_for_its_structure_and_held_to_its_row() {
+        let good = atomic_beef(&[(FEE, payer_script())]);
+        let tx = |tx: Value| json!({ "tx": tx });
+        assert_eq!(check_unjudged(&tx(json!(hex::encode(&good)))).await, Ok(()));
+        // Bytes that are no BEEF are refused naming them.
+        let (body, status) = check_unjudged(&tx(json!("00010203"))).await.unwrap_err();
+        assert_eq!(
+            (status, &body["code"]),
+            (400, &json!("ERR_INVALID_PAYMENT"))
+        );
+        assert_eq!(body["offset"], 0, "{body}");
+        // A text longer than a row is refused before a byte is read: 2,000,001
+        // bytes of hex is no BEEF either, and the answer is the bound's.
+        let long = "00".repeat(1_000_000) + "0";
+        let (body, status) = check_unjudged(&tx(json!(long + "0"))).await.unwrap_err();
+        assert_eq!(
+            (status, &body["code"]),
+            (413, &json!("ERR_BODY_TOO_LARGE")),
+            "{body}"
+        );
+        let at_bound = "00".repeat(999_999);
+        let (_, status) = check_unjudged(&json!(at_bound)).await.unwrap_err();
+        assert_eq!(
+            status, 400,
+            "within the bound the bytes are read, and refused as bytes"
+        );
     }
 
     #[test]

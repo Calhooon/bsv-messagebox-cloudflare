@@ -2,9 +2,11 @@
 //! read as a stream, one element in hand, never refused for its size or its
 //! counts.
 //!
-//! The reader is bsv-rs 0.4.3's `StreamVerifier`
-//! (`src/transaction/beef_stream.rs:2641-2758`): one step per element, a
-//! `Cursor` between any two. What it holds is the element in hand and its
+//! The reader is bsv-rs 0.4.4's `StreamVerifier`
+//! (`src/transaction/beef_stream.rs:2770-2950`): one step per element, a
+//! `Cursor` between any two, and under a budget a pause between two inputs
+//! of a transaction (`step_until`, `Timed::Paused`), the cursor then naming
+//! the input reached (`Cursor::input_reached`). What it holds is the element in hand and its
 //! index (one entry per element); what it refuses is invalid bytes, at an
 //! offset, by one of twenty kinds, none of which is a size or a count. The
 //! nineteenth is 0.4.1's: a transaction with no input is no transaction
@@ -29,25 +31,32 @@
 //! could not be read across requests through it. The door reads the structure
 //! and the scripts itself and hands the middleware the one thing its words
 //! are about: the subject transaction, for the output check
-//! (`verify_payment_output_only`). The order is the middleware's
-//! (`src/payment_core.rs:578-652`): no header service; then the bytes and the
-//! spends (`InvalidBeef`, `SpendRefused`); then the output (script, then
-//! amount); then a proof; then a height no header can carry; then the roots,
-//! lowest height first, a root the header does not carry before a lookup that
-//! could not answer. No root is asked before the output is judged, so a
-//! payment that does not pay costs the header service nothing; no payment is
-//! accepted with a root unasked.
+//! (`verify_payment_output_only`). The order (0.4.4, bsv-low #591 H1): no
+//! header service; then the structure, read with no script run
+//! (`InvalidBeef`); then the output (script, then amount), so a body that
+//! pays nothing is refused before it costs a script; then the scripts, a
+//! second reading of a payment that pays (`SpendRefused`); then a proof; then
+//! a height no header can carry; then the roots, lowest height first, a root
+//! the header does not carry before a lookup that could not answer. Through
+//! 0.4.3 the scripts ran before the output was read, the middleware's own
+//! order (`src/payment_core.rs:578-652`): a wide body carrying no satoshis
+//! cost the whole walk. No root is asked before the output is judged and the
+//! scripts allow every spend, so a payment that does not pay costs the
+//! header service nothing; no payment is accepted with a root unasked.
 //!
 //! Two sources: the inline `payment.tx` (`Carrier`, decoded a chunk at a time
 //! from the JSON value the request carried; the BRC-31 layer, bsv-middleware-
 //! cloudflare 0.5.0, has read that body whole before the route runs, as it
 //! signs over it: `src/transport/cloudflare.rs:168-178`) and an object at rest
 //! (`BeefStore`, the R2 bucket in the Worker). Only bytes at rest can be
-//! resumed: `verify_at_rest` reads for one slice of time, saves the cursor
-//! beside the object and answers `Pending`; the next request continues from
-//! the cursor's offset.
+//! resumed: `verify_at_rest` reads for one slice (of time, and of inputs
+//! run), saves the cursor beside the object and answers `Pending`; the next
+//! request continues from the cursor's offset. Since 0.4.4 the slice is asked
+//! between two inputs as well as between two elements, so a wide transaction
+//! pauses inside itself and the next request runs its scripts from the input
+//! reached, never from its first (bsv-rs 0.4.4, bsv-low #591 H1).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read};
 use std::rc::Rc;
@@ -59,7 +68,7 @@ use bsv_middleware_rs::{
     UnverifiableReason,
 };
 use bsv_rs::transaction::beef_stream::{display_hex, Hash32};
-use bsv_rs::transaction::{Cursor, Headers, Progress, StreamVerifier, Verdict};
+use bsv_rs::transaction::{Cursor, Headers, Progress, StreamVerifier, Timed, Verdict};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -76,6 +85,27 @@ pub const VERIFY_SLICE_MILLIS: u64 = 15_000;
 /// its place: each is a subrequest, and a request has a bounded number of
 /// those. A slice, not a bound.
 pub const ROOT_LOOKUPS_PER_PASS: usize = 500;
+
+/// The inputs whose scripts one request runs for an object at rest before it
+/// saves its place (0.4.4, bsv-rs 0.4.4's clock between inputs): the slice
+/// counted in work, beside the slice in time. A Worker's clock moves only at
+/// I/O, and between two inputs of a transaction in hand there is none, so the
+/// time slice alone never pauses inside a transaction there; this does. A
+/// slice, not a bound. At 0.4.4 a P2PKH input under a FORKID digest costs
+/// about 51 us native release (`tests/hostile_wide_door.rs`,
+/// `the_widest_element_at_0_4_4`), so 20,000 of them about 1.1 s.
+pub const SCRIPT_INPUTS_PER_PASS: u64 = 20_000;
+
+/// The weight one request's inputs may carry before it saves its place: each
+/// input weighs the bytes of the transaction it is in (about: the bytes the
+/// reading fetched since the element before it). A signature over the
+/// original digest (no FORKID, or the CHRONICLE bit) serializes the whole
+/// transaction (bsv-rs 0.4.4's named risk), so an input's cost grows with
+/// its transaction and a count of inputs alone bounds nothing there: 4,000
+/// such inputs cost 1.39 s native release, 347 us each. Ten billion is about
+/// 4.8 s of that work native (2.1 billion weighed a second, measured); a
+/// transaction under 500 KB is held by the count first. A slice, not a bound.
+pub const SCRIPT_WEIGHT_PER_PASS: u64 = 10_000_000_000;
 
 // ---------------------------------------------------------------------------
 // The sources
@@ -210,9 +240,15 @@ struct FeedState {
     chunks: VecDeque<Vec<u8>>,
     at: usize,
     ended: bool,
+    /// The bytes handed to the verifier.
+    taken: u64,
 }
 
 impl Feed {
+    fn taken(&self) -> u64 {
+        self.0.borrow().taken
+    }
+
     fn push(&self, chunk: Vec<u8>) {
         self.0.borrow_mut().chunks.push_back(chunk);
     }
@@ -232,6 +268,7 @@ impl Read for Feed {
                     let n = out.len().min(chunk.len() - at);
                     out[..n].copy_from_slice(&chunk[at..at + n]);
                     state.at += n;
+                    state.taken += n as u64;
                     return Ok(n);
                 }
                 Some(_) => {
@@ -267,6 +304,19 @@ pub struct Slice<'a> {
     pub millis: u64,
 }
 
+thread_local! {
+    /// The elements a script-running reading has stepped on this thread.
+    static SCRIPTED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The elements a script-running reading has stepped on this thread since it
+/// started: every input of an unproven transaction among them was executed
+/// against the output it spends. A count for the witnesses (a payment that
+/// pays nothing runs no script), never a bound.
+pub fn scripted_elements() -> u64 {
+    SCRIPTED.with(Cell::get)
+}
+
 /// What one reading came to.
 enum Reading {
     /// The structure is valid and every unproven spend is one its script
@@ -274,38 +324,114 @@ enum Reading {
     Valid(Cursor),
     /// Invalid bytes, or a spend the interpreter refused.
     Refused(Verdict),
-    /// The slice is spent; the cursor is the state between two elements.
+    /// The slice is spent; the cursor is the state between two elements, or,
+    /// inside a transaction, the state before it and the input reached
+    /// (`Cursor::input_reached`, bsv-rs 0.4.4).
     Paused(Cursor),
 }
 
+/// The two readings of a payment (0.4.4, bsv-low #591 H1). The structure
+/// first: no script is run and no output kept (`StreamVerifier::
+/// structure_only`, bsv-rs 0.4.3 `beef_stream.rs:2664-2671`), so the door can
+/// judge the paying output before it pays for anything else. Then, for a
+/// payment that pays, the scripts (`StreamVerifier::new`): every input of an
+/// unproven transaction executed against the output it spends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Structure,
+    Scripts,
+}
+
+/// When a request's slice began: the slice, the clock's reading then, and the
+/// inputs run since and their weight. One request's readings share it.
+struct Since<'a> {
+    slice: &'a Slice<'a>,
+    started: u64,
+    /// The inputs one request runs before it pauses (`Slices::inputs`).
+    inputs: u64,
+    ran: Cell<u64>,
+    /// The weight they may carry (`Slices::weight`).
+    weight: u64,
+    weighed: Cell<u64>,
+}
+
+impl<'a> Since<'a> {
+    fn now(slices: &'a Slices<'a>) -> Self {
+        Self {
+            slice: &slices.time,
+            started: (slices.time.clock)(),
+            inputs: slices.inputs,
+            ran: Cell::new(0),
+            weight: slices.weight,
+            weighed: Cell::new(0),
+        }
+    }
+
+    fn spent(&self) -> bool {
+        self.ran.get() >= self.inputs
+            || self.weighed.get() >= self.weight
+            || (self.slice.clock)().saturating_sub(self.started) >= self.slice.millis
+    }
+
+    /// Asked between two inputs of a transaction (bsv-rs 0.4.4
+    /// `StreamVerifier::step_until`): one more input has run, in a
+    /// transaction of about `bytes`.
+    fn spent_another(&self, bytes: u64) -> bool {
+        self.ran.set(self.ran.get().saturating_add(1));
+        self.weighed.set(self.weighed.get().saturating_add(bytes));
+        self.spent()
+    }
+}
+
 /// Reads `chunks` (positioned at the start, or at the cursor's offset) to a
-/// verdict, or until the slice is spent and the element in hand is done. The
-/// slice is looked at when a chunk is fetched, so every reading that fetches
-/// one finishes at least one element.
+/// verdict, or until the slice is spent. The slice is looked at when a chunk
+/// is fetched, and the element in hand is then finished; and (0.4.4, bsv-rs
+/// 0.4.4) between two inputs of a transaction whose scripts run, where the
+/// reading pauses inside the transaction with at least one input run and the
+/// cursor names the input reached. So every reading that fetches a chunk or
+/// runs an input moves. A cursor resumes the pass it was saved in (the cursor
+/// carries whether spends are checked) and, paused inside a transaction, its
+/// scripts from the input reached, never from its first.
 async fn read(
     from: Option<Cursor>,
+    pass: Pass,
     chunks: &mut dyn Chunks,
-    slice: Option<&Slice<'_>>,
+    slice: Option<&Since<'_>>,
 ) -> Result<Reading, String> {
     let feed = Feed::default();
-    let mut verifier = match from {
-        Some(cursor) => StreamVerifier::resume(cursor, feed.clone(), AskedAfter),
-        None => StreamVerifier::new(feed.clone(), AskedAfter, None),
+    let mut verifier = match (from, pass) {
+        (Some(cursor), _) => StreamVerifier::resume(cursor, feed.clone(), AskedAfter),
+        (None, Pass::Structure) => StreamVerifier::structure_only(feed.clone(), AskedAfter, None),
+        (None, Pass::Scripts) => StreamVerifier::new(feed.clone(), AskedAfter, None),
     };
-    let started = slice.map(|s| (s.clock)());
+    // Where the element in hand began, in the bytes handed over: an input
+    // weighs what was fetched since.
+    let element_from = Cell::new(0u64);
+    let mut between_inputs = || {
+        let bytes = feed.taken() - element_from.get();
+        slice.is_some_and(|since| since.spent_another(bytes))
+    };
     let mut pause = false;
     loop {
-        match verifier.step() {
-            Ok(Progress::Stepped) if pause => return Ok(Reading::Paused(verifier.cursor())),
-            Ok(Progress::Stepped) => {}
-            Ok(Progress::Verdict(Verdict::Valid { .. })) => {
+        match verifier.step_until(&mut between_inputs) {
+            Ok(Timed::Paused) => return Ok(Reading::Paused(verifier.cursor())),
+            Ok(Timed::Progress(Progress::Stepped)) => {
+                element_from.set(feed.taken());
+                if pass == Pass::Scripts {
+                    SCRIPTED.with(|n| n.set(n.get() + 1));
+                }
+                if pause {
+                    return Ok(Reading::Paused(verifier.cursor()));
+                }
+            }
+            Ok(Timed::Progress(Progress::Verdict(Verdict::Valid { .. }))) => {
                 return Ok(Reading::Valid(verifier.cursor()))
             }
-            Ok(Progress::Verdict(refused)) => return Ok(Reading::Refused(refused)),
+            Ok(Timed::Progress(Progress::Verdict(refused))) => {
+                return Ok(Reading::Refused(refused))
+            }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                if let (Some(slice), Some(started)) = (slice, started) {
-                    pause |= (slice.clock)().saturating_sub(started) >= slice.millis;
-                }
+                pause |= slice.is_some_and(Since::spent);
                 match chunks.next().await? {
                     Some(chunk) => feed.push(chunk),
                     None => feed.end(),
@@ -446,10 +572,12 @@ fn malformed(what: impl Into<String>) -> PaymentVerdict {
 }
 
 /// The last raw transaction a reading folded and the offset of its leading
-/// byte: the subject. bsv-rs 0.4.3's verifier does not hand out the element
+/// byte: the subject. bsv-rs 0.4.4's verifier does not hand out the element
 /// it stepped, so this is read from the cursor's own bytes
-/// (`Cursor::to_binary`, `beef_stream.rs:2322-2362`, byte for byte 0.4.1's:
-/// the magic `BSC1`, the frame, then the index's `last_raw`). The door holds the bytes it then
+/// (`Cursor::to_binary`, `beef_stream.rs:2402-2512`, between two elements
+/// byte for byte 0.4.1's: the magic `BSC1`, the frame, then the index's
+/// `last_raw`; a paused cursor appends after them, and the door reads a tip
+/// only at a reading's end). The door holds the bytes it then
 /// fetches to this txid (`subject_raw`), so a cursor laid out otherwise is an
 /// error here and never a wrong answer.
 fn tip_of(cursor: &Cursor) -> Result<Option<(Hash32, u64)>, DoorError> {
@@ -648,8 +776,83 @@ async fn roots_word(
     }
 }
 
-/// The inline payment through the door, in one pass: the bytes are in the
-/// request and not at rest, so there is no cursor to come back to.
+/// The output word on the subject of a reading: the satoshis paid, or the
+/// word that refuses the payment. `subject` fetches the stream's bytes from
+/// an offset to the end (the subject is the last element).
+async fn paid_by(
+    cursor: &Cursor,
+    terms: &Terms<'_>,
+    subject: impl AsyncFnOnce(u64) -> Result<Vec<u8>, DoorError>,
+) -> Result<Result<(Hash32, u64), PaymentVerdict>, DoorError> {
+    let Some((txid, at)) = tip_of(cursor)? else {
+        return Ok(Err(PaymentVerdict::Unverifiable(
+            UnverifiableReason::NoTransaction,
+        )));
+    };
+    let raw = subject_raw(subject(at).await?, &txid)?;
+    Ok(match output_word(&raw, terms) {
+        PaymentVerdict::Verified { satoshis } => Ok((txid, satoshis)),
+        other => Err(other),
+    })
+}
+
+/// The first half of the door on an inline payment: the structure, read with
+/// no script run, and the paying output on its subject. `None` when the
+/// payment pays (its scripts and roots are still to come); the refusal
+/// otherwise. What a payment that pays nothing costs, and all it costs.
+pub async fn judge_output_inline(
+    carrier: &Carrier<'_>,
+    terms: &Terms<'_>,
+) -> Result<Option<DoorVerdict>, DoorError> {
+    Ok(structure_and_output(carrier, terms).await?.err())
+}
+
+async fn structure_and_output(
+    carrier: &Carrier<'_>,
+    terms: &Terms<'_>,
+) -> Result<Result<(Hash32, u64), DoorVerdict>, DoorError> {
+    let cursor = match read(None, Pass::Structure, &mut carrier.chunks(0), None)
+        .await
+        .map_err(DoorError::Source)?
+    {
+        Reading::Valid(cursor) => cursor,
+        Reading::Refused(refused) => return Ok(Err(refusal_word(refused))),
+        Reading::Paused(_) => {
+            return Err(DoorError::Internal(
+                "a reading with no slice paused".to_string(),
+            ))
+        }
+    };
+    Ok(
+        paid_by(&cursor, terms, async |at| Ok(carrier.bytes(at, usize::MAX)))
+            .await?
+            .map_err(DoorVerdict::from),
+    )
+}
+
+/// The structure of an inline payment alone (0.4.4, bsv-low #591 M3): what a
+/// box that owes no delivery fee reads of a body it keeps unjudged. No
+/// script, no root, no output. `None` when the bytes are a BEEF; the refusal
+/// naming them otherwise.
+pub async fn structure_inline(carrier: &Carrier<'_>) -> Result<Option<DoorVerdict>, DoorError> {
+    match read(None, Pass::Structure, &mut carrier.chunks(0), None)
+        .await
+        .map_err(DoorError::Source)?
+    {
+        Reading::Valid(_) => Ok(None),
+        Reading::Refused(refused) => Ok(Some(refusal_word(refused))),
+        Reading::Paused(_) => Err(DoorError::Internal(
+            "a reading with no slice paused".to_string(),
+        )),
+    }
+}
+
+/// The inline payment through the door, in one request: the bytes are in the
+/// request and not at rest, so there is no cursor to come back to. The order
+/// is the at-rest door's: the structure, the output, the scripts, the roots.
+/// The route reads an inline payment so only where no bucket is bound; with
+/// one it is spooled after its output and read at rest
+/// (`payments::judge_delivery_inline_at_rest`).
 pub async fn verify_inline(
     carrier: &Carrier<'_>,
     terms: &Terms<'_>,
@@ -658,7 +861,14 @@ pub async fn verify_inline(
     let Some(headers) = header_service else {
         return Ok(PaymentVerdict::NoHeaderService.into());
     };
-    let cursor = match read(None, &mut carrier.chunks(0), None)
+    // The structure and the output: no script runs before the output is
+    // judged.
+    let (txid, satoshis) = match structure_and_output(carrier, terms).await? {
+        Ok(paid) => paid,
+        Err(refused) => return Ok(refused),
+    };
+    // A payment that pays: its scripts, then its roots.
+    let cursor = match read(None, Pass::Scripts, &mut carrier.chunks(0), None)
         .await
         .map_err(DoorError::Source)?
     {
@@ -670,20 +880,27 @@ pub async fn verify_inline(
             ))
         }
     };
-    let Some((txid, at)) = tip_of(&cursor)? else {
-        return Ok(PaymentVerdict::Unverifiable(UnverifiableReason::NoTransaction).into());
-    };
-    let subject = subject_raw(carrier.bytes(at, usize::MAX), &txid)?;
-    let satoshis = match output_word(&subject, terms) {
-        PaymentVerdict::Verified { satoshis } => satoshis,
-        other => return Ok(other.into()),
-    };
     match roots_word(&roots_of(&cursor), 0, None, headers, satoshis).await {
         Rooted::Word { word, .. } => Ok(judged(word, txid)),
         Rooted::Paused(_) => Err(DoorError::Internal(
             "the roots with no slice paused".to_string(),
         )),
     }
+}
+
+/// Where an inline payment is spooled before its scripts run (0.4.4,
+/// bsv-low #591 H1): `<sender's identity key>/inline-<sha256 of the BEEF>.beef`.
+/// The same request sent again names the same key, so it finds the bytes and
+/// the door's state beside them and resumes; the key is the sender's prefix
+/// (`beef_upload::key_is_owned_by`), and `/beef/upload-url` presigns only
+/// `<uuid>.beef`, so no upload is ever at it.
+pub async fn inline_spool_key(sender: &str, carrier: &Carrier<'_>) -> String {
+    let mut sha = Sha256::new();
+    let mut chunks = carrier.chunks(0);
+    while let Ok(Some(chunk)) = chunks.next().await {
+        sha.update(&chunk);
+    }
+    format!("{}/inline-{}.beef", sender, hex::encode(sha.finalize()))
 }
 
 // ---------------------------------------------------------------------------
@@ -721,16 +938,52 @@ pub fn state_key(key: &str) -> String {
     format!("door-state/{}", key)
 }
 
-const STATE_MAGIC: &[u8; 5] = b"RMBD1";
+/// The state's layout: `RMBD2` since 0.4.4, a phase in place of 0.4.3's
+/// rooting flag. A state of 0.4.3's (`RMBD1`) is no state, and its reading
+/// starts over.
+const STATE_MAGIC: &[u8; 5] = b"RMBD2";
+
+/// Where a reading at rest is (0.4.4, bsv-low #591 H1): the structure, then
+/// (for a payment whose output pays) the scripts, then the roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Structure,
+    Scripts,
+    Roots,
+}
+
+impl Phase {
+    fn byte(self) -> u8 {
+        match self {
+            Phase::Structure => 0,
+            Phase::Scripts => 1,
+            Phase::Roots => 2,
+        }
+    }
+
+    fn of(byte: u8) -> Option<Self> {
+        [Phase::Structure, Phase::Scripts, Phase::Roots]
+            .into_iter()
+            .find(|phase| phase.byte() == byte)
+    }
+
+    /// The word a pending answer names it by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Phase::Structure => "structure",
+            Phase::Scripts => "scripts",
+            Phase::Roots => "roots",
+        }
+    }
+}
 
 /// The door's state for one object at rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Rest {
     /// The object the state is of.
     stamp: Stamp,
-    /// The structure is read to its end and valid; the roots are being asked.
-    rooting: bool,
-    /// The roots asked and carried (`roots_of`'s order).
+    phase: Phase,
+    /// The roots asked and carried (`roots_of`'s order), in `Phase::Roots`.
     roots_asked: u64,
     cursor: Cursor,
 }
@@ -741,7 +994,7 @@ impl Rest {
         let etag = self.stamp.etag.as_bytes();
         let mut out = Vec::with_capacity(32 + etag.len() + cursor.len());
         out.extend_from_slice(STATE_MAGIC);
-        out.push(self.rooting as u8);
+        out.push(self.phase.byte());
         out.extend_from_slice(&self.stamp.size.to_le_bytes());
         out.extend_from_slice(&self.roots_asked.to_le_bytes());
         out.extend_from_slice(&(etag.len() as u32).to_le_bytes());
@@ -763,7 +1016,7 @@ impl Rest {
                 size: u64_at(1),
                 etag: String::from_utf8(etag.to_vec()).ok()?,
             },
-            rooting: head[0] == 1,
+            phase: Phase::of(head[0])?,
             roots_asked: u64_at(9),
             cursor: Cursor::from_binary(cursor).ok()?,
         })
@@ -773,8 +1026,14 @@ impl Rest {
 /// How far a pending verification has come.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
+    /// The reading the request paused in.
+    pub phase: Phase,
     /// The elements read.
     pub elements: u64,
+    /// Paused inside a transaction (0.4.4, bsv-rs 0.4.4): the input reached,
+    /// the first whose script has not run; the transaction is the element
+    /// after `elements` and starts at `offset`. `None` between two elements.
+    pub input: Option<u32>,
     /// The bytes read, of `size`.
     pub offset: u64,
     pub size: u64,
@@ -801,12 +1060,23 @@ pub enum AtRest {
 pub struct Slices<'a> {
     pub time: Slice<'a>,
     pub lookups: usize,
+    /// The inputs whose scripts one request runs before it pauses
+    /// (`SCRIPT_INPUTS_PER_PASS`), asked between two inputs as the clock is.
+    pub inputs: u64,
+    /// The weight those inputs may carry, each the bytes of its transaction
+    /// (`SCRIPT_WEIGHT_PER_PASS`).
+    pub weight: u64,
 }
 
 /// The object at `key` through the door, for one slice: read from the saved
 /// cursor (or the start) as a stream, never held whole; on a pause the cursor
 /// is saved beside the object. A state of another upload of the object (a
 /// different size or etag) is dropped and the reading starts over.
+///
+/// The order (0.4.4, bsv-low #591 H1): the structure is read to its end with
+/// no script run, the paying output judged on the subject, and only a payment
+/// that pays is read again for its scripts, then its roots. A body that pays
+/// nothing costs one structural pass and no script.
 pub async fn verify_at_rest(
     store: &dyn BeefStore,
     key: &str,
@@ -814,13 +1084,44 @@ pub async fn verify_at_rest(
     header_service: Option<&dyn HeaderService>,
     slices: &Slices<'_>,
 ) -> Result<AtRest, DoorError> {
+    verify_at_rest_stamped(store, key, terms, header_service, slices)
+        .await
+        .map(|(answer, _)| answer)
+}
+
+/// `verify_at_rest`, with the stamp of the object the door read (0.4.4,
+/// bsv-low #591 L1): the bytes the verdict is about, which the hand-off holds
+/// what it records to.
+pub async fn verify_at_rest_stamped(
+    store: &dyn BeefStore,
+    key: &str,
+    terms: &Terms<'_>,
+    header_service: Option<&dyn HeaderService>,
+    slices: &Slices<'_>,
+) -> Result<(AtRest, Option<Stamp>), DoorError> {
     let Some(headers) = header_service else {
-        return Ok(AtRest::Done(PaymentVerdict::NoHeaderService.into()));
+        return Ok((AtRest::Done(PaymentVerdict::NoHeaderService.into()), None));
     };
     let source = DoorError::Source;
     let Some(stamp) = store.stamp(key).await.map_err(source)? else {
-        return Ok(AtRest::NotFound);
+        return Ok((AtRest::NotFound, None));
     };
+    let read = stamp.clone();
+    door_at_rest(store, key, terms, headers, slices, stamp)
+        .await
+        .map(|answer| (answer, Some(read)))
+}
+
+async fn door_at_rest(
+    store: &dyn BeefStore,
+    key: &str,
+    terms: &Terms<'_>,
+    headers: &dyn HeaderService,
+    slices: &Slices<'_>,
+    stamp: Stamp,
+) -> Result<AtRest, DoorError> {
+    let source = DoorError::Source;
+    let since = Since::now(slices);
     let state_key = state_key(key);
     let saved = store
         .load(&state_key)
@@ -828,94 +1129,99 @@ pub async fn verify_at_rest(
         .map_err(source)?
         .and_then(|bin| Rest::from_binary(&bin))
         .filter(|rest| rest.stamp == stamp);
-    let (cursor, roots_asked) = match saved {
-        Some(rest) if rest.rooting => (rest.cursor, rest.roots_asked as usize),
-        saved => {
-            let from = saved.map(|rest| rest.cursor);
-            let offset = from.as_ref().map_or(0, Cursor::offset);
-            let mut chunks = store.open(key, offset, &stamp).await.map_err(source)?;
-            match read(from, chunks.as_mut(), Some(&slices.time))
-                .await
-                .map_err(source)?
-            {
-                Reading::Valid(cursor) => (cursor, 0),
-                Reading::Refused(refused) => {
-                    store.clear(&state_key).await.map_err(source)?;
-                    return Ok(AtRest::Done(refusal_word(refused)));
+    let (mut phase, mut from, mut roots_asked) = match saved {
+        Some(rest) => (rest.phase, Some(rest.cursor), rest.roots_asked as usize),
+        None => (Phase::Structure, None, 0),
+    };
+    let subject = async |at: u64| -> Result<Vec<u8>, DoorError> {
+        // The subject alone is read again: one element.
+        let mut tail = Vec::new();
+        let mut chunks = store.open(key, at, &stamp).await.map_err(source)?;
+        while let Some(chunk) = chunks.next().await.map_err(source)? {
+            tail.extend_from_slice(&chunk);
+        }
+        Ok(tail)
+    };
+    let pause = async |phase: Phase, cursor: Cursor, roots_asked: u64, roots: u64| {
+        let pending = Pending {
+            phase,
+            elements: cursor.elements_read(),
+            input: cursor.input_reached(),
+            offset: cursor.offset(),
+            size: stamp.size,
+            roots_asked,
+            roots,
+        };
+        let rest = Rest {
+            stamp: stamp.clone(),
+            phase,
+            roots_asked,
+            cursor,
+        };
+        store
+            .save(&state_key, rest.to_binary())
+            .await
+            .map_err(source)?;
+        Ok(AtRest::Pending(pending))
+    };
+    let done = async |verdict: DoorVerdict| {
+        store.clear(&state_key).await.map_err(source)?;
+        Ok(AtRest::Done(verdict))
+    };
+    // The output word, when this request judged it.
+    let mut known = None;
+    while phase != Phase::Roots {
+        let pass = match phase {
+            Phase::Structure => Pass::Structure,
+            _ => Pass::Scripts,
+        };
+        let offset = from.as_ref().map_or(0, Cursor::offset);
+        let mut chunks = store.open(key, offset, &stamp).await.map_err(source)?;
+        match read(from.take(), pass, chunks.as_mut(), Some(&since))
+            .await
+            .map_err(source)?
+        {
+            Reading::Refused(refused) => return done(refusal_word(refused)).await,
+            Reading::Paused(cursor) => return pause(phase, cursor, 0, 0).await,
+            Reading::Valid(cursor) if phase == Phase::Structure => {
+                // The output, before a script runs.
+                match paid_by(&cursor, terms, subject).await? {
+                    Ok(paid) => known = Some(paid),
+                    Err(word) => return done(word.into()).await,
                 }
-                Reading::Paused(cursor) => {
-                    let pending = Pending {
-                        elements: cursor.elements_read(),
-                        offset: cursor.offset(),
-                        size: stamp.size,
-                        roots_asked: 0,
-                        roots: 0,
-                    };
-                    let rest = Rest {
-                        stamp,
-                        rooting: false,
-                        roots_asked: 0,
-                        cursor,
-                    };
-                    store
-                        .save(&state_key, rest.to_binary())
-                        .await
-                        .map_err(source)?;
-                    return Ok(AtRest::Pending(pending));
-                }
+                phase = Phase::Scripts;
+            }
+            Reading::Valid(cursor) => {
+                phase = Phase::Roots;
+                from = Some(cursor);
+                roots_asked = 0;
             }
         }
-    };
-    let done = |word: PaymentVerdict| Ok(AtRest::Done(word.into()));
-    let Some((txid, at)) = tip_of(&cursor)? else {
-        store.clear(&state_key).await.map_err(source)?;
-        return done(PaymentVerdict::Unverifiable(
-            UnverifiableReason::NoTransaction,
-        ));
-    };
-    // The subject alone is read again: one element.
-    let mut tail = Vec::new();
-    let mut chunks = store.open(key, at, &stamp).await.map_err(source)?;
-    while let Some(chunk) = chunks.next().await.map_err(source)? {
-        tail.extend_from_slice(&chunk);
     }
-    let subject = subject_raw(tail, &txid)?;
-    let satoshis = match output_word(&subject, terms) {
-        PaymentVerdict::Verified { satoshis } => satoshis,
-        other => {
-            store.clear(&state_key).await.map_err(source)?;
-            return done(other);
-        }
+    let cursor = from.ok_or_else(|| DoorError::Internal("the roots with no reading".into()))?;
+    let (txid, satoshis) = match known {
+        Some(paid) => paid,
+        None => match paid_by(&cursor, terms, subject).await? {
+            Ok(paid) => paid,
+            Err(word) => return done(word.into()).await,
+        },
     };
     let roots = roots_of(&cursor);
-    let rooted = roots_word(&roots, roots_asked, Some(slices.lookups), headers, satoshis).await;
-    let (keep_at, answer) = match rooted {
-        Rooted::Paused(place) => (
-            Some(place),
-            AtRest::Pending(Pending {
-                elements: cursor.elements_read(),
-                offset: cursor.offset(),
-                size: stamp.size,
-                roots_asked: place as u64,
-                roots: roots.len() as u64,
-            }),
-        ),
-        Rooted::Word { word, failed_at } => (failed_at, AtRest::Done(judged(word, txid))),
-    };
-    match keep_at {
-        Some(place) => {
-            let rest = Rest {
-                stamp,
-                rooting: true,
-                roots_asked: place as u64,
-                cursor,
-            };
-            store.save(&state_key, rest.to_binary()).await
+    match roots_word(&roots, roots_asked, Some(slices.lookups), headers, satoshis).await {
+        Rooted::Paused(place) => {
+            pause(Phase::Roots, cursor, place as u64, roots.len() as u64).await
         }
-        None => store.clear(&state_key).await,
+        Rooted::Word {
+            word,
+            failed_at: Some(place),
+        } => {
+            // A header service that could not answer keeps the state at the
+            // roots: the retry does not read the bytes again.
+            pause(Phase::Roots, cursor, place as u64, roots.len() as u64).await?;
+            Ok(AtRest::Done(judged(word, txid)))
+        }
+        Rooted::Word { word, .. } => done(judged(word, txid)).await,
     }
-    .map_err(source)?;
-    Ok(answer)
 }
 
 #[cfg(test)]
@@ -1150,7 +1456,10 @@ pub(crate) mod tests {
         let (bytes, _) = chain(5);
         let tx = json!(hex::encode(&bytes));
         let carrier = Carrier::of(&tx).unwrap();
-        let Reading::Valid(cursor) = read(None, &mut carrier.chunks(0), None).await.unwrap() else {
+        let Reading::Valid(cursor) = read(None, Pass::Scripts, &mut carrier.chunks(0), None)
+            .await
+            .unwrap()
+        else {
             panic!("a valid chain");
         };
         let (subject, at) = tip_of(&cursor).unwrap().expect("a tip");
@@ -1562,6 +1871,8 @@ pub(crate) mod tests {
                     millis: 0,
                 },
                 lookups,
+                inputs: u64::MAX,
+                weight: u64::MAX,
             },
         )
         .await
@@ -1582,6 +1893,8 @@ pub(crate) mod tests {
                     millis: u64::MAX,
                 },
                 lookups: usize::MAX,
+                inputs: u64::MAX,
+                weight: u64::MAX,
             },
         )
         .await
@@ -1618,10 +1931,11 @@ pub(crate) mod tests {
             AtRest::Done(inline(&bytes, &headers).await)
         );
         assert_eq!(store.state(KEY), None, "a verdict leaves no state");
-        // Read once from the start, then the subject alone from where it
-        // starts: one element.
+        // The structure from the start, then the subject alone from where
+        // it starts (one element, for the output), then the scripts from the
+        // start (0.4.4: the output before a script runs).
         let subject = raw_tx(&[0; 32], FEE, PAID).len() as u64;
-        assert_eq!(*store.opened.borrow(), [0, bytes.len() as u64 - subject]);
+        assert_eq!(*store.opened.borrow(), [0, bytes.len() as u64 - subject, 0]);
     }
 
     #[tokio::test]
@@ -1634,11 +1948,16 @@ pub(crate) mod tests {
         store.chunk.set(40);
         let (verdict, pending) = passes(&store, &headers, usize::MAX).await;
         assert_eq!(verdict.word, PaymentVerdict::Verified { satoshis: FEE });
-        // One BUMP and the links: a pause after each element, and a last
-        // pass that reads the stream's end and the verdict.
-        let elements: Vec<u64> = pending.iter().map(|p| p.elements).collect();
-        assert_eq!(elements, (1..=links as u64 + 1).collect::<Vec<_>>());
-        assert!(pending.windows(2).all(|w| w[0].offset < w[1].offset));
+        // One BUMP and the links: a pause after each element, in the
+        // structure and then in the scripts (0.4.4), and a last pass that
+        // reads the stream's end and the verdict.
+        for phase in [Phase::Structure, Phase::Scripts] {
+            let read: Vec<&Pending> = pending.iter().filter(|p| p.phase == phase).collect();
+            let elements: Vec<u64> = read.iter().map(|p| p.elements).collect();
+            assert_eq!(elements, (1..=links as u64 + 1).collect::<Vec<_>>());
+            assert!(read.windows(2).all(|w| w[0].offset < w[1].offset));
+        }
+        assert_eq!(pending.len(), 2 * (links + 1));
         assert!(pending.iter().all(|p| p.size == bytes.len() as u64));
         assert_eq!(
             headers.asked(),
@@ -1646,10 +1965,11 @@ pub(crate) mod tests {
             "the root is asked once, at the end"
         );
         assert_eq!(store.state(KEY), None);
-        // Each pass read on from its cursor, never from the start again.
+        // Each pass read on from its cursor; the start is read twice, once
+        // a reading (the structure, then the scripts).
         let opened = store.opened.borrow();
+        assert_eq!(opened.iter().filter(|from| **from == 0).count(), 2);
         assert_eq!(opened[0], 0);
-        assert!(opened[1..].iter().all(|from| *from > 0));
     }
 
     #[tokio::test]
@@ -1778,7 +2098,11 @@ pub(crate) mod tests {
             })
         );
         assert_eq!(down.asked(), [850_001, 850_002, 850_003]);
-        assert_eq!(store.opened.borrow().len(), 2);
+        assert_eq!(
+            store.opened.borrow().len(),
+            3,
+            "the structure, the subject, the scripts"
+        );
         assert_eq!(
             word(whole(&store, &headers).await),
             PaymentVerdict::Verified { satoshis: FEE }
@@ -1786,7 +2110,7 @@ pub(crate) mod tests {
         assert_eq!(headers.asked()[3..], [850_002, 850_003]);
         assert_eq!(
             store.opened.borrow().len(),
-            3,
+            4,
             "the bytes are not read again, only the subject"
         );
         assert_eq!(store.state(KEY), None);
@@ -1821,6 +2145,8 @@ pub(crate) mod tests {
                 millis: 0,
             },
             lookups: 1,
+            inputs: u64::MAX,
+            weight: u64::MAX,
         };
         assert_eq!(
             verify_at_rest(&store, KEY, &terms(), None, &slices)
@@ -1859,6 +2185,8 @@ pub(crate) mod tests {
                 millis: 50,
             },
             lookups: usize::MAX,
+            inputs: u64::MAX,
+            weight: u64::MAX,
         };
         let mut pauses = 0;
         loop {
@@ -1874,7 +2202,8 @@ pub(crate) mod tests {
                 AtRest::NotFound => panic!("the object is there"),
             }
         }
-        // About 6,200 bytes in 40-byte chunks, 50 fetches a slice.
-        assert!((2..=5).contains(&pauses), "{pauses} pauses");
+        // About 6,200 bytes read twice (the structure, then the scripts) in
+        // 40-byte chunks, 50 fetches a slice.
+        assert!((4..=10).contains(&pauses), "{pauses} pauses");
     }
 }

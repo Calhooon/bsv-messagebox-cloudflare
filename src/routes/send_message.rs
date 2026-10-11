@@ -187,6 +187,29 @@ pub async fn process_send(
         return SendOutcome::BlockedRecipients { list: blocked };
     }
 
+    // -- 1b. The sender's budget for the window (0.4.4, bsv-low #591 M3 and
+    //       NOTE-3): one send, and the bytes of text no delivery fee judges
+    //       (the message, and the payment when the box owes no delivery fee).
+    //       A paid payment's bytes are not counted: it is paid for. --
+    if let Ok(db) = env.d1("DB") {
+        let payment_text = match (&validated.payment, delivery_fee > 0) {
+            (Some(payment), false) => payment.to_string().len(),
+            _ => 0,
+        };
+        let unjudged = (validated.body.to_string().len() + payment_text) as u64;
+        if let Err((body, status)) = crate::send_budget::charge(
+            &crate::send_budget::D1Windows { db: &db },
+            &crate::send_budget::Budget::from_env(env),
+            sender_key,
+            Date::now().as_millis() / 1000,
+            unjudged,
+        )
+        .await
+        {
+            return SendOutcome::ValidationError { body, status };
+        }
+    }
+
     // -- 2. Decide whether payment is required. --
     let fee_map: Vec<(String, String, i32)> = ctx_map
         .iter()

@@ -803,6 +803,14 @@ mod tests {
             .unwrap();
         db.execute_batch(include_str!("../migrations/0004_beef_key.sql"))
             .unwrap();
+        db.execute_batch(include_str!("../migrations/0005_announce_owed.sql"))
+            .unwrap();
+        db.execute_batch(include_str!("../migrations/0007_beef_reclaiming.sql"))
+            .unwrap();
+        db.execute_batch(include_str!("../migrations/0008_beef_minted.sql"))
+            .unwrap();
+        db.execute_batch(include_str!("../migrations/0009_fee_terminal.sql"))
+            .unwrap();
         // 3,000 boxes (a third retained), 12,000 messages across 40 recipients.
         // The plans below are a function of schema and statement only: without
         // ANALYZE (no sqlite_stat1) the planner never consults row counts, so

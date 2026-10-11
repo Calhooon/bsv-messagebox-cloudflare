@@ -38,7 +38,13 @@ pub use crate::storage::{INSERT_MESSAGE_SQL, LIST_MESSAGES_SQL};
 /// the route runs them: a host test runs the same text on a real SQLite.
 pub use crate::retention::{ack_delete_sql, ack_update_sql};
 pub use crate::storage::{
-    FEE_OWES_KEY_SQL, FORGET_RELEASED_SQL, RELEASED_KEYS_SQL, ROW_NAMES_KEY_SQL,
+    CLAIMED_SQL, CLAIM_SQL, FEE_OWES_KEY_SQL, FORGET_MINTED_SQL, FORGET_RELEASED_SQL,
+    MINTED_DUE_SQL, MINT_SQL, POSTPONE_MINTED_SQL, RELEASED_KEYS_SQL, ROW_NAMES_KEY_SQL,
+    UNCLAIM_SQL,
+};
+pub use crate::storage::{
+    CLEAR_WALLET_WORD_SQL, END_FEE_SQL, FEES_FIGURE_SQL, LAST_ENDED_SQL, SET_WALLET_WORD_SQL,
+    WALLET_WORD_SQL,
 };
 
 /// The custom metadata of an object at rest that names the one caller
@@ -62,17 +68,6 @@ pub trait PaymentStore: BeefStore {
     ) -> Result<Stamp, String>;
     /// The `READER_METADATA` of the object at `key`, `None` when it has none.
     async fn reader(&self, key: &str) -> Result<Option<String>, String>;
-    /// The object at `key`, the bytes `stamp` names, with `reader` as its
-    /// `READER_METADATA`: as it is when it names `reader` already, otherwise
-    /// written again in place from its own stream (R2 keeps metadata only as
-    /// an object is written). The stamp of what is at rest after.
-    async fn name_reader(&self, key: &str, stamp: &Stamp, reader: &str) -> Result<Stamp, String> {
-        if self.reader(key).await?.as_deref() == Some(reader) {
-            return Ok(stamp.clone());
-        }
-        let mut chunks = self.open(key, 0, stamp).await?;
-        self.spool(key, chunks.as_mut(), stamp.size, reader).await
-    }
     /// The bucket's name, as wallet-infra binds it to read a reference
     /// (`beef_at_rest`); `None` when the deployment does not say it.
     fn bucket_name(&self) -> Option<String>;
@@ -85,6 +80,46 @@ pub trait PaymentStore: BeefStore {
 #[async_trait::async_trait(?Send)]
 pub trait FeeWallet {
     async fn internalize(&self, args: &Value) -> Result<bool, String>;
+}
+
+/// A broadcaster's word on a payment's subject (0.4.4, bsv-low #591 M2): a
+/// hint by the tracker's rule (bsv-stack-lean `docs/charters/tracker.md`
+/// section 2), never a verdict. An acceptance is not "mined" and a refusal is
+/// not "rejected"; the message is delivered on the door's verdict either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hint {
+    /// The broadcaster took the subject (a 2xx).
+    pub accepted: bool,
+    /// Its word, or why no word came.
+    pub word: String,
+}
+
+/// The bytes of a payment as the announcer posts them.
+pub enum Subject<'a> {
+    /// At rest: the object at `key`, the bytes `stamp` names.
+    AtRest { key: &'a str, stamp: &'a Stamp },
+    /// In the request.
+    InHand(&'a Carrier<'a>),
+}
+
+/// A broadcaster the subject is announced to (`payments::ArcAnnouncer` in the
+/// Worker). `Ok` is the broadcaster's answer as a hint; `Err` is no answer.
+#[async_trait::async_trait(?Send)]
+pub trait Announcer {
+    async fn announce(&self, subject: Subject<'_>) -> Result<Hint, String>;
+}
+
+/// An announcement still owed: the broadcaster refused, or did not answer,
+/// and the drain asks again (`reask_announces`). It names the bytes at rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwedAnnounce {
+    pub key: String,
+    /// The etag of the bytes the door verified.
+    pub etag: String,
+    pub txid: String,
+    pub attempts: u32,
+    /// Unix seconds: not before.
+    pub next_at: u64,
 }
 
 /// A delivery fee whose recording in wallet-infra is still owed: the object
@@ -127,8 +162,63 @@ pub trait FeeLedger {
         next_at: u64,
         why: &str,
     ) -> Result<(), String>;
-    /// Whether a deferred fee names the object at `key`.
+    /// Whether a deferred fee, or an announcement owed, names the object at
+    /// `key`. An ended fee names nothing.
     async fn owes(&self, key: &str) -> Result<bool, String>;
+    /// The fee at `key` ends (0.4.4, bsv-low #591 R403-L1): `why` is kept on
+    /// its row, and the drain never takes it up again.
+    async fn end(&self, key: &str, why: &str) -> Result<(), String>;
+    /// The fees owed, the fees ended, and the reason of the last one ended.
+    async fn figure(&self) -> Result<FeeFigure, String>;
+    /// The relay's word that wallet-infra cannot read its bucket, and when it
+    /// was recorded.
+    async fn wallet_word(&self) -> Result<Option<(String, u64)>, String>;
+    /// Record that word (`Some`), or clear it (`None`).
+    async fn set_wallet_word(&self, word: Option<&str>, now: u64) -> Result<(), String>;
+    /// Record an announcement as owed, with the word that made it so. One
+    /// already recorded at the key is left as it is.
+    async fn owe_announce(&self, owed: &OwedAnnounce, word: &str) -> Result<(), String>;
+    /// The announcements due at `now`, the longest waiting leading.
+    async fn due_announces(&self, now: u64, limit: u32) -> Result<Vec<OwedAnnounce>, String>;
+    /// The broadcaster took the subject: the row goes.
+    async fn announced(&self, key: &str) -> Result<(), String>;
+    /// Asked again and not taken: one more attempt, a later `next_at`.
+    async fn put_off_announce(
+        &self,
+        key: &str,
+        attempts: u32,
+        next_at: u64,
+        word: &str,
+    ) -> Result<(), String>;
+}
+
+/// The fees as the health figure gives them (0.4.4, bsv-low #591 R403-L1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeeFigure {
+    /// Fees still owed: the drain takes them up.
+    pub owed: u64,
+    /// Fees ended: each row keeps its reason.
+    pub ended: u64,
+    /// The reason of the fee ended last.
+    pub last_ended: Option<String>,
+}
+
+/// The attempts a fee wallet-infra could not record is tried, a minute
+/// doubling to a day between them (`backoff_secs`): about three weeks. Then it
+/// ends, with the last refusal as its reason.
+pub const FEE_ATTEMPTS_CEILING: u32 = 30;
+
+/// How long the relay's word that wallet-infra cannot read its bucket stands
+/// before a fee is deferred into it again, to be tried once more: a day.
+pub const WALLET_WORD_SECS: u64 = 86_400;
+
+/// Whether wallet-infra's refusal says it cannot read the relay's bucket: the
+/// two words its at-rest door has for it (`[SRC] rust-wallet-infra@50a282f
+/// src/storage/internalize_action.rs:352-356`, no `BEEF_AT_REST` binding;
+/// `src/beef_at_rest.rs:430-434`, another bucket bound).
+pub fn cannot_read_bucket(word: &str) -> bool {
+    word.contains("no bucket is bound here for bytes at rest")
+        || (word.contains("beefAtRest: bucket ") && word.contains("is not bound here"))
 }
 
 /// The stored rows, as what names an object at rest (NL-4c). A row names the
@@ -144,6 +234,24 @@ pub trait RowRefs {
     async fn released(&self, limit: u32) -> Result<Vec<String>, String>;
     /// The released key was looked at.
     async fn forget(&self, key: &str) -> Result<(), String>;
+    /// A reclaim holds `key` while it looks and deletes (0.4.4, bsv-low #591
+    /// L2): written before it looks at the rows.
+    async fn claim(&self, key: &str) -> Result<(), String>;
+    /// The reclaim of `key` is over.
+    async fn unclaim(&self, key: &str) -> Result<(), String>;
+    /// Whether a reclaim holds `key` now: a send that named it asks after
+    /// its row is written.
+    async fn claimed(&self, key: &str) -> Result<bool, String>;
+    /// The relay minted `key` (an upload URL, or a spool): look at it again
+    /// at `deadline` (0.4.4, bsv-low #591 L3). A key minted again keeps its
+    /// first record.
+    async fn mint(&self, key: &str, deadline: u64) -> Result<(), String>;
+    /// The minted keys past their deadline at `now`, at most `limit`.
+    async fn minted_due(&self, now: u64, limit: u32) -> Result<Vec<String>, String>;
+    /// Look at `key` again at `deadline`.
+    async fn postpone_minted(&self, key: &str, deadline: u64) -> Result<(), String>;
+    /// The minted key was looked at for the last time.
+    async fn forget_minted(&self, key: &str) -> Result<(), String>;
 }
 
 /// What the hand-off works through.
@@ -152,6 +260,8 @@ pub struct Seams<'a> {
     pub wallet: &'a dyn FeeWallet,
     pub ledger: &'a dyn FeeLedger,
     pub rows: &'a dyn RowRefs,
+    /// The broadcaster, when the deployment names one.
+    pub announcer: Option<&'a dyn Announcer>,
 }
 
 /// A verified payment as the route hands it on.
@@ -160,11 +270,19 @@ pub struct Paid<'a> {
     pub payment: &'a Value,
     /// The object `payment.beefR2Key` names, when the sender uploaded one.
     pub r2_key: Option<&'a str>,
+    /// Where the relay put an inline payment's bytes at rest before its
+    /// scripts ran (`payments::judge_delivery_inline_at_rest`), when it did:
+    /// the hand-off keeps them there and spools nothing again.
+    pub spooled: Option<&'a str>,
     /// Where an inline payment's bytes are put at rest: a key of the upload
     /// shape, `<sender's identity key>/<uuid>.beef`, that nothing presigned.
     pub spool_key: &'a str,
     /// The server's delivery output, when the box owes a delivery fee.
     pub server_output: Option<&'a Value>,
+    /// The stamp of the object the door read at `r2_key` or `spooled`, when
+    /// it read one (0.4.4, bsv-low #591 L1). The hand-off records nothing of
+    /// bytes that are no longer these.
+    pub stamp: Option<&'a Stamp>,
     /// The subject's txid, when the door judged the payment (a box with no
     /// delivery fee judges nothing).
     pub txid: Option<&'a str>,
@@ -188,6 +306,10 @@ pub enum Fee {
     Internalized,
     /// It is owed: a row of the ledger, drained later.
     Deferred,
+    /// It could not be recorded and is not owed (0.4.4, R403-L1): the
+    /// wallet-infra it would be deferred into cannot read the relay's bucket.
+    /// Its row keeps the reason; the message goes.
+    Ended,
 }
 
 /// The hand-off's result.
@@ -197,8 +319,11 @@ pub struct HandedOff {
     /// recipient's outputs).
     pub payment: Value,
     pub fee: Fee,
-    /// The object that must stay at rest: a row or a deferred fee names it.
+    /// The object that must stay at rest: a row, a deferred fee or an
+    /// announcement owed names it.
     pub kept: Option<String>,
+    /// The broadcaster's word on the subject, when the payment was judged.
+    pub hint: Option<Hint>,
 }
 
 fn err(status: u16, code: &str, description: &str) -> RouteResult {
@@ -284,7 +409,17 @@ pub enum TxShape {
 }
 
 impl TxShape {
-    fn of(carrier: &Carrier<'_>) -> Self {
+    /// The shape the sender sent `payment.tx` in: the carrier's, or a byte
+    /// array the relay read as hex (`validation::read_send_body`, 0.4.4
+    /// NOTE-4, `payment.txShape: "array"`).
+    pub fn sent(payment: &Value, carrier: &Carrier<'_>) -> Self {
+        match payment.get("txShape").and_then(Value::as_str) {
+            Some("array") => TxShape::Array,
+            _ => TxShape::of(carrier),
+        }
+    }
+
+    pub fn of(carrier: &Carrier<'_>) -> Self {
         match carrier {
             Carrier::Array(_) => TxShape::Array,
             Carrier::Hex(_) => TxShape::Hex,
@@ -309,7 +444,11 @@ impl TxShape {
 
 /// The fields of a stored payment that are the relay's to write. A request
 /// that carries one of them does not put it in a row.
-const ROW_FIELDS: [&str; 7] = [
+const ROW_FIELDS: [&str; 11] = [
+    "announced",
+    "beefReader",
+    "key",
+    "words",
     "tx",
     "beefR2Key",
     "beefSize",
@@ -356,35 +495,70 @@ pub fn payment_at_rest(
     Value::Object(row)
 }
 
-/// An object's bytes, as `payment.tx` in `shape`: read as a stream, a chunk
-/// encoded at a time. The caller has decided the object fits what it is
-/// building.
-async fn tx_from_rest(
+/// A payment no delivery fee judged, as its row keeps it (0.4.4, bsv-low
+/// #591 M3): the request's `payment` with its `tx` as sent, without what is
+/// the relay's to write, and `verdict: notJudged`.
+pub fn payment_in_row(payment: &Value) -> Value {
+    let mut row: serde_json::Map<String, Value> = payment
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| !ROW_FIELDS.contains(&name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    if let Some(tx) = payment.get("tx") {
+        // A byte array the relay read as hex goes back in the row as the
+        // array it came as (0.4.4, NOTE-4).
+        let tx = match (payment.get("txShape").and_then(Value::as_str), tx.as_str()) {
+            (Some("array"), Some(text)) => match hex::decode(text) {
+                Ok(bytes) => json!(bytes),
+                Err(_) => tx.clone(),
+            },
+            _ => tx.clone(),
+        };
+        row.insert("tx".into(), tx);
+    }
+    row.insert("verdict".into(), json!("notJudged"));
+    Value::Object(row)
+}
+
+/// An object's bytes as the JSON text of `payment.tx` in `shape`, written
+/// straight to text a chunk at a time (0.4.4, bsv-low #591 M1): a byte array
+/// is never a `Value::Array` of one `Value` a byte. The caller has decided
+/// the text fits what it is building (`encoded_len`).
+async fn tx_text(
     blobs: &dyn BeefStore,
     key: &str,
     stamp: &Stamp,
     shape: TxShape,
-) -> Result<Value, String> {
+) -> Result<String, String> {
+    use std::fmt::Write as _;
     let mut chunks = blobs.open(key, 0, stamp).await?;
-    Ok(match shape {
+    let mut text = String::with_capacity(encoded_len(stamp.size, shape) as usize);
+    match shape {
         TxShape::Array => {
-            let mut bytes = Vec::with_capacity(stamp.size as usize);
+            text.push('[');
             while let Some(chunk) = chunks.next().await? {
-                bytes.extend(chunk.into_iter().map(Value::from));
+                for byte in chunk {
+                    let _ = write!(text, "{},", byte);
+                }
             }
-            Value::Array(bytes)
+            if text.ends_with(',') {
+                text.pop();
+            }
+            text.push(']');
         }
         TxShape::Hex => {
-            let mut text = String::with_capacity(stamp.size as usize * 2);
+            text.push('"');
             while let Some(chunk) = chunks.next().await? {
                 text.push_str(&hex::encode(chunk));
             }
-            Value::String(text)
+            text.push('"');
         }
         TxShape::Base64 => {
             // Whole groups of three bytes are encoded as they arrive; what
             // is left over waits for the next chunk.
-            let mut text = String::with_capacity(stamp.size as usize / 3 * 4 + 4);
+            text.push_str("{\"beef\":\"");
             let mut held: Vec<u8> = Vec::new();
             while let Some(chunk) = chunks.next().await? {
                 held.extend_from_slice(&chunk);
@@ -393,9 +567,29 @@ async fn tx_from_rest(
                 held.drain(..whole);
             }
             B64.encode_string(&held, &mut text);
-            json!({ "beef": text })
+            text.push_str("\"}");
         }
-    })
+    }
+    Ok(text)
+}
+
+/// An object's bytes as one hex string: the fee recorded in the request.
+async fn hex_from_rest(blobs: &dyn BeefStore, key: &str, stamp: &Stamp) -> Result<String, String> {
+    let text = tx_text(blobs, key, stamp, TxShape::Hex).await?;
+    Ok(text[1..text.len() - 1].to_string())
+}
+
+/// The most the JSON text of `payment.tx` can be for `size` bytes in
+/// `shape`: a byte array four characters a byte (up to three digits and a
+/// comma; 3.57 on average over bytes spread evenly, but a budget is held to
+/// the most), hex two, base64 four for three (about 1.34), each with its
+/// brackets or quotes.
+pub fn encoded_len(size: u64, shape: TxShape) -> u64 {
+    match shape {
+        TxShape::Array => size.saturating_mul(4) + 2,
+        TxShape::Hex => size.saturating_mul(2) + 2,
+        TxShape::Base64 => size.div_ceil(3).saturating_mul(4) + 12,
+    }
 }
 
 /// The carrier's bytes as one hex string: the fee recorded in the request,
@@ -463,8 +657,8 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
                 })?,
         ),
     };
-    let mut rest: Option<(String, Stamp)> = match paid.r2_key {
-        Some(key) => Some((
+    let mut rest: Option<(String, Stamp)> = match (paid.r2_key, paid.spooled) {
+        (Some(key), _) => Some((
             key.to_string(),
             seams
                 .blobs
@@ -473,17 +667,59 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
                 .map_err(beef_key_not_found)?
                 .ok_or_else(|| beef_key_not_found("R2 object not found".to_string()))?,
         )),
-        None => None,
+        // The relay's own spool: there, or spooled again below.
+        (None, Some(key)) => seams
+            .blobs
+            .stamp(key)
+            .await
+            .map_err(store_unavailable)?
+            .map(|stamp| (key.to_string(), stamp)),
+        (None, None) => None,
     };
-    let shape = carrier.as_ref().map_or(TxShape::Base64, TxShape::of);
+    // The bytes the door read, and no others (0.4.4, bsv-low #591 L1): an
+    // object replaced between the verdict and here is not the payment the
+    // door verified, and nothing of it is recorded. The same request again
+    // reads the object as it is now.
+    if let (Some(door), Some((key, now))) = (paid.stamp, &rest) {
+        if door != now {
+            return Err(err(
+                503,
+                "ERR_PAYMENT_CHANGED",
+                &format!(
+                    "The payment's BEEF at {} changed after it was verified (etag {} then, {} now); send the same request again.",
+                    key, door.etag, now.etag
+                ),
+            ));
+        }
+    }
+    let shape = carrier.as_ref().map_or(TxShape::Base64, |carrier| {
+        TxShape::sent(paid.payment, carrier)
+    });
     let size = match (&carrier, &rest) {
         (Some(carrier), _) => carrier.len(),
         (None, Some((_, stamp))) => stamp.size,
         (None, None) => 0,
     };
 
+    // A body nobody judged (a box that owes no delivery fee) is kept in its
+    // row, as 0.3.x kept every payment, and never spooled (0.4.4, bsv-low
+    // #591 M3): the route has read its structure and held it to the row's
+    // bound (`payments::check_unjudged`).
+    if let (None, None, Some(_)) = (paid.server_output, paid.r2_key, &carrier) {
+        return Ok(HandedOff {
+            payment: if paid.rows {
+                payment_in_row(paid.payment)
+            } else {
+                Value::Null
+            },
+            fee: Fee::NotOwed,
+            kept: None,
+            hint: None,
+        });
+    }
+
     // The bytes at rest before anything names them.
-    if let (true, Some(carrier)) = (paid.rows, &carrier) {
+    if let (true, None, Some(carrier)) = (paid.rows, &rest, &carrier) {
         let stamp = seams
             .blobs
             .spool(paid.spool_key, &mut carrier.chunks(0), size, paid.reader)
@@ -492,8 +728,83 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
         rest = Some((paid.spool_key.to_string(), stamp));
     }
 
-    // Whether the R2 path's own object names the reader yet.
-    let mut named = false;
+    // The reader of a sender's upload (0.4.4, bsv-low #591 R403-M1): named
+    // at mint time, a signed header of the presigned PUT; an object at rest
+    // that does not name it (an upload of an earlier release) has it beside
+    // its key in the row. The object is never written again: one head, no
+    // byte read, and the etag the door verified is the one recorded.
+    let beef_reader = match (paid.r2_key, &rest) {
+        (Some(_), Some((key, _))) => match seams.blobs.reader(key).await {
+            Ok(Some(reader)) if reader == paid.reader => None,
+            _ => Some(paid.reader.to_string()),
+        },
+        _ => None,
+    };
+
+    // The subject announced before delivery (0.4.4, bsv-low #591 M2). The
+    // broadcaster's word is a hint, kept on the row; a refusal, or no answer,
+    // is owed and asked again by the drain. Nothing here refuses the sender.
+    let mut hint = None;
+    let mut announce_owed = false;
+    if let (Some(_), Some(txid)) = (paid.server_output, paid.txid) {
+        let word = match (seams.announcer, &rest, &carrier) {
+            (Some(to), Some((key, stamp)), _) => {
+                Some(to.announce(Subject::AtRest { key, stamp }).await)
+            }
+            (Some(to), None, Some(carrier)) => Some(to.announce(Subject::InHand(carrier)).await),
+            _ => None,
+        };
+        let said = match &word {
+            None => Hint {
+                accepted: false,
+                word: "no broadcaster is configured".to_string(),
+            },
+            Some(Ok(said)) => said.clone(),
+            Some(Err(e)) => Hint {
+                accepted: false,
+                word: format!("no answer: {}", e),
+            },
+        };
+        if word.is_some() && !said.accepted {
+            // The re-ask names the bytes: at rest before it does.
+            if let (None, Some(carrier)) = (&rest, &carrier) {
+                let stamp = seams
+                    .blobs
+                    .spool(paid.spool_key, &mut carrier.chunks(0), size, paid.reader)
+                    .await
+                    .map_err(store_unavailable)?;
+                rest = Some((paid.spool_key.to_string(), stamp));
+            }
+            if let Some((key, stamp)) = &rest {
+                seams
+                    .ledger
+                    .owe_announce(
+                        &OwedAnnounce {
+                            key: key.clone(),
+                            etag: stamp.etag.clone(),
+                            txid: txid.to_string(),
+                            attempts: 0,
+                            next_at: paid.now,
+                        },
+                        &said.word,
+                    )
+                    .await
+                    .map_err(|e| {
+                        err(
+                            503,
+                            "ERR_PAYMENT_UNAVAILABLE",
+                            &format!(
+                                "The announcement could not be recorded as owed; send the same request again: {}",
+                                e
+                            ),
+                        )
+                    })?;
+                announce_owed = true;
+            }
+        }
+        hint = Some(said);
+    }
+
     let mut fee = Fee::NotOwed;
     if let Some(server_output) = paid.server_output {
         let args = fee_args(server_output, paid.payment);
@@ -504,9 +815,9 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
             // `tx` as hex, the shape wallet-infra decodes, whatever shape
             // the sender sent.
             let tx = match (&rest, paid.r2_key, &carrier) {
-                (Some((key, stamp)), Some(_), _) => {
-                    tx_from_rest(seams.blobs, key, stamp, TxShape::Hex).await
-                }
+                (Some((key, stamp)), Some(_), _) => hex_from_rest(seams.blobs, key, stamp)
+                    .await
+                    .map(Value::String),
                 (_, _, Some(carrier)) => Ok(Value::String(hex_of(carrier))),
                 _ => Err("no bytes to hand wallet-infra".to_string()),
             };
@@ -521,8 +832,10 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
                         Ok(true) => None,
                         // wallet-infra's own word on the payment, as before.
                         Ok(false) => {
-                            if paid.r2_key.is_none() && rest.is_some() {
-                                let _ = seams.blobs.clear(paid.spool_key).await;
+                            // The relay's own spool goes, unless another
+                            // send's row names the same bytes.
+                            if let (None, Some((key, _))) = (paid.r2_key, &rest) {
+                                let _ = reclaim(seams, key).await;
                             }
                             return Err(err(
                                 400,
@@ -549,7 +862,6 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
                         .map_err(store_unavailable)?;
                     rest = Some((paid.spool_key.to_string(), stamp));
                 }
-                name_the_reader(seams, paid, &mut rest, &mut named).await?;
                 let (key, stamp) = rest.as_ref().ok_or_else(|| {
                     err(
                         500,
@@ -557,6 +869,16 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
                         "A deferred fee names no bytes at rest.",
                     )
                 })?;
+                let unavailable = |e: String| {
+                    err(
+                        503,
+                        "ERR_PAYMENT_UNAVAILABLE",
+                        &format!(
+                            "The delivery fee could not be recorded as owed; send the same request again: {}",
+                            e
+                        ),
+                    )
+                };
                 seams
                     .ledger
                     .defer(&DeferredFee {
@@ -569,28 +891,48 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
                         next_at: paid.now,
                     })
                     .await
-                    .map_err(|e| {
-                        err(
-                            503,
-                            "ERR_PAYMENT_UNAVAILABLE",
-                            &format!(
-                                "The delivery fee could not be recorded as owed; send the same request again: {}",
-                                e
-                            ),
-                        )
-                    })?;
-                Fee::Deferred
+                    .map_err(unavailable)?;
+                // No fee is deferred into a wallet-infra that cannot read the
+                // relay's bucket (0.4.4, R403-L1): it ends at once, its reason
+                // on its row.
+                match seams.ledger.wallet_word().await {
+                    Ok(Some((word, at))) if paid.now < at + WALLET_WORD_SECS => {
+                        seams
+                            .ledger
+                            .end(
+                                key,
+                                &format!(
+                                    "not deferred: wallet-infra cannot read the relay's bucket ({})",
+                                    word
+                                ),
+                            )
+                            .await
+                            .map_err(unavailable)?;
+                        Fee::Ended
+                    }
+                    _ => Fee::Deferred,
+                }
             }
         };
     }
 
-    if paid.rows {
-        name_the_reader(seams, paid, &mut rest, &mut named).await?;
+    let keep = paid.rows || fee == Fee::Deferred || announce_owed;
+    // A spool nothing will name goes now (`reclaim`: unless an earlier send
+    // names the same bytes).
+    if let (false, None, Some((key, _))) = (keep, paid.r2_key, &rest) {
+        let _ = reclaim(seams, key).await;
     }
-    let kept = rest.filter(|_| paid.rows || fee == Fee::Deferred);
+    let kept = rest.filter(|_| keep);
     let payment = match &kept {
         Some((key, stamp)) if paid.rows => {
-            payment_at_rest(paid.payment, key, stamp, shape, paid.txid)
+            let mut payment = payment_at_rest(paid.payment, key, stamp, shape, paid.txid);
+            if let Some(hint) = &hint {
+                payment["announced"] = json!({ "accepted": hint.accepted, "word": hint.word });
+            }
+            if let Some(reader) = &beef_reader {
+                payment["beefReader"] = json!(reader);
+            }
+            payment
         }
         _ => Value::Null,
     };
@@ -598,44 +940,62 @@ pub async fn hand_off(seams: &Seams<'_>, paid: &Paid<'_>) -> Result<HandedOff, R
         payment,
         fee,
         kept: kept.map(|(key, _)| key),
+        hint,
     })
-}
-
-/// The R2 path's own object, once it is kept, names the reader as the spool
-/// names it (`PaymentStore::name_reader`), once per send: the row and the
-/// deferred fee then name the object as it is after.
-async fn name_the_reader(
-    seams: &Seams<'_>,
-    paid: &Paid<'_>,
-    rest: &mut Option<(String, Stamp)>,
-    named: &mut bool,
-) -> Result<(), RouteResult> {
-    let (Some(_), Some((key, stamp)), false) = (paid.r2_key, rest.as_mut(), *named) else {
-        return Ok(());
-    };
-    *stamp = seams
-        .blobs
-        .name_reader(key, stamp, paid.reader)
-        .await
-        .map_err(store_unavailable)?;
-    *named = true;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Ownership: an object goes only when nothing names it
 // ---------------------------------------------------------------------------
 
-/// Delete the object at `key` when no stored row and no deferred fee names
-/// it; `true` when it was deleted. A store that cannot say who names the key
-/// deletes nothing (`Err`): the object stays. The one way a payment's object
-/// is deleted once it is at rest.
+/// Delete the object at `key` when no stored row, no deferred fee and no
+/// announcement owed names it; `true` when it was deleted (or was already
+/// gone). A store that cannot say who names the key deletes nothing (`Err`):
+/// the object stays. The one way a payment's object is deleted once it is at
+/// rest.
+///
+/// R2 deletes by key alone (0.4.4, bsv-low #591 L2), so the reclaim claims
+/// the key first (`RowRefs::claim`), looks, stamps the object, looks again,
+/// and deletes only the bytes it stamped. A send that names the key after the
+/// second look reads the claim after its row (`RowRefs::claimed`): one of the
+/// two always sees the other.
 pub async fn reclaim(seams: &Seams<'_>, key: &str) -> Result<bool, String> {
-    if seams.rows.names(key).await? || seams.ledger.owes(key).await? {
+    seams.rows.claim(key).await?;
+    let reclaimed = reclaim_claimed(seams, key).await;
+    let _ = seams.rows.unclaim(key).await;
+    reclaimed
+}
+
+async fn named(seams: &Seams<'_>, key: &str) -> Result<bool, String> {
+    Ok(seams.rows.names(key).await? || seams.ledger.owes(key).await?)
+}
+
+async fn reclaim_claimed(seams: &Seams<'_>, key: &str) -> Result<bool, String> {
+    if named(seams, key).await? {
+        return Ok(false);
+    }
+    let Some(looked) = seams.blobs.stamp(key).await? else {
+        return Ok(true);
+    };
+    // The second look: a send that named the key since the first.
+    if named(seams, key).await? {
+        return Ok(false);
+    }
+    // The bytes looked at, and no others.
+    if seams.blobs.stamp(key).await?.as_ref() != Some(&looked) {
         return Ok(false);
     }
     seams.blobs.clear(key).await?;
     Ok(true)
+}
+
+/// After a send named `key` (0.4.4, bsv-low #591 L2): whether a reclaim held
+/// the key as the row was written and the bytes are gone, the one case the
+/// claim cannot spare. The route logs it with its key: an orphan, a row that
+/// names nothing at rest.
+pub async fn orphaned(seams: &Seams<'_>, key: &str) -> bool {
+    matches!(seams.rows.claimed(key).await, Ok(true))
+        && matches!(seams.blobs.stamp(key).await, Ok(None))
 }
 
 /// The released keys one pass looks at.
@@ -672,6 +1032,63 @@ pub async fn reclaim_released(seams: &Seams<'_>, limit: u32) -> Result<Reclaimed
         }
     }
     Ok(reclaimed)
+}
+
+/// How long after its URL's life a minted upload waits for a send to name it
+/// (0.4.4, bsv-low #591 L3): a day.
+pub const MINTED_MARGIN_SECS: u64 = 86_400;
+
+/// How long a minted key whose reading is still pending waits again.
+pub const MINTED_PENDING_SECS: u64 = 3_600;
+
+/// What one pass over the minted keys came to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Expired {
+    /// Objects deleted: nothing named them by their deadline.
+    pub deleted: u32,
+    /// Keys a row, a fee or an announcement names: theirs now.
+    pub named: u32,
+    /// Keys whose reading is pending, or the store could not answer for.
+    pub put_off: u32,
+}
+
+/// Look at the minted keys past their deadline, at most `limit` (0.4.4,
+/// bsv-low #591 L3): an object nothing names is deleted with its door state
+/// (`reclaim`), one something names is left to what names it, and the record
+/// is forgotten either way. A key whose door state is there (a reading
+/// pending across requests) waits `MINTED_PENDING_SECS` more; the bucket's
+/// lifecycle rule on `door-state/` ends a state nobody comes back to.
+pub async fn reclaim_minted(seams: &Seams<'_>, now: u64, limit: u32) -> Result<Expired, String> {
+    let mut expired = Expired::default();
+    for key in seams.rows.minted_due(now, limit).await? {
+        let state = crate::beef_door::state_key(&key);
+        if !matches!(seams.blobs.load(&state).await, Ok(None)) {
+            seams
+                .rows
+                .postpone_minted(&key, now + MINTED_PENDING_SECS)
+                .await?;
+            expired.put_off += 1;
+            continue;
+        }
+        match reclaim(seams, &key).await {
+            Ok(deleted) => {
+                seams.rows.forget_minted(&key).await?;
+                if deleted {
+                    expired.deleted += 1;
+                } else {
+                    expired.named += 1;
+                }
+            }
+            Err(_) => {
+                seams
+                    .rows
+                    .postpone_minted(&key, now + MINTED_PENDING_SECS)
+                    .await?;
+                expired.put_off += 1;
+            }
+        }
+    }
+    Ok(expired)
 }
 
 /// After a send: delete, best-effort, the payment's object when this send
@@ -713,16 +1130,20 @@ pub struct Drained {
     pub settled: u32,
     /// Fees tried and still owed: wallet-infra or the store could not answer.
     pub put_off: u32,
-    /// Fees not tried: the bytes are no longer the upload the door verified,
-    /// or the deployment names no bucket for the reference.
-    pub held: u32,
+    /// Fees ended (0.4.4, R403-L1): a reason that cannot clear by itself
+    /// (the bytes are no longer the upload the door verified or are gone, the
+    /// arguments do not parse, the deployment names no bucket, wallet-infra
+    /// cannot read the bucket), or the ceiling of attempts reached. 0.4.3
+    /// held such a fee and retried it daily without end.
+    pub ended: u32,
 }
 
 /// What became of one fee at the drain.
 enum Tried {
     Settled,
     PutOff(String),
-    Held(String),
+    /// A reason that cannot clear by itself: the fee ends.
+    Ends(String),
 }
 
 /// One deferred fee: the object held to the upload the door verified (its
@@ -732,17 +1153,17 @@ enum Tried {
 async fn try_fee(seams: &Seams<'_>, fee: &DeferredFee) -> Tried {
     let stamp = match seams.blobs.stamp(&fee.key).await {
         Ok(Some(stamp)) => stamp,
-        Ok(None) => return Tried::Held("the object is not in the store".to_string()),
+        Ok(None) => return Tried::Ends("the object is not in the store".to_string()),
         Err(e) => return Tried::PutOff(e),
     };
     if stamp.etag != fee.etag {
-        return Tried::Held("another upload is at the key".to_string());
+        return Tried::Ends("another upload is at the key".to_string());
     }
     let Some(bucket) = seams.blobs.bucket_name() else {
-        return Tried::Held("the deployment names no bucket for the reference".to_string());
+        return Tried::Ends("the deployment names no bucket for the reference".to_string());
     };
     let Ok(args) = serde_json::from_str::<Value>(&fee.args) else {
-        return Tried::Held("the row's arguments do not parse".to_string());
+        return Tried::Ends("the row's arguments do not parse".to_string());
     };
     let reference = beef_at_rest(&fee.key, &stamp, &bucket);
     match seams
@@ -752,62 +1173,157 @@ async fn try_fee(seams: &Seams<'_>, fee: &DeferredFee) -> Tried {
     {
         Ok(true) => Tried::Settled,
         Ok(false) => Tried::PutOff("wallet-infra did not accept the payment".to_string()),
+        Err(e) if cannot_read_bucket(&e) => Tried::Ends(format!(
+            "wallet-infra cannot read the relay's bucket: {}",
+            e
+        )),
         Err(e) => Tried::PutOff(e),
     }
 }
 
 /// Record the deferred fees that are due at `now`, at most `limit` of them,
 /// the longest waiting leading. A fee recorded has its row cleared, and its
-/// object deleted when no stored row names it (`reclaim`). A fee that could not be
-/// recorded stays, with one more attempt and a later `next_at`; none is
-/// dropped. `Err` is a ledger that could not be read.
+/// object deleted when nothing else names it (`reclaim`). A fee that could
+/// not be recorded this time stays, with one more attempt and a later
+/// `next_at`, up to `FEE_ATTEMPTS_CEILING`; at the ceiling, or for a reason
+/// that cannot clear by itself, it ends with its reason (0.4.4, bsv-low #591
+/// R403-L1). A refusal that says wallet-infra cannot read the relay's bucket
+/// is recorded as the relay's word, and cleared when a fee is recorded.
+/// `Err` is a ledger that could not be read.
 pub async fn drain_fees(seams: &Seams<'_>, now: u64, limit: u32) -> Result<Drained, String> {
     let mut drained = Drained::default();
     for fee in seams.ledger.due(now, limit).await? {
-        let why = match try_fee(seams, &fee).await {
+        match try_fee(seams, &fee).await {
             Tried::Settled => {
                 seams.ledger.settle(&fee.key).await?;
                 // The fee no longer names the object. It goes when no row
                 // does either: asked of the rows now, not read from what the
                 // fee's row said when it was deferred.
                 let _ = reclaim(seams, &fee.key).await;
+                if matches!(seams.ledger.wallet_word().await, Ok(Some(_))) {
+                    seams.ledger.set_wallet_word(None, now).await?;
+                }
                 drained.settled += 1;
-                continue;
             }
             Tried::PutOff(why) => {
-                drained.put_off += 1;
-                why
+                let attempts = fee.attempts.saturating_add(1);
+                if attempts >= FEE_ATTEMPTS_CEILING {
+                    let why = format!("not recorded after {} attempts: {}", attempts, why);
+                    seams.ledger.end(&fee.key, &why).await?;
+                    drained.ended += 1;
+                } else {
+                    seams
+                        .ledger
+                        .put_off(&fee.key, attempts, now + backoff_secs(attempts), &why)
+                        .await?;
+                    drained.put_off += 1;
+                }
             }
-            Tried::Held(why) => {
-                drained.held += 1;
-                why
+            Tried::Ends(why) => {
+                if cannot_read_bucket(&why) {
+                    seams.ledger.set_wallet_word(Some(&why), now).await?;
+                }
+                seams.ledger.end(&fee.key, &why).await?;
+                drained.ended += 1;
             }
-        };
-        let attempts = fee.attempts.saturating_add(1);
-        seams
-            .ledger
-            .put_off(&fee.key, attempts, now + backoff_secs(attempts), &why)
-            .await?;
+        }
     }
     Ok(drained)
+}
+
+/// The fees on the health figure (0.4.4, bsv-low #591 R403-L1): owed, ended
+/// and the last reason, and the relay's word on wallet-infra's reach into its
+/// bucket when there is one.
+pub async fn health_figure(ledger: &dyn FeeLedger) -> Result<Value, String> {
+    let figure = ledger.figure().await?;
+    let mut fees = json!({
+        "owed": figure.owed,
+        "ended": figure.ended,
+    });
+    if let Some(last) = figure.last_ended {
+        fees["lastEnded"] = json!(last);
+    }
+    if let Some((word, at)) = ledger.wallet_word().await? {
+        fees["walletInfra"] = json!({ "readsTheBucket": false, "word": word, "since": at });
+    }
+    Ok(fees)
+}
+
+/// What one re-ask of the owed announcements came to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reasked {
+    /// Announcements the broadcaster took; their rows are gone.
+    pub accepted: u32,
+    /// Asked again and not taken, or not asked: one more attempt.
+    pub put_off: u32,
+}
+
+/// Ask again the announcements due at `now`, at most `limit` (0.4.4,
+/// bsv-low #591 M2): the bytes held to the etag the door verified and posted
+/// from rest. A broadcaster that takes the subject clears its row, and the
+/// object goes when nothing else names it; any other word is a hint, kept
+/// with one more attempt and the fees' backoff. With no broadcaster named,
+/// nothing is asked. `Err` is a ledger that could not be read.
+pub async fn reask_announces(seams: &Seams<'_>, now: u64, limit: u32) -> Result<Reasked, String> {
+    let mut reasked = Reasked::default();
+    let Some(announcer) = seams.announcer else {
+        return Ok(reasked);
+    };
+    for owed in seams.ledger.due_announces(now, limit).await? {
+        let word = match seams.blobs.stamp(&owed.key).await {
+            Ok(Some(stamp)) if stamp.etag == owed.etag => {
+                match announcer
+                    .announce(Subject::AtRest {
+                        key: &owed.key,
+                        stamp: &stamp,
+                    })
+                    .await
+                {
+                    Ok(hint) if hint.accepted => {
+                        seams.ledger.announced(&owed.key).await?;
+                        let _ = reclaim(seams, &owed.key).await;
+                        reasked.accepted += 1;
+                        continue;
+                    }
+                    Ok(hint) => hint.word,
+                    Err(e) => format!("no answer: {}", e),
+                }
+            }
+            Ok(Some(_)) => "another upload is at the key".to_string(),
+            Ok(None) => "the object is not in the store".to_string(),
+            Err(e) => e,
+        };
+        let attempts = owed.attempts.saturating_add(1);
+        seams
+            .ledger
+            .put_off_announce(&owed.key, attempts, now + backoff_secs(attempts), &word)
+            .await?;
+        reasked.put_off += 1;
+    }
+    Ok(reasked)
 }
 
 // ---------------------------------------------------------------------------
 // The readers of a row
 // ---------------------------------------------------------------------------
 
-/// The largest BEEF a list reader hands back inside the row's `payment.tx`:
-/// D1's bound on a row, so every payment a row ever carried is still served
-/// the way it was. A larger one is served by its key (`/beef/download-url`).
-/// A way of serving, never a refusal.
+/// The largest `payment.tx` a list reader hands back inside a row, in bytes
+/// of its JSON text (0.4.4, bsv-low #591 M1; 0.4.0 to 0.4.3 counted BEEF
+/// bytes): D1's bound on a row, so every payment a row ever carried, whose
+/// text was in the row, is still served the way it was. A larger one is
+/// served by its key (`/beef/download-url`). A way of serving, never a
+/// refusal.
 pub const LIST_INLINE_OBJECT_BYTES: u64 = 2_000_000;
 
-/// The BEEF bytes one list response hands back inline. A row past it waits
-/// for the next listing; the isolate that builds the response is what this
-/// spares.
-pub const LIST_INLINE_BYTES: u64 = 32 * 1024 * 1024;
+/// The text one list response is built to, every body it serves counted in
+/// bytes of its JSON text (0.4.4, M1 and NOTE-3; 0.4.0 to 0.4.3 counted 32
+/// MiB of BEEF bytes, which a byte array makes about 115 MiB of text): about
+/// 16 MB, an eighth of the isolate's 128 MB, so the response, its escaped
+/// copy in the reply and the rows read from D1 stay well inside it. A row
+/// past it waits for the next listing.
+pub const LIST_INLINE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// What one list response may still hand back inline.
+/// What one list response may still hand back, in bytes of text.
 #[derive(Debug, Clone, Copy)]
 pub struct ListBudget {
     pub bytes: u64,
@@ -845,39 +1361,79 @@ pub fn rest_of(payment: &Value) -> Option<(&str, Stamp, TxShape)> {
     ))
 }
 
-/// A stored row's body for a list response. A row whose payment names bytes
-/// at rest gets them back as `payment.tx`, in the shape the sender sent,
-/// streamed from the store, when they are no larger than
+/// A stored row's body for a list response, its text counted against the
+/// response's budget. A row whose payment names bytes at rest gets them back
+/// as `payment.tx`, in the shape the sender sent, streamed from the store and
+/// written straight to text, when that text is no longer than
 /// `LIST_INLINE_OBJECT_BYTES`; a larger payment, or one whose bytes the store
 /// could not give (or are no longer the upload the door verified), is served
-/// as stored, by its key. Every other body is served as stored, untouched.
+/// as stored, by its key. Every other body is served as stored, untouched. A
+/// row whose text the budget no longer covers is left for the next listing,
+/// before its bytes are read.
 pub async fn serve_body<'a>(
     body: &'a str,
     blobs: &dyn BeefStore,
     budget: &mut ListBudget,
 ) -> Served<'a> {
-    let stored = Served::Body(Cow::Borrowed(body));
+    let as_stored = |budget: &mut ListBudget| match budget.bytes.checked_sub(body.len() as u64) {
+        Some(left) => {
+            budget.bytes = left;
+            Served::Body(Cow::Borrowed(body))
+        }
+        None => Served::NextListing,
+    };
     if !body.contains("\"beefR2Key\"") {
-        return stored;
+        return as_stored(budget);
     }
     let Ok(mut row) = serde_json::from_str::<Value>(body) else {
-        return stored;
+        return as_stored(budget);
     };
     let Some((key, stamp, shape)) = row.get("payment").and_then(rest_of) else {
-        return stored;
+        return as_stored(budget);
     };
-    if stamp.size > LIST_INLINE_OBJECT_BYTES {
-        return stored;
+    // A row served by its key carries the payment's reference and the
+    // reader's words (0.4.4, bsv-low #591 NOTE-2): `payment.tx` is absent,
+    // and a recipient that reads it (the reference client throws on a
+    // missing `tx` and keeps the payment on the message, ts-stack@edf6e03
+    // packages/messaging/message-box-client/src/MessageBoxClient.ts:580,
+    // 2109-2131, 2155-2166) has the key and what to do with it beside it.
+    let by_key = |mut row: Value, words: String, budget: &mut ListBudget| {
+        row["payment"]["key"] = json!(key);
+        row["payment"]["words"] = json!(words);
+        let text = row.to_string();
+        match budget.bytes.checked_sub(text.len() as u64) {
+            Some(left) => {
+                budget.bytes = left;
+                Served::Body(Cow::Owned(text))
+            }
+            None => Served::NextListing,
+        }
+    };
+    let text = encoded_len(stamp.size, shape);
+    if text > LIST_INLINE_OBJECT_BYTES {
+        let words = format!(
+            "This payment's BEEF ({} bytes) is not in the listing: it rests at its key, {}. Ask POST /beef/download-url with this message's messageId for a URL to read it from, and internalize it from there.",
+            stamp.size, key
+        );
+        return by_key(row.clone(), words, budget);
     }
-    if stamp.size > budget.bytes {
+    // The body, the payment's text, and `,"tx":` between them.
+    if text + body.len() as u64 + 6 > budget.bytes {
         return Served::NextListing;
     }
-    let Ok(tx) = tx_from_rest(blobs, key, &stamp, shape).await else {
-        return stored;
+    let Ok(tx) = tx_text(blobs, key, &stamp, shape).await else {
+        let words = format!(
+            "This payment's BEEF could not be read back for this listing: it rests at its key, {}. List again, or ask POST /beef/download-url with this message's messageId.",
+            key
+        );
+        return by_key(row.clone(), words, budget);
     };
-    budget.bytes -= stamp.size;
-    row["payment"]["tx"] = tx;
-    Served::Body(Cow::Owned(row.to_string()))
+    // The text goes in where a mark nobody else can write stands.
+    let mark = format!("rmb-tx-{}", uuid::Uuid::new_v4().simple());
+    row["payment"]["tx"] = json!(mark);
+    let served = row.to_string().replacen(&format!("\"{}\"", mark), &tx, 1);
+    budget.bytes = budget.bytes.saturating_sub(served.len() as u64);
+    Served::Body(Cow::Owned(served))
 }
 
 #[cfg(test)]
@@ -1082,13 +1638,22 @@ pub(crate) mod tests {
             let body = row(&payment_at_rest(&json!({}), KEY, &stamp, shape, Some("aa")));
             assert!(body.len() < 400, "the row holds no BEEF: {}", body.len());
             let mut budget = ListBudget::default();
-            let row = served(&body, &blobs, &mut budget).await;
+            let Served::Body(text) = serve_body(&body, &blobs, &mut budget).await else {
+                panic!("served");
+            };
+            // The text written straight is the text of the row built as a
+            // value, byte for byte (0.4.3's way).
+            let mut built: Value = serde_json::from_str(&body).unwrap();
+            built["payment"]["tx"] = tx.clone();
+            assert_eq!(text, built.to_string(), "{shape:?}");
+            assert!(text.len() as u64 <= encoded_len(1_000, shape) + body.len() as u64 + 6);
+            let row: Value = serde_json::from_str(&text).unwrap();
             assert_eq!(row["payment"]["tx"], tx, "{shape:?}");
             assert_eq!(row["payment"]["beefR2Key"], KEY, "the key stays beside it");
             assert_eq!(row["payment"]["txid"], "aa");
             assert_eq!(row["message"], "hello");
             assert_eq!(blobs.opened.get(), 1, "one read of the object");
-            assert_eq!(budget.bytes, LIST_INLINE_BYTES - 1_000);
+            assert_eq!(budget.bytes, LIST_INLINE_BYTES - text.len() as u64);
         }
     }
 
@@ -1129,6 +1694,17 @@ pub(crate) mod tests {
         assert!(row["payment"].get("tx").is_none());
         assert_eq!(row["payment"]["beefR2Key"], KEY);
         assert_eq!(blobs.opened.get(), 0, "never read into the response");
+        // NOTE-2 (bsv-low #591, 0.4.4): the payment's reference and the
+        // reader's words, so a recipient that reads `payment.tx` and finds
+        // none is handed the key's word with the payment it keeps.
+        assert_eq!(row["payment"]["key"], KEY);
+        let words = row["payment"]["words"]
+            .as_str()
+            .expect("the reader's words");
+        assert!(
+            words.contains("/beef/download-url") && words.contains(KEY),
+            "{words}"
+        );
     }
 
     #[tokio::test]
@@ -1150,6 +1726,8 @@ pub(crate) mod tests {
         blobs.put(KEY, &bytes(100), "e2");
         let row = served(&body, &blobs, &mut budget).await;
         assert!(row["payment"].get("tx").is_none(), "{row}");
+        assert_eq!(row["payment"]["key"], KEY, "served by key, and it says so");
+        assert!(row["payment"]["words"].as_str().is_some(), "{row}");
 
         blobs.put(KEY, &beef, "e1");
         blobs.down.set(true);
@@ -1161,7 +1739,11 @@ pub(crate) mod tests {
         blobs.down.set(false);
         let row = served(&body, &blobs, &mut budget).await;
         assert!(row["payment"].get("tx").is_none(), "{row}");
-        assert_eq!(budget.bytes, LIST_INLINE_BYTES, "nothing was handed back");
+        let spent = LIST_INLINE_BYTES - budget.bytes;
+        assert!(
+            spent > 3 * body.len() as u64 && spent < 3 * 1_024,
+            "three rows served by key, their words beside them, and no BEEF: {spent}"
+        );
     }
 
     #[tokio::test]
@@ -1176,7 +1758,11 @@ pub(crate) mod tests {
             TxShape::Hex,
             None,
         ));
-        let mut budget = ListBudget { bytes: 1_000 };
+        // Room for one row's text (the body and 1,202 bytes of hex), not
+        // two.
+        let mut budget = ListBudget {
+            bytes: body.len() as u64 + 1_202 + 100,
+        };
         assert!(matches!(
             serve_body(&body, &blobs, &mut budget).await,
             Served::Body(_)
@@ -1186,6 +1772,39 @@ pub(crate) mod tests {
             Served::NextListing
         );
         assert_eq!(blobs.opened.get(), 1);
+    }
+
+    /// M1 (bsv-low #591): the budget is the response's text, not the BEEF's
+    /// bytes. Twelve rows of a 450,000-byte BEEF sent as a byte array fit
+    /// 0.4.3's 32 MiB of BEEF whole; as text they are at most 1,800,002
+    /// bytes each (under a row's 2,000,000; 1,602,977 as written), so a
+    /// response of about 16 MB serves ten inline and leaves the eleventh for
+    /// the next listing before it is read or encoded.
+    #[tokio::test]
+    async fn a_listing_whose_beef_fits_the_old_budget_and_whose_text_does_not_stops_before_encoding(
+    ) {
+        let beef = bytes(450_000);
+        let blobs = Mem::default();
+        let stamp = blobs.put(KEY, &beef, "e1");
+        let body = row(&payment_at_rest(
+            &json!({}),
+            KEY,
+            &stamp,
+            TxShape::Array,
+            Some("aa"),
+        ));
+        let mut budget = ListBudget::default();
+        let mut served = Vec::new();
+        for _ in 0..12 {
+            match serve_body(&body, &blobs, &mut budget).await {
+                Served::Body(text) => served.push(text.len()),
+                Served::NextListing => break,
+            }
+        }
+        let text: usize = served.iter().sum();
+        assert_eq!(served.len(), 10, "ten rows of {served:?}");
+        assert!(text as u64 <= 16 * 1024 * 1024, "{text} bytes of text");
+        assert_eq!(blobs.opened.get(), 10, "the eleventh is not read");
     }
 
     // ---- the hand-off ----
@@ -1233,6 +1852,31 @@ pub(crate) mod tests {
         async fn owes(&self, key: &str) -> Result<bool, String> {
             Ok(self.rows.borrow().iter().any(|row| row.key == key))
         }
+        async fn owe_announce(&self, _: &OwedAnnounce, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn end(&self, key: &str, _why: &str) -> Result<(), String> {
+            self.rows.borrow_mut().retain(|row| row.key != key);
+            Ok(())
+        }
+        async fn figure(&self) -> Result<FeeFigure, String> {
+            Ok(FeeFigure::default())
+        }
+        async fn wallet_word(&self) -> Result<Option<(String, u64)>, String> {
+            Ok(None)
+        }
+        async fn set_wallet_word(&self, _: Option<&str>, _: u64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn due_announces(&self, _: u64, _: u32) -> Result<Vec<OwedAnnounce>, String> {
+            Ok(Vec::new())
+        }
+        async fn announced(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn put_off_announce(&self, _: &str, _: u32, _: u64, _: &str) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     /// The stored rows as a list of the keys they name, and the keys let go
@@ -1242,6 +1886,9 @@ pub(crate) mod tests {
         keys: RefCell<Vec<String>>,
         released: RefCell<Vec<String>>,
         down: Cell<bool>,
+        /// A send that names this key right after a look answers that
+        /// nothing names it: the race between the look and the delete.
+        renamed_after_look: RefCell<Option<String>>,
     }
 
     #[async_trait::async_trait(?Send)]
@@ -1250,7 +1897,12 @@ pub(crate) mod tests {
             if self.down.get() {
                 return Err("D1_ERROR: unavailable".to_string());
             }
-            Ok(self.keys.borrow().iter().any(|named| named == key))
+            let named = self.keys.borrow().iter().any(|named| named == key);
+            if self.renamed_after_look.borrow().as_deref() == Some(key) {
+                self.renamed_after_look.borrow_mut().take();
+                self.keys.borrow_mut().push(key.to_string());
+            }
+            Ok(named)
         }
         async fn released(&self, limit: u32) -> Result<Vec<String>, String> {
             let released = self.released.borrow();
@@ -1258,6 +1910,27 @@ pub(crate) mod tests {
         }
         async fn forget(&self, key: &str) -> Result<(), String> {
             self.released.borrow_mut().retain(|k| k != key);
+            Ok(())
+        }
+        async fn claim(&self, _key: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn unclaim(&self, _key: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn claimed(&self, _key: &str) -> Result<bool, String> {
+            Ok(false)
+        }
+        async fn mint(&self, _key: &str, _deadline: u64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn minted_due(&self, _now: u64, _limit: u32) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
+        }
+        async fn postpone_minted(&self, _key: &str, _deadline: u64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn forget_minted(&self, _key: &str) -> Result<(), String> {
             Ok(())
         }
     }
@@ -1277,12 +1950,15 @@ pub(crate) mod tests {
                 wallet,
                 ledger,
                 rows: &Named::default(),
+                announcer: None,
             },
             &Paid {
                 payment,
                 r2_key: None,
+                spooled: None,
                 spool_key: KEY,
                 server_output: fee_owed.then_some(&server_output),
+                stamp: None,
                 txid: fee_owed.then_some("aa"),
                 rows,
                 reader: "02relay",
@@ -1305,6 +1981,7 @@ pub(crate) mod tests {
             wallet: &wallet,
             ledger: &ledger,
             rows: &rows,
+            announcer: None,
         };
         let fee = DeferredFee {
             key: KEY.to_string(),
@@ -1338,6 +2015,36 @@ pub(crate) mod tests {
         assert!(!here());
     }
 
+    /// L2 (bsv-low #591): the reclaim was a look (`names`, `owes`) and then a
+    /// delete, so a send that named the key between the two lost its bytes.
+    /// Since 0.4.4 the reclaim looks again after its claim and holds the
+    /// delete to the etag it looked at: the re-named object stays.
+    #[tokio::test]
+    async fn a_concurrent_re_name_between_the_look_and_the_delete_loses_nothing() {
+        let blobs = Mem::default();
+        let wallet = accepts();
+        let ledger = Owed::default();
+        let rows = Named::default();
+        let seams = Seams {
+            blobs: &blobs,
+            wallet: &wallet,
+            ledger: &ledger,
+            rows: &rows,
+            announcer: None,
+        };
+        blobs.put(KEY, &bytes(10), "e1");
+        *rows.renamed_after_look.borrow_mut() = Some(KEY.to_string());
+        assert_eq!(reclaim(&seams, KEY).await, Ok(false));
+        assert!(
+            blobs.objects.borrow().contains_key(KEY),
+            "the re-named object stays"
+        );
+        assert!(
+            rows.names(KEY).await.unwrap(),
+            "and the send's row names it"
+        );
+    }
+
     #[tokio::test]
     async fn the_released_keys_are_looked_at_and_one_the_store_cannot_answer_for_waits() {
         let blobs = Mem::default();
@@ -1349,6 +2056,7 @@ pub(crate) mod tests {
             wallet: &wallet,
             ledger: &ledger,
             rows: &rows,
+            announcer: None,
         };
         for key in ["02abc/gone.beef", "02abc/named.beef"] {
             blobs.put(key, &bytes(10), "e1");
@@ -1380,7 +2088,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_box_that_owes_no_delivery_fee_keeps_the_recipients_payment_at_rest_unjudged() {
+    async fn a_box_that_owes_no_delivery_fee_keeps_the_recipients_payment_in_its_row_and_spools_nothing(
+    ) {
+        // M3 (bsv-low #591): a body nobody judged is never spooled. 0.4.0 to
+        // 0.4.3 put it at rest and named it in the row; 0.3.x's row carried
+        // it, bounded by the row, and so does 0.4.4's.
         let (blobs, wallet, ledger) = (Mem::default(), accepts(), Owed::default());
         let payment = json!({ "tx": hex::encode(bytes(50)), "description": "d" });
         let handed = handed(&blobs, &wallet, &ledger, &payment, false, true)
@@ -1388,11 +2100,12 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(handed.fee, Fee::NotOwed);
         assert_eq!(wallet.asked.get(), 0);
-        assert_eq!(handed.kept.as_deref(), Some(KEY));
+        assert_eq!(handed.kept, None, "nothing at rest");
+        assert!(blobs.objects.borrow().is_empty(), "nothing spooled");
         assert_eq!(handed.payment["verdict"], "notJudged");
-        assert_eq!(handed.payment["txShape"], "hex");
-        assert!(handed.payment.get("tx").is_none());
-        assert_eq!(blobs.objects.borrow()[KEY].0, bytes(50));
+        assert_eq!(handed.payment["tx"], payment["tx"], "the bytes in the row");
+        assert_eq!(handed.payment["description"], "d");
+        assert!(handed.payment.get("beefR2Key").is_none());
     }
 
     #[tokio::test]
@@ -1562,6 +2275,7 @@ pub(crate) mod tests {
             wallet: &wallet,
             ledger: &ledger,
             rows: &rows,
+            announcer: None,
         };
         let drained = drain_fees(&seams, 0, DRAIN_BATCH).await.unwrap();
         assert_eq!(drained.settled, 1);
@@ -1584,11 +2298,14 @@ pub(crate) mod tests {
             wallet: &wallet,
             ledger: &ledger,
             rows: &rows,
+            announcer: None,
         };
         let drained = drain_fees(&seams, 0, DRAIN_BATCH).await.unwrap();
-        assert_eq!((drained.settled, drained.held), (0, 1));
+        assert_eq!((drained.settled, drained.ended), (0, 1));
         assert!(wallet.0.borrow().is_empty(), "never the bytes in its place");
-        assert_eq!(ledger.rows.borrow().len(), 1, "never dropped");
+        // 0.4.4 (R403-L1): a reason that cannot clear by itself ends the fee
+        // at once; 0.4.3 kept it and retried it daily.
+        assert!(ledger.rows.borrow().is_empty(), "ended, never retried");
     }
 
     #[test]

@@ -26,12 +26,25 @@ pub const INSERT_MESSAGE_SQL: &str =
     "INSERT OR IGNORE INTO messages (message_id, message_box_id, sender, recipient, body, beef_key) \
      VALUES (?, ?, ?, ?, ?, ?)";
 
-/// The statement that lists a recipient's box (`list_messages`).
+/// The statement that lists a recipient's box (`list_messages`): at most
+/// `LIST_MESSAGES_LIMIT` rows, as before, and of those the leading rows whose
+/// bodies add up to at most the response's budget (0.4.4, bsv-low #591
+/// NOTE-3: `handoff::LIST_INLINE_BYTES`, in bytes of the stored text). A row
+/// is at most D1's 2,000,000 bytes, so a listing of near-full rows handed the
+/// isolate up to about 200 MB before; now about 16 MB, and the rest are in
+/// the next listing. The inner statement is 0.4.3's, the same rows in the
+/// same order, stopping at its `LIMIT`; the window adds the running length.
+/// Bound in order: recipient, box, the row limit, the byte budget.
 pub const LIST_MESSAGES_SQL: &str =
-    "SELECT message_id AS messageId, body, sender, created_at, updated_at \
-     FROM messages WHERE recipient = ? AND message_box_id = ? \
-     AND acknowledged_at IS NULL \
-     LIMIT ?";
+    "SELECT messageId, body, sender, created_at, updated_at FROM ( \
+       SELECT messageId, body, sender, created_at, updated_at, \
+              SUM(size) OVER (ROWS UNBOUNDED PRECEDING) AS upto FROM ( \
+         SELECT message_id AS messageId, body, sender, created_at, updated_at, \
+                length(CAST(body AS BLOB)) AS size \
+         FROM messages WHERE recipient = ? AND message_box_id = ? \
+         AND acknowledged_at IS NULL \
+         LIMIT ?)) \
+     WHERE upto <= ?";
 
 /// The statements of the deferred-fee ledger (`fee_internalize`, migration
 /// 0003; `D1Ledger`). Each is idempotent: a deferral is `INSERT OR IGNORE` on
@@ -41,11 +54,40 @@ pub const DEFER_FEE_SQL: &str =
      VALUES (?, ?, ?, ?, ?, ?, ?)";
 pub const DUE_FEES_SQL: &str =
     "SELECT key, etag, txid, args, named, attempts, next_at FROM fee_internalize \
-     WHERE next_at <= ? ORDER BY next_at LIMIT ?";
+     WHERE next_at <= ? AND ended IS NULL ORDER BY next_at LIMIT ?";
+/// A fee ends with its reason (migration 0009, 0.4.4 bsv-low #591 R403-L1).
+pub const END_FEE_SQL: &str =
+    "UPDATE fee_internalize SET ended = ?, last_error = ?, updated_at = datetime('now') WHERE key = ?";
+/// The health figure: the fees owed and ended, and the last reason.
+pub const FEES_FIGURE_SQL: &str =
+    "SELECT COALESCE(SUM(ended IS NULL), 0) AS owed, COALESCE(SUM(ended IS NOT NULL), 0) AS ended \
+     FROM fee_internalize";
+pub const LAST_ENDED_SQL: &str =
+    "SELECT ended FROM fee_internalize WHERE ended IS NOT NULL ORDER BY updated_at DESC LIMIT 1";
+/// The relay's word on wallet-infra's reach into its bucket.
+pub const WALLET_WORD_SQL: &str = "SELECT word, at FROM relay_health WHERE name = 'wallet-bucket'";
+pub const SET_WALLET_WORD_SQL: &str =
+    "INSERT OR REPLACE INTO relay_health (name, word, at) VALUES ('wallet-bucket', ?, ?)";
+pub const CLEAR_WALLET_WORD_SQL: &str = "DELETE FROM relay_health WHERE name = 'wallet-bucket'";
 pub const SETTLE_FEE_SQL: &str = "DELETE FROM fee_internalize WHERE key = ?";
 pub const PUT_OFF_FEE_SQL: &str =
     "UPDATE fee_internalize SET attempts = ?, next_at = ?, last_error = ?, \
      updated_at = datetime('now') WHERE key = ?";
+
+/// The statements of the announcements owed (`announce_owed`, migration
+/// 0005, 0.4.4 bsv-low #591 M2; `D1Ledger`): a broadcaster's refusal, or no
+/// answer, asked again by the drain. Idempotent as the fees are.
+pub const OWE_ANNOUNCE_SQL: &str =
+    "INSERT OR IGNORE INTO announce_owed (key, etag, txid, attempts, next_at, last_word) \
+     VALUES (?, ?, ?, 0, ?, ?)";
+pub const DUE_ANNOUNCES_SQL: &str = "SELECT key, etag, txid, attempts, next_at FROM announce_owed \
+     WHERE next_at <= ? ORDER BY next_at LIMIT ?";
+pub const ANNOUNCED_SQL: &str = "DELETE FROM announce_owed WHERE key = ?";
+pub const PUT_OFF_ANNOUNCE_SQL: &str =
+    "UPDATE announce_owed SET attempts = ?, next_at = ?, last_word = ?, \
+     updated_at = datetime('now') WHERE key = ?";
+pub const ANNOUNCE_OWES_KEY_SQL: &str =
+    "SELECT 1 AS named FROM announce_owed WHERE key = ? LIMIT 1";
 
 /// The statements of object ownership (migration 0004; `D1Rows`, and
 /// `D1Ledger::owes`). A stored row names its payment's object in `beef_key`;
@@ -53,7 +95,21 @@ pub const PUT_OFF_FEE_SQL: &str =
 /// index: `idx_messages_beef_key`, the ledger's primary key, the queue's.
 pub const ROW_NAMES_KEY_SQL: &str =
     "SELECT 1 AS named FROM messages WHERE beef_key = ? AND acknowledged_at IS NULL LIMIT 1";
-pub const FEE_OWES_KEY_SQL: &str = "SELECT 1 AS named FROM fee_internalize WHERE key = ? LIMIT 1";
+pub const FEE_OWES_KEY_SQL: &str =
+    "SELECT 1 AS named FROM fee_internalize WHERE key = ? AND ended IS NULL LIMIT 1";
+/// The claim a reclaim holds while it looks and deletes (migration 0007,
+/// 0.4.4 bsv-low #591 L2). A claim older than five minutes is no claim.
+pub const CLAIM_SQL: &str =
+    "INSERT OR REPLACE INTO beef_reclaiming (key, claimed_at) VALUES (?, CAST(strftime('%s','now') AS INTEGER))";
+pub const UNCLAIM_SQL: &str = "DELETE FROM beef_reclaiming WHERE key = ?";
+pub const CLAIMED_SQL: &str = "SELECT 1 AS named FROM beef_reclaiming WHERE key = ? \
+     AND claimed_at >= CAST(strftime('%s','now') AS INTEGER) - 300 LIMIT 1";
+/// The keys the relay minted (migration 0008, 0.4.4 bsv-low #591 L3).
+pub const MINT_SQL: &str = "INSERT OR IGNORE INTO beef_minted (key, deadline) VALUES (?, ?)";
+pub const MINTED_DUE_SQL: &str =
+    "SELECT key FROM beef_minted WHERE deadline <= ? ORDER BY deadline LIMIT ?";
+pub const POSTPONE_MINTED_SQL: &str = "UPDATE beef_minted SET deadline = ? WHERE key = ?";
+pub const FORGET_MINTED_SQL: &str = "DELETE FROM beef_minted WHERE key = ?";
 /// The keys rows have let go of (`beef_released`, filled by the triggers).
 pub const RELEASED_KEYS_SQL: &str = "SELECT key FROM beef_released LIMIT ?";
 pub const FORGET_RELEASED_SQL: &str = "DELETE FROM beef_released WHERE key = ?";
@@ -77,8 +133,157 @@ struct FeeRow {
     next_at: f64,
 }
 
+#[derive(Debug, Deserialize)]
+struct AnnounceRow {
+    key: String,
+    etag: String,
+    txid: String,
+    attempts: f64,
+    next_at: f64,
+}
+
+impl D1Ledger<'_> {
+    async fn write(&self, q: Query) -> Result<(), String> {
+        with_d1_write_retry(|| q.execute(self.db))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn exists(&self, q: Query) -> Result<bool, String> {
+        let row: Option<NamedRow> = with_d1_read_retry(|| q.fetch_optional(self.db))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.is_some())
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl crate::handoff::FeeLedger for D1Ledger<'_> {
+    async fn owe_announce(
+        &self,
+        owed: &crate::handoff::OwedAnnounce,
+        word: &str,
+    ) -> Result<(), String> {
+        let word: String = word.chars().take(FEE_ERROR_CHARS).collect();
+        self.write(
+            Query::new(OWE_ANNOUNCE_SQL)
+                .bind(owed.key.as_str())
+                .bind(owed.etag.as_str())
+                .bind(owed.txid.as_str())
+                .bind(owed.next_at)
+                .bind(word),
+        )
+        .await
+    }
+
+    async fn due_announces(
+        &self,
+        now: u64,
+        limit: u32,
+    ) -> Result<Vec<crate::handoff::OwedAnnounce>, String> {
+        let q = Query::new(DUE_ANNOUNCES_SQL).bind(now).bind(limit);
+        let rows: Vec<AnnounceRow> = with_d1_read_retry(|| q.fetch_all(self.db))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::handoff::OwedAnnounce {
+                key: row.key,
+                etag: row.etag,
+                txid: row.txid,
+                attempts: row.attempts as u32,
+                next_at: row.next_at as u64,
+            })
+            .collect())
+    }
+
+    async fn announced(&self, key: &str) -> Result<(), String> {
+        self.write(Query::new(ANNOUNCED_SQL).bind(key)).await
+    }
+
+    async fn end(&self, key: &str, why: &str) -> Result<(), String> {
+        let why: String = why.chars().take(FEE_ERROR_CHARS).collect();
+        self.write(
+            Query::new(END_FEE_SQL)
+                .bind(why.as_str())
+                .bind(why.as_str())
+                .bind(key),
+        )
+        .await
+    }
+
+    async fn figure(&self) -> Result<crate::handoff::FeeFigure, String> {
+        #[derive(Deserialize)]
+        struct Counts {
+            owed: f64,
+            ended: f64,
+        }
+        #[derive(Deserialize)]
+        struct Last {
+            ended: String,
+        }
+        let q = Query::new(FEES_FIGURE_SQL);
+        let counts: Option<Counts> = with_d1_read_retry(|| q.fetch_optional(self.db))
+            .await
+            .map_err(|e| e.to_string())?;
+        let q = Query::new(LAST_ENDED_SQL);
+        let last: Option<Last> = with_d1_read_retry(|| q.fetch_optional(self.db))
+            .await
+            .map_err(|e| e.to_string())?;
+        let counts = counts.unwrap_or(Counts {
+            owed: 0.0,
+            ended: 0.0,
+        });
+        Ok(crate::handoff::FeeFigure {
+            owed: counts.owed as u64,
+            ended: counts.ended as u64,
+            last_ended: last.map(|last| last.ended),
+        })
+    }
+
+    async fn wallet_word(&self) -> Result<Option<(String, u64)>, String> {
+        #[derive(Deserialize)]
+        struct Word {
+            word: String,
+            at: f64,
+        }
+        let q = Query::new(WALLET_WORD_SQL);
+        let word: Option<Word> = with_d1_read_retry(|| q.fetch_optional(self.db))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(word.map(|w| (w.word, w.at as u64)))
+    }
+
+    async fn set_wallet_word(&self, word: Option<&str>, now: u64) -> Result<(), String> {
+        match word {
+            Some(word) => {
+                let word: String = word.chars().take(FEE_ERROR_CHARS).collect();
+                self.write(Query::new(SET_WALLET_WORD_SQL).bind(word).bind(now))
+                    .await
+            }
+            None => self.write(Query::new(CLEAR_WALLET_WORD_SQL)).await,
+        }
+    }
+
+    async fn put_off_announce(
+        &self,
+        key: &str,
+        attempts: u32,
+        next_at: u64,
+        word: &str,
+    ) -> Result<(), String> {
+        let word: String = word.chars().take(FEE_ERROR_CHARS).collect();
+        self.write(
+            Query::new(PUT_OFF_ANNOUNCE_SQL)
+                .bind(attempts)
+                .bind(next_at)
+                .bind(word)
+                .bind(key),
+        )
+        .await
+    }
+
     async fn defer(&self, fee: &crate::handoff::DeferredFee) -> Result<(), String> {
         let q = Query::new(DEFER_FEE_SQL)
             .bind(fee.key.as_str())
@@ -122,11 +327,10 @@ impl crate::handoff::FeeLedger for D1Ledger<'_> {
     }
 
     async fn owes(&self, key: &str) -> Result<bool, String> {
-        let q = Query::new(FEE_OWES_KEY_SQL).bind(key);
-        let row: Option<NamedRow> = with_d1_read_retry(|| q.fetch_optional(self.db))
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(row.is_some())
+        Ok(self.exists(Query::new(FEE_OWES_KEY_SQL).bind(key)).await?
+            || self
+                .exists(Query::new(ANNOUNCE_OWES_KEY_SQL).bind(key))
+                .await?)
     }
 
     async fn put_off(
@@ -280,6 +484,62 @@ impl crate::handoff::RowRefs for D1Rows<'_> {
 
     async fn forget(&self, key: &str) -> Result<(), String> {
         let q = Query::new(FORGET_RELEASED_SQL).bind(key);
+        with_d1_write_retry(|| q.execute(self.db))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn claim(&self, key: &str) -> Result<(), String> {
+        let q = Query::new(CLAIM_SQL).bind(key);
+        with_d1_write_retry(|| q.execute(self.db))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn unclaim(&self, key: &str) -> Result<(), String> {
+        let q = Query::new(UNCLAIM_SQL).bind(key);
+        with_d1_write_retry(|| q.execute(self.db))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn claimed(&self, key: &str) -> Result<bool, String> {
+        let q = Query::new(CLAIMED_SQL).bind(key);
+        let row: Option<NamedRow> = with_d1_read_retry(|| q.fetch_optional(self.db))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.is_some())
+    }
+
+    async fn mint(&self, key: &str, deadline: u64) -> Result<(), String> {
+        let q = Query::new(MINT_SQL).bind(key).bind(deadline);
+        with_d1_write_retry(|| q.execute(self.db))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn minted_due(&self, now: u64, limit: u32) -> Result<Vec<String>, String> {
+        let q = Query::new(MINTED_DUE_SQL).bind(now).bind(limit);
+        let rows: Vec<KeyRow> = with_d1_read_retry(|| q.fetch_all(self.db))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(|row| row.key).collect())
+    }
+
+    async fn postpone_minted(&self, key: &str, deadline: u64) -> Result<(), String> {
+        let q = Query::new(POSTPONE_MINTED_SQL).bind(deadline).bind(key);
+        with_d1_write_retry(|| q.execute(self.db))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn forget_minted(&self, key: &str) -> Result<(), String> {
+        let q = Query::new(FORGET_MINTED_SQL).bind(key);
         with_d1_write_retry(|| q.execute(self.db))
             .await
             .map(|_| ())
@@ -458,7 +718,8 @@ impl<'a> Storage<'a> {
         let q = Query::new(LIST_MESSAGES_SQL)
             .bind(identity_key)
             .bind(box_id)
-            .bind(LIST_MESSAGES_LIMIT);
+            .bind(LIST_MESSAGES_LIMIT)
+            .bind(crate::handoff::LIST_INLINE_BYTES);
         with_d1_read_retry(|| q.fetch_all(self.db)).await
     }
 
@@ -1535,6 +1796,8 @@ mod ledger_tests {
             include_str!("../migrations/0001_initial.sql"),
             include_str!("../migrations/0002_transcript_retention.sql"),
             include_str!("../migrations/0003_fee_internalize.sql"),
+            include_str!("../migrations/0005_announce_owed.sql"),
+            include_str!("../migrations/0009_fee_terminal.sql"),
         ] {
             db.execute_batch(migration).unwrap();
         }
@@ -1547,6 +1810,47 @@ mod ledger_tests {
             rusqlite::params![key, "etag-1", "ab".repeat(32), "{}", 1, 0, next_at],
         )
         .unwrap()
+    }
+
+    /// R403-L1 (0.4.4): an ended fee is never due again, names no object,
+    /// and is counted apart on the health figure with its reason; the
+    /// relay's word on the wallet is set and cleared.
+    #[test]
+    fn an_ended_fee_is_never_due_names_nothing_and_is_counted_with_its_reason() {
+        let db = ledger_db();
+        defer(&db, "02aa/one.beef", 10);
+        defer(&db, "02aa/two.beef", 10);
+        db.execute(
+            END_FEE_SQL,
+            rusqlite::params![
+                "another upload is at the key",
+                "another upload is at the key",
+                "02aa/one.beef"
+            ],
+        )
+        .unwrap();
+        assert_eq!(due(&db, 100, 10).len(), 1);
+        let owes = |key: &str| db.prepare(FEE_OWES_KEY_SQL).unwrap().exists([key]).unwrap();
+        assert!(!owes("02aa/one.beef") && owes("02aa/two.beef"));
+        let (owed, ended): (i64, i64) = db
+            .query_row(FEES_FIGURE_SQL, [], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        assert_eq!((owed, ended), (1, 1));
+        let last: String = db.query_row(LAST_ENDED_SQL, [], |row| row.get(0)).unwrap();
+        assert_eq!(last, "another upload is at the key");
+        db.execute(SET_WALLET_WORD_SQL, rusqlite::params!["refused", 5])
+            .unwrap();
+        let word: (String, i64) = db
+            .query_row(WALLET_WORD_SQL, [], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        assert_eq!(word, ("refused".to_string(), 5));
+        db.execute(CLEAR_WALLET_WORD_SQL, []).unwrap();
+        assert!(db
+            .prepare(WALLET_WORD_SQL)
+            .unwrap()
+            .exists([])
+            .map(|e| !e)
+            .unwrap());
     }
 
     fn due(db: &rusqlite::Connection, now: i64, limit: i64) -> Vec<(String, i64, i64)> {
@@ -1645,6 +1949,7 @@ mod ownership_tests {
             include_str!("../migrations/0002_transcript_retention.sql"),
             include_str!("../migrations/0003_fee_internalize.sql"),
             include_str!("../migrations/0004_beef_key.sql"),
+            include_str!("../migrations/0009_fee_terminal.sql"),
         ] {
             db.execute_batch(migration).unwrap();
         }
@@ -1696,6 +2001,27 @@ mod ownership_tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
             .join("\n")
+    }
+
+    /// NOTE-3 (0.4.4): the listing with its running length is still a seek
+    /// on the box's index, stopping at its limit; the window runs over the
+    /// rows the limit kept, never the box.
+    #[test]
+    fn the_listing_with_its_budget_is_a_seek_and_never_a_scan_of_the_box() {
+        let db = db();
+        let listing = plan(
+            &db,
+            LIST_MESSAGES_SQL,
+            &[
+                &"02aa",
+                &1,
+                &LIST_MESSAGES_LIMIT,
+                &crate::handoff::LIST_INLINE_BYTES,
+            ],
+        );
+        eprintln!("{listing}");
+        assert!(listing.contains("SEARCH messages"), "{listing}");
+        assert!(!listing.contains("SCAN messages"), "{listing}");
     }
 
     #[test]

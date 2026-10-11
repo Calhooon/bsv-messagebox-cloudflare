@@ -259,6 +259,8 @@ fn at_rest(beef: &[u8], root: &str, resumed: bool) -> (Answer, usize, usize, boo
                         millis: if resumed { 0 } else { u64::MAX },
                     },
                     lookups: usize::MAX,
+                    inputs: u64::MAX,
+                    weight: u64::MAX,
                 };
                 let mut pending = 0usize;
                 loop {
@@ -312,7 +314,10 @@ fn a_spend_a_script_allows_is_accepted_inline_and_at_rest() {
     assert_eq!(at_rest(&bytes, &root, false), (Ok(FEE), 0, 1, false));
     let (answer, pending, asked, left) = at_rest(&bytes, &root, true);
     assert_eq!((answer, asked, left), (Ok(FEE), 1, false));
-    assert_eq!(pending, 3, "the BUMP and the two transactions");
+    assert_eq!(
+        pending, 6,
+        "the BUMP and the two transactions, for the structure and then for the scripts"
+    );
 }
 
 /// The parent's output is locked to a key and the subject offers no
@@ -338,7 +343,10 @@ fn an_unsigned_spend_is_refused_at_rest() {
     assert_eq!(answer, inline_answer, "the inline refusal, word for word");
     let (resumed, pending, asked, left) = at_rest(&bytes, &root, true);
     assert_eq!(resumed, answer, "the same refusal across requests");
-    assert_eq!(pending, 2, "the BUMP and the parent, then the spend");
+    assert_eq!(
+        pending, 5,
+        "the structure's three elements, then the output; the BUMP and the parent again, then the spend"
+    );
     assert_eq!((asked, left), (0, false));
 }
 
@@ -351,7 +359,7 @@ fn a_payment_standing_on_the_proven_transaction_is_accepted_inline_and_at_rest()
     let (bytes, root, _) = ancestry(false);
     assert_eq!(inline(&bytes, &root), (Ok(FEE), 3));
     assert_eq!(at_rest(&bytes, &root, false), (Ok(FEE), 0, 1, false));
-    assert_eq!(at_rest(&bytes, &root, true), (Ok(FEE), 3, 1, false));
+    assert_eq!(at_rest(&bytes, &root, true), (Ok(FEE), 6, 1, false));
 }
 
 /// The subject spends a transaction with no input, beside a proven stranger

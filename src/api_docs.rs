@@ -643,12 +643,13 @@ fn path_beef_upload_url() -> Value {
                         "application/json": {
                             "schema": {
                                 "type": "object",
-                                "required": ["status", "url", "key", "expiresAt"],
+                                "required": ["status", "url", "key", "expiresAt", "headers"],
                                 "properties": {
                                     "status": { "type": "string", "enum": ["success"] },
                                     "url": { "type": "string", "description": "Presigned R2 PUT URL (S3 v4 signed)." },
                                     "key": { "type": "string", "description": "R2 object key scoped to the caller's identity key." },
-                                    "expiresAt": { "type": "integer", "description": "Unix timestamp (seconds) at which the presigned URL expires." }
+                                    "expiresAt": { "type": "integer", "description": "Unix timestamp (seconds) at which the presigned URL expires." },
+                                    "headers": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Since 0.4.4: headers the PUT must carry exactly as given (`x-amz-meta-recipient-identity-key`, the object's reader, the relay's identity key). They are signed into the URL; a PUT without them does not verify." }
                                 }
                             }
                         }

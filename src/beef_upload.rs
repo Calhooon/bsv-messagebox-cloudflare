@@ -24,7 +24,7 @@
 
 use crate::beef_door::{BeefStore, Chunks, Stamp};
 use crate::handoff::PaymentStore;
-use crate::r2_presign::{presign_r2_put, PresignInput};
+use crate::r2_presign::{presign_r2_put_with, PresignInput};
 use serde_json::{json, Value};
 use worker::Env;
 
@@ -104,30 +104,41 @@ pub fn load_upload_config(env: &Env) -> Result<UploadConfig, String> {
 ///
 /// `now_secs` and `uuid` are passed in (instead of read from the runtime)
 /// so this function is unit-testable without a live Worker.
+/// The header a PUT to a presigned upload URL must carry (0.4.4, bsv-low
+/// #591 R403-M1): the object's reader, `handoff::READER_METADATA` as S3
+/// custom metadata, signed into the URL.
+pub const READER_HEADER: &str = "x-amz-meta-recipient-identity-key";
+
 pub fn build_upload_response(
     cfg: &UploadConfig,
     identity_key: &str,
     now_secs: u64,
     uuid: &str,
+    reader: &str,
 ) -> Value {
     let key = build_upload_key(identity_key, uuid);
     let amz_date = format_amz_date(now_secs);
 
-    let presigned = presign_r2_put(&PresignInput {
-        access_key_id: &cfg.access_key_id,
-        secret_access_key: &cfg.secret_access_key,
-        account_id: &cfg.account_id,
-        bucket: &cfg.bucket,
-        key: &key,
-        amz_date: &amz_date,
-        expires_secs: URL_EXPIRES_SECS,
-    });
+    let presigned = presign_r2_put_with(
+        &PresignInput {
+            access_key_id: &cfg.access_key_id,
+            secret_access_key: &cfg.secret_access_key,
+            account_id: &cfg.account_id,
+            bucket: &cfg.bucket,
+            key: &key,
+            amz_date: &amz_date,
+            expires_secs: URL_EXPIRES_SECS,
+        },
+        &[(READER_HEADER, reader)],
+    );
 
     json!({
         "status": "success",
         "url": presigned.url,
         "key": presigned.key,
         "expiresAt": now_secs + URL_EXPIRES_SECS as u64,
+        // The PUT carries these, exactly: they are signed into the URL.
+        "headers": { READER_HEADER: reader },
     })
 }
 
@@ -141,6 +152,11 @@ pub struct R2Store<'a> {
 impl<'a> R2Store<'a> {
     pub fn new(env: &'a Env) -> Self {
         Self { env }
+    }
+
+    /// Whether the deployment binds the bucket.
+    pub fn bound(&self) -> bool {
+        self.bucket().is_ok()
     }
 
     fn bucket(&self) -> Result<worker::Bucket, String> {
@@ -510,7 +526,44 @@ pub async fn handle_upload_url(identity_key: &str, env: &Env) -> (Value, u16) {
 
     let now = (js_sys::Date::now() / 1000.0) as u64;
     let uuid = uuid::Uuid::new_v4().simple().to_string();
-    let body = build_upload_response(&cfg, identity_key, now, &uuid);
+    // The key recorded before its URL is handed out (0.4.4, bsv-low #591
+    // L3): an upload no send names by the deadline is reclaimed. No record,
+    // no URL.
+    let key = build_upload_key(identity_key, &uuid);
+    let deadline = now + URL_EXPIRES_SECS as u64 + crate::handoff::MINTED_MARGIN_SECS;
+    let minted = match env.d1("DB") {
+        Ok(db) => {
+            use crate::handoff::RowRefs as _;
+            crate::storage::D1Rows { db: &db }
+                .mint(&key, deadline)
+                .await
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    if let Err(e) = minted {
+        return (
+            json!({
+                "status": "error",
+                "code": "ERR_UPLOAD_UNAVAILABLE",
+                "description": format!("The upload could not be recorded; ask again: {}", e),
+            }),
+            503,
+        );
+    }
+    let reader = match crate::payments::relay_identity(env) {
+        Ok(reader) => reader,
+        Err(e) => {
+            return (
+                json!({
+                    "status": "error",
+                    "code": "ERR_SERVER_MISCONFIGURED",
+                    "description": format!("The relay's identity: {}", e),
+                }),
+                500,
+            )
+        }
+    };
+    let body = build_upload_response(&cfg, identity_key, now, &uuid, &reader);
     (body, 200)
 }
 
@@ -568,7 +621,9 @@ mod tests {
     #[test]
     fn upload_response_shape() {
         // 1_776_772_800 is 2026-04-21T12:00:00Z.
-        let body = build_upload_response(&test_cfg(), "02abc", 1_776_772_800, "uuid123");
+        let body = build_upload_response(&test_cfg(), "02abc", 1_776_772_800, "uuid123", "02relay");
+        // The reader the PUT must name (R403-M1), signed into the URL.
+        assert_eq!(body["headers"][READER_HEADER], "02relay");
 
         assert_eq!(body["status"], "success");
         assert_eq!(body["key"], "02abc/uuid123.beef");
@@ -585,8 +640,8 @@ mod tests {
     #[test]
     fn upload_response_is_deterministic_given_inputs() {
         // Same (cfg, identity, now, uuid) → same signed URL.
-        let body_a = build_upload_response(&test_cfg(), "02abc", 1_776_772_800, "uuid");
-        let body_b = build_upload_response(&test_cfg(), "02abc", 1_776_772_800, "uuid");
+        let body_a = build_upload_response(&test_cfg(), "02abc", 1_776_772_800, "uuid", "02relay");
+        let body_b = build_upload_response(&test_cfg(), "02abc", 1_776_772_800, "uuid", "02relay");
         assert_eq!(body_a["url"], body_b["url"]);
         assert_eq!(body_a["key"], body_b["key"]);
     }

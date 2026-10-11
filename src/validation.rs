@@ -23,12 +23,227 @@ pub struct ValidatedSendMessage {
     pub payment: Option<Value>, // Raw payment object if present
 }
 
+/// The largest `/sendMessage` body the relay reads (0.4.4, bsv-low #591
+/// NOTE-4): 12 MiB, in every shape of `payment.tx`. The isolate is 128 MiB;
+/// the body is held whole by the BRC-31 layer (it signs over it), and the
+/// relay holds at most two more of its size while it reads it (the text it
+/// parses, and the payment's hex beside it), so three bodies stay under 40
+/// MiB and the rest of the isolate is the Worker's and the reading's. An
+/// estimate on the host, not measured in wasm32. Through 0.4.3 the bound was
+/// the platform's 100 MB, and a byte array of about 15 MB exhausted the
+/// isolate in parsing alone. A larger payment goes by upload
+/// (`/beef/upload-url`), which has no bound.
+pub const SEND_BODY_BYTES: usize = 12 * 1024 * 1024;
+
+/// The `/sendMessage` body as a `Value`, read so that no `payment.tx` is
+/// ever a `Value` a byte (0.4.4, bsv-low #591 NOTE-4): the body is held to
+/// `SEND_BODY_BYTES` before a byte of it is parsed (413
+/// `ERR_BODY_TOO_LARGE`), and a `payment.tx` sent as a byte array is read
+/// from the text as bytes and handed on as hex, with `payment.txShape:
+/// "array"` beside it so its rows hand it back as it came. An array that is
+/// not bytes (a number above 255, anything not a number) is no payment and
+/// is read as `false`, which the payment door refuses as such. A
+/// `txShape` the sender wrote is the relay's field and is dropped.
+pub fn read_send_body(raw: &[u8]) -> ValResult<Value> {
+    if raw.len() > SEND_BODY_BYTES {
+        return Err(err(
+            413,
+            "ERR_BODY_TOO_LARGE",
+            &format!(
+                "The send is {} bytes and the relay reads at most {} in one request. Upload the payment's BEEF (/beef/upload-url) and send its key (payment.beefR2Key): an upload has no bound.",
+                raw.len(),
+                SEND_BODY_BYTES
+            ),
+        ));
+    }
+    let invalid = || err(400, "ERR_INVALID_JSON", "Invalid JSON body");
+    let spans = tx_spans(raw);
+    let mut sent_as_array = false;
+    let mut body: Value = if spans.iter().any(|(from, _)| raw[*from] == b'[') {
+        let mut text = Vec::with_capacity(raw.len());
+        let mut at = 0;
+        for (from, to) in &spans {
+            text.extend_from_slice(&raw[at..*from]);
+            sent_as_array = raw[*from] == b'[';
+            if sent_as_array {
+                match array_bytes(&raw[*from..*to]) {
+                    Some(bytes) => {
+                        text.push(b'"');
+                        text.extend_from_slice(hex::encode(bytes).as_bytes());
+                        text.push(b'"');
+                    }
+                    None => text.extend_from_slice(b"false"),
+                }
+            } else {
+                text.extend_from_slice(&raw[*from..*to]);
+            }
+            at = *to;
+        }
+        text.extend_from_slice(&raw[at..]);
+        serde_json::from_slice(&text).map_err(|_| invalid())?
+    } else {
+        serde_json::from_slice(raw).map_err(|_| invalid())?
+    };
+    if let Some(payment) = body.get_mut("payment").and_then(Value::as_object_mut) {
+        payment.remove("txShape");
+        if sent_as_array && payment.get("tx").is_some_and(Value::is_string) {
+            payment.insert("txShape".to_string(), json!("array"));
+        }
+    }
+    Ok(body)
+}
+
+/// The byte ranges of every value of a `tx` member of a `payment` member of
+/// the top-level object, in the order they come; nothing when the text is
+/// not an object as far as the scan reads (the parse then says why).
+fn tx_spans(raw: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let _ = members(raw, skip_ws(raw, 0), &mut |raw, key, from, to| {
+        if key == "payment" && raw.get(from) == Some(&b'{') {
+            let _ = members(raw, from, &mut |_, key, from, to| {
+                if key == "tx" {
+                    spans.push((from, to));
+                }
+            });
+        }
+        let _ = to;
+    });
+    spans
+}
+
+/// What `members` hands each member: the text, the key (decoded), and the
+/// value's range.
+type Member<'a> = dyn FnMut(&[u8], String, usize, usize) + 'a;
+
+/// Each member of the object at `at`: its key (decoded) and its value's
+/// range. `None` when the bytes are not an object.
+fn members(raw: &[u8], at: usize, each: &mut Member<'_>) -> Option<usize> {
+    if raw.get(at) != Some(&b'{') {
+        return None;
+    }
+    let mut at = skip_ws(raw, at + 1);
+    if raw.get(at) == Some(&b'}') {
+        return Some(at + 1);
+    }
+    loop {
+        let key_end = skip_string(raw, at)?;
+        let key: String = serde_json::from_slice(&raw[at..key_end]).ok()?;
+        at = skip_ws(raw, key_end);
+        if raw.get(at) != Some(&b':') {
+            return None;
+        }
+        let from = skip_ws(raw, at + 1);
+        let to = skip_value(raw, from)?;
+        each(raw, key, from, to);
+        at = skip_ws(raw, to);
+        match raw.get(at) {
+            Some(b',') => at = skip_ws(raw, at + 1),
+            Some(b'}') => return Some(at + 1),
+            _ => return None,
+        }
+    }
+}
+
+fn skip_ws(raw: &[u8], mut at: usize) -> usize {
+    while matches!(raw.get(at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        at += 1;
+    }
+    at
+}
+
+/// The end of the string at `at` (one past its closing quote).
+fn skip_string(raw: &[u8], at: usize) -> Option<usize> {
+    if raw.get(at) != Some(&b'"') {
+        return None;
+    }
+    let mut at = at + 1;
+    loop {
+        match raw.get(at)? {
+            b'\\' => at += 2,
+            b'"' => return Some(at + 1),
+            _ => at += 1,
+        }
+    }
+}
+
+/// The end of the value at `at`, nesting counted without recursion.
+fn skip_value(raw: &[u8], at: usize) -> Option<usize> {
+    match raw.get(at)? {
+        b'"' => skip_string(raw, at),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut at = at;
+            loop {
+                match raw.get(at)? {
+                    b'"' => {
+                        at = skip_string(raw, at)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(at + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                at += 1;
+            }
+        }
+        _ => {
+            // A scalar: to the next delimiter.
+            let from = at;
+            let mut at = at;
+            while !matches!(
+                raw.get(at),
+                None | Some(b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+            ) {
+                at += 1;
+            }
+            (at > from).then_some(at)
+        }
+    }
+}
+
+/// The bytes of a JSON array of integers 0 to 255, read from its text; `None`
+/// when it is anything else.
+fn array_bytes(text: &[u8]) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(text.len() / 3);
+    let mut at = skip_ws(text, 1);
+    if text.get(at) == Some(&b']') {
+        return (skip_ws(text, at + 1) == text.len()).then_some(bytes);
+    }
+    loop {
+        let from = at;
+        let mut n: u32 = 0;
+        while let Some(d @ b'0'..=b'9') = text.get(at) {
+            n = n * 10 + u32::from(d - b'0');
+            at += 1;
+            if at - from > 3 {
+                return None;
+            }
+        }
+        if at == from || (text[from] == b'0' && at - from > 1) || n > 255 {
+            return None;
+        }
+        bytes.push(n as u8);
+        at = skip_ws(text, at);
+        match text.get(at)? {
+            b',' => at = skip_ws(text, at + 1),
+            b']' => return (skip_ws(text, at + 1) == text.len()).then_some(bytes),
+            _ => return None,
+        }
+    }
+}
+
 /// Validate sendMessage request body. Exact validation order from Node.js.
 pub fn validate_send_message(raw: &[u8]) -> ValResult<ValidatedSendMessage> {
-    // Parse JSON — matches go-messagebox-server's explicit ERR_INVALID_JSON path
-    let body: Value = serde_json::from_slice(raw)
-        .map_err(|_| err(400, "ERR_INVALID_JSON", "Invalid JSON body"))?;
+    validate_send_value(read_send_body(raw)?)
+}
 
+/// `validate_send_message` on a body already read (`read_send_body`).
+pub fn validate_send_value(body: Value) -> ValResult<ValidatedSendMessage> {
     // 1. message object must exist
     let message = body.get("message").ok_or_else(|| {
         err(
@@ -274,6 +489,70 @@ pub fn is_valid_pubkey(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- NOTE-4 (0.4.4): the body read so that no tx is a Value a byte ----
+
+    const KEY66: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    fn a_send_paying(payment: &str) -> String {
+        format!(
+            r#"{{"message":{{"messageBox":"inbox","recipient":"{KEY66}","messageId":"m","body":"hi"}},"payment":{payment}}}"#
+        )
+    }
+
+    #[test]
+    fn an_array_tx_is_read_as_bytes_and_handed_on_as_hex_with_its_shape() {
+        let body =
+            read_send_body(a_send_paying(r#"{ "tx" : [ 0 , 1,255 ] ,"outputs":[]}"#).as_bytes())
+                .unwrap();
+        assert_eq!(body["payment"]["tx"], "0001ff");
+        assert_eq!(body["payment"]["txShape"], "array");
+        // An escaped key is the same key.
+        let body = read_send_body(
+            a_send_paying(r#"{"\u0074x":[7]}"#)
+                .replace("\"payment\"", "\"pay\\u006dent\"")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(body["payment"]["tx"], "07");
+        // The empty array is no bytes, as before.
+        let body = read_send_body(a_send_paying(r#"{"tx":[]}"#).as_bytes()).unwrap();
+        assert_eq!(body["payment"]["tx"], "");
+    }
+
+    #[test]
+    fn an_array_that_is_not_bytes_is_no_payment_and_a_sent_shape_is_dropped() {
+        for tx in [
+            "[256]", "[1.0]", "[-1]", "[01]", r#"["a"]"#, "[1,]", "[[1]]",
+        ] {
+            let body = read_send_body(a_send_paying(&format!(r#"{{"tx":{tx}}}"#)).as_bytes())
+                .unwrap_or_else(|e| panic!("{tx}: {e:?}"));
+            assert_eq!(body["payment"]["tx"], false, "{tx}");
+            assert!(body["payment"].get("txShape").is_none(), "{tx}");
+        }
+        // The sender's txShape is the relay's field.
+        let body =
+            read_send_body(a_send_paying(r#"{"tx":"00","txShape":"array"}"#).as_bytes()).unwrap();
+        assert!(body["payment"].get("txShape").is_none());
+        // A tx anywhere but the top-level payment is untouched.
+        let text = format!(
+            r#"{{"message":{{"messageBox":"inbox","recipient":"{KEY66}","messageId":"m","body":{{"payment":{{"tx":[1]}}}}}}}}"#
+        );
+        let body = read_send_body(text.as_bytes()).unwrap();
+        assert_eq!(body["message"]["body"]["payment"]["tx"], json!([1]));
+        // What is not JSON is still not JSON.
+        let (body, status) = read_send_body(b"{\"payment\":{\"tx\":[1,2").unwrap_err();
+        assert_eq!((status, &body["code"]), (400, &json!("ERR_INVALID_JSON")));
+    }
+
+    #[test]
+    fn a_body_past_the_bound_is_refused_before_it_is_read() {
+        let mut text = a_send_paying(r#"{"tx":"00"}"#);
+        text.push_str(&" ".repeat(SEND_BODY_BYTES));
+        let (body, status) = read_send_body(text.as_bytes()).unwrap_err();
+        assert_eq!((status, &body["code"]), (413, &json!("ERR_BODY_TOO_LARGE")));
+        assert!(body["description"].as_str().unwrap().contains("12582912"));
+    }
     use serde_json::json;
 
     const VALID_PUBKEY: &str = "028d37b941208cd6b8a4c28288eda5f2f16c2b3ab0fcb6d13c18b47fe37b971fc1";

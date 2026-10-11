@@ -60,18 +60,31 @@ pub struct PresignedUpload {
     pub key: String,
 }
 
-/// Presign a PUT URL for Cloudflare R2.
+/// Presign a PUT URL for Cloudflare R2 that signs `host` alone. Since 0.4.4
+/// the relay mints no upload without its reader (`presign_r2_put_with`); this
+/// stays for the tests of the signing itself.
+#[cfg(test)]
 pub fn presign_r2_put(input: &PresignInput) -> PresignedUpload {
-    presign_r2("PUT", input)
+    presign_r2("PUT", input, &[])
+}
+
+/// Presign a PUT URL whose request must carry `headers` (lowercase names)
+/// with exactly these values: each is a signed header (SigV4: in the
+/// canonical headers and in `X-Amz-SignedHeaders`), so a PUT without one, or
+/// with another value, does not verify. The relay names an upload's reader
+/// so (0.4.4, bsv-low #591 R403-M1): `x-amz-meta-*` is how S3 carries an
+/// object's custom metadata, and R2 keeps it as the object's.
+pub fn presign_r2_put_with(input: &PresignInput, headers: &[(&str, &str)]) -> PresignedUpload {
+    presign_r2("PUT", input, headers)
 }
 
 /// Presign a GET URL for Cloudflare R2: the holder reads the object straight
 /// from the bucket, a stream of any size with no Worker in its path.
 pub fn presign_r2_get(input: &PresignInput) -> PresignedUpload {
-    presign_r2("GET", input)
+    presign_r2("GET", input, &[])
 }
 
-fn presign_r2(method: &str, input: &PresignInput) -> PresignedUpload {
+fn presign_r2(method: &str, input: &PresignInput, headers: &[(&str, &str)]) -> PresignedUpload {
     let host = format!("{}.r2.cloudflarestorage.com", input.account_id);
     let canonical_key = normalize_key(input.key);
     let canonical_path = format!("/{}/{}", input.bucket, encode_key_path(&canonical_key));
@@ -85,12 +98,27 @@ fn presign_r2(method: &str, input: &PresignInput) -> PresignedUpload {
     let credential = format!("{}/{}", input.access_key_id, credential_scope);
     let expires = input.expires_secs.to_string();
 
+    // The signed headers: `host`, and any the request must carry, sorted by
+    // name.
+    let mut signed: Vec<(String, String)> = vec![("host".to_string(), host.clone())];
+    signed.extend(
+        headers
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string())),
+    );
+    signed.sort();
+    let signed_headers = signed
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+
     let mut query_pairs: Vec<(&str, String)> = vec![
         ("X-Amz-Algorithm", ALGORITHM.to_string()),
         ("X-Amz-Credential", credential),
         ("X-Amz-Date", input.amz_date.to_string()),
         ("X-Amz-Expires", expires),
-        ("X-Amz-SignedHeaders", "host".to_string()),
+        ("X-Amz-SignedHeaders", signed_headers.clone()),
     ];
     query_pairs.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -100,9 +128,11 @@ fn presign_r2(method: &str, input: &PresignInput) -> PresignedUpload {
         .collect::<Vec<_>>()
         .join("&");
 
-    // Canonical headers — just `host` since we only signed that header.
-    let canonical_headers = format!("host:{}\n", host);
-    let signed_headers = "host";
+    // Canonical headers: each signed header, `name:value`, one a line.
+    let canonical_headers: String = signed
+        .iter()
+        .map(|(name, value)| format!("{}:{}\n", name, value))
+        .collect();
     let payload_hash = "UNSIGNED-PAYLOAD";
 
     let canonical_request = format!(
@@ -306,6 +336,41 @@ mod tests {
         assert_eq!(unsigned(&put.url), unsigned(&get.url));
         assert_ne!(put.url, get.url, "the method is signed");
         assert_eq!(get.url, presign_r2_get(&input).url);
+    }
+
+    /// R403-M1 (0.4.4): the reader is a signed header of the PUT. The
+    /// header's name is in `X-Amz-SignedHeaders` beside `host`, and the
+    /// signature is over its value: another value, or none, is another
+    /// signature, which R2 does not take for this URL.
+    #[test]
+    fn a_put_that_names_its_reader_signs_the_header() {
+        let input = PresignInput {
+            access_key_id: "k",
+            secret_access_key: "s",
+            account_id: "acct",
+            bucket: "b",
+            key: "02abc/u.beef",
+            amz_date: "20260421T120000Z",
+            expires_secs: 600,
+        };
+        let reader = [("x-amz-meta-recipient-identity-key", "02relay")];
+        let named = presign_r2_put_with(&input, &reader);
+        assert!(
+            named
+                .url
+                .contains("X-Amz-SignedHeaders=host%3Bx-amz-meta-recipient-identity-key"),
+            "{}",
+            named.url
+        );
+        let other = presign_r2_put_with(&input, &[("x-amz-meta-recipient-identity-key", "02else")]);
+        let plain = presign_r2_put(&input);
+        let signature = |url: &str| url[url.rfind("X-Amz-Signature=").unwrap()..].to_string();
+        assert_ne!(signature(&named.url), signature(&other.url));
+        assert_ne!(signature(&named.url), signature(&plain.url));
+        assert!(
+            plain.url.contains("X-Amz-SignedHeaders=host&"),
+            "unchanged without one"
+        );
     }
 
     #[test]

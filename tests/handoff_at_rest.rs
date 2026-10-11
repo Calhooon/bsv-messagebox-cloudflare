@@ -26,7 +26,8 @@ mod support;
 
 use base64::Engine as _;
 use rust_message_box::beef_door::{
-    BeefStore, Chunks, Slice, Slices, Stamp, ROOT_LOOKUPS_PER_PASS, VERIFY_SLICE_MILLIS,
+    BeefStore, Chunks, Slice, Slices, Stamp, ROOT_LOOKUPS_PER_PASS, SCRIPT_INPUTS_PER_PASS,
+    SCRIPT_WEIGHT_PER_PASS, VERIFY_SLICE_MILLIS,
 };
 use rust_message_box::handoff::{
     ack_delete_sql, ack_update_sql, drain_fees, forget_unnamed, hand_off, reclaim_released,
@@ -34,7 +35,18 @@ use rust_message_box::handoff::{
     Reclaimed, RowRefs, Seams, FORGET_RELEASED_SQL, INSERT_MESSAGE_SQL, LIST_MESSAGES_SQL,
     READER_METADATA, RELEASED_KEYS_SQL, ROW_NAMES_KEY_SQL,
 };
-use rust_message_box::payments::{judge_delivery_at_rest, judge_delivery_output, Judged};
+use rust_message_box::handoff::{health_figure, FeeFigure, FEE_ATTEMPTS_CEILING};
+use rust_message_box::handoff::{
+    orphaned, reask_announces, Announcer, Hint, OwedAnnounce, Reasked, Subject, CLAIMED_SQL,
+    CLAIM_SQL, UNCLAIM_SQL,
+};
+use rust_message_box::handoff::{
+    reclaim_minted, Expired, FORGET_MINTED_SQL, MINTED_DUE_SQL, MINTED_MARGIN_SECS, MINT_SQL,
+    POSTPONE_MINTED_SQL,
+};
+use rust_message_box::payments::{
+    judge_delivery_at_rest, judge_delivery_inline_at_rest, judge_delivery_output, Judged,
+};
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -58,6 +70,10 @@ struct Blobs {
     states: RefCell<HashMap<String, Vec<u8>>>,
     largest_chunk: Cell<usize>,
     spools: Cell<usize>,
+    /// How many times an object's bytes were opened.
+    opened: Cell<usize>,
+    /// The deployment names no bucket (`bucket_name`).
+    nameless: Cell<bool>,
     /// Each object's custom metadata, as R2 keeps it beside the bytes.
     metadata: RefCell<HashMap<String, HashMap<String, String>>>,
 }
@@ -92,6 +108,7 @@ impl BeefStore for Blobs {
         if *etag != stamp.etag {
             return Err("the object changed".to_string());
         }
+        self.opened.set(self.opened.get() + 1);
         Ok(Box::new(Bytes {
             bytes: bytes[from as usize..].to_vec(),
             at: 0,
@@ -151,7 +168,7 @@ impl PaymentStore for Blobs {
     }
 
     fn bucket_name(&self) -> Option<String> {
-        Some(BUCKET.to_string())
+        (!self.nameless.get()).then(|| BUCKET.to_string())
     }
 }
 
@@ -179,10 +196,41 @@ impl FeeWallet for Wallet {
     }
 }
 
-/// The ledger of deferred fees.
+/// The broadcaster: answers as scripted (a 200 unless told otherwise), and
+/// counts what it is asked.
+struct Broadcaster {
+    answer: RefCell<Result<Hint, String>>,
+    asked: Cell<usize>,
+}
+
+impl Default for Broadcaster {
+    fn default() -> Self {
+        Self {
+            answer: RefCell::new(Ok(Hint {
+                accepted: true,
+                word: "ARC 200: SEEN_ON_NETWORK".to_string(),
+            })),
+            asked: Cell::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Announcer for Broadcaster {
+    async fn announce(&self, _subject: Subject<'_>) -> Result<Hint, String> {
+        self.asked.set(self.asked.get() + 1);
+        self.answer.borrow().clone()
+    }
+}
+
+/// The ledger of deferred fees, and of the announcements owed; each fee's
+/// end, and the relay's word on wallet-infra's reach into the bucket.
 #[derive(Default)]
 struct Ledger {
     rows: RefCell<Vec<DeferredFee>>,
+    announces: RefCell<Vec<(OwedAnnounce, String)>>,
+    ended: RefCell<Vec<(String, String)>>,
+    word: RefCell<Option<(String, u64)>>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -211,7 +259,64 @@ impl FeeLedger for Ledger {
         Ok(())
     }
     async fn owes(&self, key: &str) -> Result<bool, String> {
-        Ok(self.rows.borrow().iter().any(|row| row.key == key))
+        Ok(self.rows.borrow().iter().any(|row| row.key == key)
+            || self.announces.borrow().iter().any(|(a, _)| a.key == key))
+    }
+    async fn end(&self, key: &str, why: &str) -> Result<(), String> {
+        self.rows.borrow_mut().retain(|row| row.key != key);
+        self.ended
+            .borrow_mut()
+            .push((key.to_string(), why.to_string()));
+        Ok(())
+    }
+    async fn figure(&self) -> Result<FeeFigure, String> {
+        Ok(FeeFigure {
+            owed: self.rows.borrow().len() as u64,
+            ended: self.ended.borrow().len() as u64,
+            last_ended: self.ended.borrow().last().map(|(_, why)| why.clone()),
+        })
+    }
+    async fn wallet_word(&self) -> Result<Option<(String, u64)>, String> {
+        Ok(self.word.borrow().clone())
+    }
+    async fn set_wallet_word(&self, word: Option<&str>, now: u64) -> Result<(), String> {
+        *self.word.borrow_mut() = word.map(|w| (w.to_string(), now));
+        Ok(())
+    }
+    async fn owe_announce(&self, owed: &OwedAnnounce, word: &str) -> Result<(), String> {
+        let mut announces = self.announces.borrow_mut();
+        if !announces.iter().any(|(a, _)| a.key == owed.key) {
+            announces.push((owed.clone(), word.to_string()));
+        }
+        Ok(())
+    }
+    async fn due_announces(&self, now: u64, limit: u32) -> Result<Vec<OwedAnnounce>, String> {
+        let announces = self.announces.borrow();
+        let due = announces.iter().filter(|(a, _)| a.next_at <= now);
+        Ok(due.take(limit as usize).map(|(a, _)| a.clone()).collect())
+    }
+    async fn announced(&self, key: &str) -> Result<(), String> {
+        self.announces.borrow_mut().retain(|(a, _)| a.key != key);
+        Ok(())
+    }
+    async fn put_off_announce(
+        &self,
+        key: &str,
+        attempts: u32,
+        next_at: u64,
+        word: &str,
+    ) -> Result<(), String> {
+        for (a, last) in self
+            .announces
+            .borrow_mut()
+            .iter_mut()
+            .filter(|(a, _)| a.key == key)
+        {
+            a.attempts = attempts;
+            a.next_at = next_at;
+            *last = word.to_string();
+        }
+        Ok(())
     }
 }
 
@@ -240,6 +345,48 @@ impl RowRefs for Rows<'_> {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
+    async fn claim(&self, key: &str) -> Result<(), String> {
+        self.0
+            .execute(CLAIM_SQL, [key])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    async fn unclaim(&self, key: &str) -> Result<(), String> {
+        self.0
+            .execute(UNCLAIM_SQL, [key])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    async fn claimed(&self, key: &str) -> Result<bool, String> {
+        let mut statement = self.0.prepare(CLAIMED_SQL).unwrap();
+        statement.exists([key]).map_err(|e| e.to_string())
+    }
+    async fn mint(&self, key: &str, deadline: u64) -> Result<(), String> {
+        self.0
+            .execute(MINT_SQL, rusqlite::params![key, deadline])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    async fn minted_due(&self, now: u64, limit: u32) -> Result<Vec<String>, String> {
+        let mut statement = self.0.prepare(MINTED_DUE_SQL).unwrap();
+        let keys = statement
+            .query_map(rusqlite::params![now, limit], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>();
+        keys.map_err(|e| e.to_string())
+    }
+    async fn postpone_minted(&self, key: &str, deadline: u64) -> Result<(), String> {
+        self.0
+            .execute(POSTPONE_MINTED_SQL, rusqlite::params![deadline, key])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    async fn forget_minted(&self, key: &str) -> Result<(), String> {
+        self.0
+            .execute(FORGET_MINTED_SQL, [key])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// The relay's D1 schema on a real SQLite that refuses what D1 refuses of a
@@ -253,6 +400,14 @@ fn d1() -> rusqlite::Connection {
     db.execute_batch(include_str!("../migrations/0003_fee_internalize.sql"))
         .unwrap();
     db.execute_batch(include_str!("../migrations/0004_beef_key.sql"))
+        .unwrap();
+    db.execute_batch(include_str!("../migrations/0005_announce_owed.sql"))
+        .unwrap();
+    db.execute_batch(include_str!("../migrations/0007_beef_reclaiming.sql"))
+        .unwrap();
+    db.execute_batch(include_str!("../migrations/0008_beef_minted.sql"))
+        .unwrap();
+    db.execute_batch(include_str!("../migrations/0009_fee_terminal.sql"))
         .unwrap();
     db.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, D1_ROW_BYTES);
     db.execute(
@@ -312,6 +467,7 @@ struct World {
     blobs: Blobs,
     wallet: Wallet,
     ledger: Ledger,
+    arc: Broadcaster,
     db: rusqlite::Connection,
 }
 
@@ -321,6 +477,7 @@ impl World {
             blobs: Blobs::default(),
             wallet: Wallet::default(),
             ledger: Ledger::default(),
+            arc: Broadcaster::default(),
             db: d1(),
         }
     }
@@ -330,9 +487,15 @@ impl World {
         self.db
             .prepare(LIST_MESSAGES_SQL)
             .unwrap()
-            .query_map(rusqlite::params![RECIPIENT, 1, 100], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map(
+                rusqlite::params![
+                    RECIPIENT,
+                    1,
+                    100,
+                    rust_message_box::handoff::LIST_INLINE_BYTES
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
@@ -351,6 +514,7 @@ macro_rules! seams {
             wallet: &$world.wallet,
             ledger: &$world.ledger,
             rows: &$rows,
+            announcer: Some(&$world.arc),
         }
     };
 }
@@ -364,6 +528,7 @@ struct Sent {
     blobs: Blobs,
     wallet: Wallet,
     ledger: Ledger,
+    arc: Broadcaster,
     db: rusqlite::Connection,
     spool_key: String,
 }
@@ -409,6 +574,7 @@ fn send_with(chain: Chain, uploaded: Option<&'static str>, rows: bool, wallet_do
             blobs: world.blobs,
             wallet: world.wallet,
             ledger: world.ledger,
+            arc: world.arc,
             db: world.db,
             spool_key,
         }
@@ -464,6 +630,8 @@ async fn send_into(
                     millis: VERIFY_SLICE_MILLIS,
                 },
                 lookups: ROOT_LOOKUPS_PER_PASS,
+                inputs: SCRIPT_INPUTS_PER_PASS,
+                weight: SCRIPT_WEIGHT_PER_PASS,
             };
             judge_delivery_at_rest(
                 &world.blobs,
@@ -498,8 +666,10 @@ async fn send_into(
         &Paid {
             payment: &payment,
             r2_key: uploaded,
+            spooled: None,
             spool_key,
             server_output: Some(&server_output),
+            stamp: judged.stamp.as_ref(),
             txid: Some(&judged.txid),
             rows,
             reader: &wallet(SERVER_KEY).identity_key().to_hex(),
@@ -596,9 +766,13 @@ fn the_same_payment_uploaded_to_r2_stays_where_it_arrived() {
     let sent = send(chain, Some(key), true);
 
     the_row_names_the_bytes_at_rest(&sent, &beef, key);
-    // No second copy: the one object, written again in place once so that
-    // it names its reader (NL-7b), and nothing at another key.
-    assert_eq!(sent.blobs.spools.get(), 1, "the object, once, in place");
+    // No second copy and no write (0.4.4, R403-M1): the one object as the
+    // sender put it, and nothing at another key.
+    assert_eq!(
+        sent.blobs.spools.get(),
+        0,
+        "the object is never written again"
+    );
     assert_eq!(sent.blobs.objects.borrow().len(), 1);
     assert_eq!(sent.handed.fee, Fee::Deferred);
     assert!(sent.wallet.arguments.borrow().is_empty());
@@ -606,7 +780,8 @@ fn the_same_payment_uploaded_to_r2_stays_where_it_arrived() {
     assert_eq!(owed.len(), 1);
     assert_eq!(
         (owed[0].key.as_str(), owed[0].etag.as_str()),
-        (key, "spooled-1")
+        (key, "uploaded"),
+        "the etag the door verified"
     );
 }
 
@@ -702,17 +877,54 @@ fn the_inline_paths_spool_names_the_relay_on_the_object() {
     the_object_names_the_relay(&sent, &sent.spool_key, &beef);
 }
 
+/// An upload of an earlier release names no reader: since 0.4.4 its row
+/// carries the reader beside the key, and the object is as the sender put
+/// it (R403-M1). An upload minted by 0.4.4 names the relay itself (the
+/// presigned PUT signs the header), and its row says nothing more.
 #[test]
-fn the_r2_paths_own_object_names_the_relay_too() {
+fn an_upload_that_names_no_reader_has_it_in_its_row_and_is_never_written_again() {
     let chain = chain_atomic_beef(100_000, 0);
-    let beef = chain.beef.clone();
     let sent = send(chain, Some(UPLOADED), true);
     assert_eq!(sent.handed.fee, Fee::Deferred);
-    the_object_names_the_relay(&sent, UPLOADED, &beef);
+    assert_eq!(sent.blobs.spools.get(), 0);
+    assert_eq!(sent.blobs.objects.borrow()[UPLOADED].1, "uploaded");
+    assert!(sent.blobs.metadata.borrow().get(UPLOADED).is_none());
+    let row: Value = serde_json::from_str(&sent.listed[0].1).unwrap();
+    assert_eq!(row["payment"]["beefReader"], json!(relay()));
+    assert_eq!(row["payment"]["beefEtag"], "uploaded");
+    assert_eq!(sent.ledger.rows.borrow()[0].etag, "uploaded");
+
+    on_a_small_stack(|| {
+        let world = World::new();
+        let chain = chain_atomic_beef(10, 0);
+        world
+            .blobs
+            .objects
+            .borrow_mut()
+            .insert(UPLOADED.to_string(), (chain.beef.clone(), "minted".into()));
+        world.blobs.metadata.borrow_mut().insert(
+            UPLOADED.to_string(),
+            HashMap::from([(READER_METADATA.to_string(), relay())]),
+        );
+        let (_, handed) = block_on(send_into(
+            &world,
+            &chain,
+            Some(UPLOADED),
+            true,
+            "m-1",
+            SPOOL,
+        ));
+        assert!(
+            handed.payment.get("beefReader").is_none(),
+            "the object names it"
+        );
+        assert_eq!(handed.payment["beefEtag"], "minted");
+        assert_eq!(world.blobs.spools.get(), 0);
+    });
 }
 
 #[test]
-fn a_re_sent_key_whose_object_names_the_relay_is_not_written_again() {
+fn a_re_sent_key_is_never_written_again_and_both_rows_keep_its_etag() {
     on_a_small_stack(|| {
         let world = World::new();
         let chain = chain_atomic_beef(10, 0);
@@ -726,12 +938,10 @@ fn a_re_sent_key_whose_object_names_the_relay_is_not_written_again() {
                 SPOOL,
             ));
         }
-        assert_eq!(world.blobs.spools.get(), 1, "written in place once");
-        // Both rows name the object as it is: the earlier row's etag holds.
-        let etag = world.blobs.objects.borrow()[UPLOADED].1.clone();
+        assert_eq!(world.blobs.spools.get(), 0, "never written");
         for (_, body) in world.listed() {
             let row: Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(row["payment"]["beefEtag"], json!(etag));
+            assert_eq!(row["payment"]["beefEtag"], json!("uploaded"));
         }
     });
 }
@@ -804,7 +1014,7 @@ fn a_fee_over_8_mib_is_sent_as_a_reference_too_and_is_never_held() {
 
     let drained = drain(&sent, NOW);
 
-    assert_eq!(drained.held, 0, "a held fee no longer exists");
+    assert_eq!(drained.ended, 0, "a fee is never ended for its size");
     let arguments = sent.wallet.arguments.borrow();
     assert_eq!(arguments.len(), 1, "wallet-infra, once");
     the_argument_is_the_reference(&arguments[0], UPLOADED, size, &etag);
@@ -880,9 +1090,18 @@ fn a_fee_is_never_recorded_from_another_upload_at_its_key() {
         .borrow_mut()
         .insert(UPLOADED.to_string(), (vec![0u8; 64], "another".into()));
 
-    assert_eq!(drain(&sent, NOW).held, 1);
+    assert_eq!(drain(&sent, NOW).ended, 1);
     assert!(sent.wallet.arguments.borrow().is_empty());
-    assert_eq!(sent.ledger.rows.borrow().len(), 1);
+    // 0.4.4 (R403-L1): the fee ends with its reason; 0.4.3 kept it owed and
+    // retried it daily without end.
+    assert!(sent.ledger.rows.borrow().is_empty());
+    assert_eq!(
+        sent.ledger.ended.borrow()[0],
+        (
+            UPLOADED.to_string(),
+            "another upload is at the key".to_string()
+        )
+    );
 }
 
 // ---- ownership: an object is deleted only when no stored row names it (NL-4c) ----
@@ -1096,4 +1315,779 @@ fn a_retired_message_lets_go_of_its_object_and_a_fee_still_owed_keeps_it() {
         assert_eq!(drained.settled, 1);
         assert!(!world.has(SPOOL), "reclaimed with the fee");
     });
+}
+
+// ---- the inline payment spooled before its scripts (0.4.4, bsv-low #591 H1) ----
+//
+// Through 0.4.3 an inline payment was read in one pass in the request, the
+// scripts with it, and had no slice: a wide body was one reading of all its
+// CPU (LOW's 18.5 to 186 s). Since 0.4.4 its structure and its paying output
+// are read in the request, and a payment that pays is spooled before its
+// scripts run and read from rest in slices, as an upload is.
+
+/// What the spooled door came to: the verdict, the key, the pending phases.
+type Spooled = (Result<Judged, (Value, u16)>, Option<String>, Vec<String>);
+
+/// The door on an inline `tx` through the spool, every request sent again
+/// until a verdict, with a clock that moves one millisecond a reading of it
+/// and a slice of one: each request reads about one element. The verdict,
+/// the key, and the pending answers' phases.
+fn inline_in_slices(world: &World, tx: &Value, chain: &Chain, fee: u64) -> Spooled {
+    let headers = headers(chain);
+    let ticks = Cell::new(0u64);
+    let clock = || {
+        ticks.set(ticks.get() + 1);
+        ticks.get()
+    };
+    let slices = Slices {
+        time: Slice {
+            clock: &clock,
+            millis: 1,
+        },
+        lookups: usize::MAX,
+        inputs: u64::MAX,
+        weight: u64::MAX,
+    };
+    let mut phases = Vec::new();
+    loop {
+        let (judged, key) = block_on(judge_delivery_inline_at_rest(
+            &world.blobs,
+            tx,
+            &delivery_output(),
+            fee,
+            &sender(),
+            &wallet(SERVER_KEY),
+            Some(&headers),
+            &slices,
+            &relay(),
+            None,
+        ));
+        match &judged {
+            Err((body, 503)) if body["code"] == "ERR_PAYMENT_PENDING" => {
+                phases.push(body["phase"].as_str().unwrap().to_string());
+                assert!(phases.len() < 10_000, "the requests end");
+            }
+            _ => return (judged, key, phases),
+        }
+    }
+}
+
+#[test]
+fn an_inline_payment_that_pauses_at_the_slice_resumes_to_the_same_verdict() {
+    on_a_small_stack(|| {
+        let chain = chain_atomic_beef(300, 0);
+        let tx = json!({ "beef": base64::engine::general_purpose::STANDARD.encode(&chain.beef) });
+        // The verdict of one request, in the request (no bucket).
+        let headers = headers(&chain);
+        let whole = block_on(judge_delivery_output(
+            &tx,
+            &delivery_output(),
+            FEE,
+            &sender(),
+            &wallet(SERVER_KEY),
+            Some(&headers),
+        ))
+        .expect("the payment is valid");
+
+        let world = World::new();
+        let (judged, key, phases) = inline_in_slices(&world, &tx, &chain, FEE);
+        let key = key.expect("the bytes were put at rest");
+        let count = |phase: &str| phases.iter().filter(|p| *p == phase).count();
+        eprintln!(
+            "handoff_at_rest: inline, {} bytes: {} pending ({} structure, {} scripts, {} roots)",
+            chain.beef.len(),
+            phases.len(),
+            count("structure"),
+            count("scripts"),
+            count("roots")
+        );
+        let judged = judged.expect("the verdict");
+        assert_eq!(
+            (judged.satoshis, &judged.txid),
+            (whole.satoshis, &whole.txid),
+            "the verdict of one request"
+        );
+        assert_eq!(
+            judged.stamp.as_ref().map(|s| s.size),
+            Some(chain.beef.len() as u64)
+        );
+        assert!(phases.len() > 100, "{} requests paused", phases.len());
+        assert!(
+            phases.iter().any(|p| p == "scripts"),
+            "it paused in the scripts"
+        );
+        assert!(key.starts_with(&format!("{}/inline-", sender())), "{key}");
+        assert_eq!(
+            world.blobs.spools.get(),
+            1,
+            "spooled once, found again by every retry"
+        );
+        assert_eq!(world.blobs.objects.borrow()[&key].0, chain.beef);
+        assert!(
+            world.blobs.states.borrow().is_empty(),
+            "a verdict leaves no state"
+        );
+        assert_eq!(
+            world.blobs.metadata.borrow()[&key].get(READER_METADATA),
+            Some(&relay()),
+            "the spool names the relay as its reader"
+        );
+
+        // The hand-off keeps the bytes where the door read them.
+        let stored_rows = Rows(&world.db);
+        let payment = json!({
+            "tx": tx,
+            "outputs": [delivery_output(), recipient_output()],
+        });
+        let handed = block_on(hand_off(
+            &seams!(world, stored_rows),
+            &Paid {
+                payment: &payment,
+                r2_key: None,
+                spooled: Some(&key),
+                spool_key: "unused",
+                server_output: Some(&delivery_output()),
+                stamp: None,
+                txid: Some(&whole.txid),
+                rows: true,
+                reader: &relay(),
+                now: NOW,
+            },
+        ))
+        .expect("handed off");
+        assert_eq!(handed.kept.as_deref(), Some(key.as_str()));
+        assert_eq!(handed.payment["beefR2Key"], key);
+        assert_eq!(handed.payment["txShape"], "base64");
+        assert_eq!(world.blobs.spools.get(), 1, "never spooled again");
+    });
+}
+
+#[test]
+fn an_inline_payment_that_pays_too_little_is_refused_in_the_request_and_nothing_is_put_at_rest() {
+    on_a_small_stack(|| {
+        let chain = chain_atomic_beef(300, 0);
+        let tx = json!(hex::encode(&chain.beef));
+        let world = World::new();
+        let (judged, key, phases) = inline_in_slices(&world, &tx, &chain, FEE + 1);
+        let (body, status) = judged.expect_err("an underpayment");
+        assert_eq!(
+            (status, &body["code"]),
+            (400, &json!("ERR_INSUFFICIENT_PAYMENT"))
+        );
+        assert_eq!((key, phases.len()), (None, 0));
+        assert_eq!(world.blobs.spools.get(), 0, "nothing spooled");
+    });
+}
+
+// ---- the subject announced before delivery (0.4.4, bsv-low #591 M2) ----
+//
+// Through 0.4.3 nothing in the relay posted the subject: a deferred fee was
+// credit until a drain, and the drain hands wallet-infra a reference, which
+// broadcasts nothing either. Since 0.4.4 the relay announces the subject in
+// the send; the broadcaster's word is a hint (bsv-stack-lean
+// `docs/charters/tracker.md` section 2): the message is delivered on the
+// door's verdict whatever it says, the row keeps the word, and a word that is
+// not an acceptance is owed and asked again by the drain.
+
+fn refusing(world: &World) {
+    *world.arc.answer.borrow_mut() = Ok(Hint {
+        accepted: false,
+        word: "ARC 503: Service Unavailable".to_string(),
+    });
+}
+
+#[test]
+fn a_paid_send_whose_broadcaster_answers_a_5xx_is_delivered_its_row_carries_the_hint_and_the_drain_re_asks(
+) {
+    on_a_small_stack(|| {
+        let world = World::new();
+        refusing(&world);
+        let chain = chain_atomic_beef(3, 0);
+        let spool_key = format!("{}/5b0c1f6e2d3a4c7b8e9f0a1b2c3d4e5f.beef", sender());
+        let (_, handed) = block_on(send_into(&world, &chain, None, true, "m-1", &spool_key));
+
+        // Delivered, the fee recorded, the word on the row.
+        let listed = world.listed();
+        assert_eq!(listed.len(), 1, "the message is delivered");
+        let row: Value = serde_json::from_str(&listed[0].1).unwrap();
+        assert_eq!(
+            row["payment"]["announced"],
+            json!({ "accepted": false, "word": "ARC 503: Service Unavailable" })
+        );
+        assert_eq!(
+            row["payment"]["verdict"], "verified",
+            "the door's verdict stands"
+        );
+        assert_eq!(handed.fee, Fee::Internalized);
+        assert_eq!(world.arc.asked.get(), 1, "announced in the send");
+
+        // Owed, naming the bytes at rest.
+        let owed = world.ledger.announces.borrow().clone();
+        assert_eq!(owed.len(), 1);
+        assert_eq!(owed[0].0.key, spool_key);
+        assert_eq!(owed[0].0.txid, subject_txid(&chain.beef));
+        assert_eq!(owed[0].1, "ARC 503: Service Unavailable");
+
+        // The drain asks again: still refused, put off with one more attempt.
+        let stored_rows = Rows(&world.db);
+        let seams = seams!(world, stored_rows);
+        assert_eq!(
+            block_on(reask_announces(&seams, NOW, 10)).unwrap(),
+            Reasked {
+                accepted: 0,
+                put_off: 1
+            }
+        );
+        assert_eq!(world.arc.asked.get(), 2);
+        assert_eq!(world.ledger.announces.borrow()[0].0.attempts, 1);
+        assert!(world.ledger.announces.borrow()[0].0.next_at > NOW);
+
+        // Taken on a later pass: the debt is gone; the row still names the
+        // bytes, so they stay.
+        *world.arc.answer.borrow_mut() = Ok(Hint {
+            accepted: true,
+            word: "ARC 200: SEEN_ON_NETWORK".to_string(),
+        });
+        assert_eq!(
+            block_on(reask_announces(&seams, NOW + 86_400, 10)).unwrap(),
+            Reasked {
+                accepted: 1,
+                put_off: 0
+            }
+        );
+        assert!(world.ledger.announces.borrow().is_empty());
+        assert!(world.has(&spool_key), "the row names the bytes");
+    });
+}
+
+#[test]
+fn an_announcement_owed_keeps_its_bytes_when_no_row_names_them_and_lets_go_once_taken() {
+    on_a_small_stack(|| {
+        let world = World::new();
+        *world.arc.answer.borrow_mut() = Err("connection reset".to_string());
+        let chain = chain_atomic_beef(3, 0);
+        let spool_key = format!("{}/5b0c1f6e2d3a4c7b8e9f0a1b2c3d4e5f.beef", sender());
+        let (_, handed) = block_on(send_into(&world, &chain, None, false, "m-1", &spool_key));
+        assert_eq!(
+            handed.kept.as_deref(),
+            Some(spool_key.as_str()),
+            "kept for the re-ask"
+        );
+        assert_eq!(
+            handed.hint,
+            Some(Hint {
+                accepted: false,
+                word: "no answer: connection reset".to_string()
+            })
+        );
+        assert!(world.has(&spool_key));
+        *world.arc.answer.borrow_mut() = Ok(Hint {
+            accepted: true,
+            word: "ARC 200: SEEN_ON_NETWORK".to_string(),
+        });
+        let stored_rows = Rows(&world.db);
+        let reasked = block_on(reask_announces(&seams!(world, stored_rows), NOW, 10)).unwrap();
+        assert_eq!(reasked.accepted, 1);
+        assert!(!world.has(&spool_key), "nothing names the bytes now");
+    });
+}
+
+// ---- NOTE-3: a box of rows near D1's bound lists within the budget ----
+
+/// bsv-low #591 NOTE-3: the list statement read up to 100 rows whole, and a
+/// row is up to D1's 2,000,000 bytes, so one listing could hand the isolate
+/// about 200 MB before any budget ran. Since 0.4.4 the statement itself
+/// stops at the response's budget (`handoff::LIST_INLINE_BYTES`, about 16
+/// MB of stored text): twenty rows of 1,900,000 bytes list eight at a time,
+/// and the rest are in the next listing.
+#[test]
+fn a_box_of_two_megabyte_rows_lists_within_the_budget() {
+    let world = World::new();
+    let message = "a".repeat(1_900_000 - 20);
+    for i in 0..20 {
+        let body = json!({ "message": message }).to_string();
+        world
+            .db
+            .execute(
+                INSERT_MESSAGE_SQL,
+                rusqlite::params![
+                    format!("m-{i}"),
+                    1,
+                    sender(),
+                    RECIPIENT,
+                    body,
+                    None::<String>
+                ],
+            )
+            .expect("a row under D1's bound");
+    }
+    let listed = world.listed();
+    let text: usize = listed.iter().map(|(_, body)| body.len()).sum();
+    eprintln!(
+        "handoff_at_rest: a box of 20 rows of 1.9 MB lists {} rows, {} bytes",
+        listed.len(),
+        text
+    );
+    assert!(
+        text as u64 <= rust_message_box::handoff::LIST_INLINE_BYTES,
+        "{text} bytes in one listing"
+    );
+    assert_eq!(listed.len(), 8);
+    assert_eq!(listed[0].0, "m-0", "the order is the box's");
+}
+
+// ---- L1: the door's stamp carried into the hand-off ----
+
+/// bsv-low #591 L1: through 0.4.3 the hand-off stamped the key afresh, so
+/// bytes put at the key between the verdict and the hand-off were the ones
+/// named, recorded `verified` and handed on. Since 0.4.4 the verdict carries
+/// the stamp of what the door read, and the hand-off records nothing of other
+/// bytes: 503 `ERR_PAYMENT_CHANGED`, nothing in a row, no fee owed, no
+/// announcement; the same request again reads the object as it is.
+#[test]
+fn bytes_replaced_between_the_verdict_and_the_hand_off_are_never_recorded_verified() {
+    on_a_small_stack(|| {
+        let world = World::new();
+        let chain = chain_atomic_beef(3, 0);
+        let key = format!("{}/upload.beef", sender());
+        world
+            .blobs
+            .objects
+            .borrow_mut()
+            .insert(key.clone(), (chain.beef.clone(), "uploaded".into()));
+        let headers = headers(&chain);
+        let clock = || 0u64;
+        let slices = Slices {
+            time: Slice {
+                clock: &clock,
+                millis: VERIFY_SLICE_MILLIS,
+            },
+            lookups: ROOT_LOOKUPS_PER_PASS,
+            inputs: SCRIPT_INPUTS_PER_PASS,
+            weight: SCRIPT_WEIGHT_PER_PASS,
+        };
+        let judged = block_on(judge_delivery_at_rest(
+            &world.blobs,
+            &key,
+            &delivery_output(),
+            FEE,
+            &sender(),
+            &wallet(SERVER_KEY),
+            Some(&headers),
+            &slices,
+        ))
+        .expect("the door verifies the upload");
+        assert_eq!(
+            judged.stamp.as_ref().map(|s| s.etag.as_str()),
+            Some("uploaded")
+        );
+
+        // Another upload at the key, after the verdict.
+        let other = chain_atomic_beef(4, 0).beef;
+        world
+            .blobs
+            .objects
+            .borrow_mut()
+            .insert(key.clone(), (other, "replaced".into()));
+
+        let payment = json!({
+            "beefR2Key": key,
+            "outputs": [delivery_output(), recipient_output()],
+        });
+        let stored_rows = Rows(&world.db);
+        let (body, status) = block_on(hand_off(
+            &seams!(world, stored_rows),
+            &Paid {
+                payment: &payment,
+                r2_key: Some(&key),
+                spooled: None,
+                spool_key: "unused",
+                server_output: Some(&delivery_output()),
+                stamp: judged.stamp.as_ref(),
+                txid: Some(&judged.txid),
+                rows: true,
+                reader: &relay(),
+                now: NOW,
+            },
+        ))
+        .expect_err("nothing of other bytes is recorded");
+        eprintln!("handoff_at_rest: {status} {}", body["description"]);
+        assert_eq!(
+            (status, &body["code"]),
+            (503, &json!("ERR_PAYMENT_CHANGED"))
+        );
+        assert!(world.ledger.rows.borrow().is_empty(), "no fee owed");
+        assert!(
+            world.ledger.announces.borrow().is_empty(),
+            "nothing announced"
+        );
+        assert_eq!(world.arc.asked.get(), 0);
+        assert!(
+            world.wallet.arguments.borrow().is_empty(),
+            "wallet-infra asked nothing"
+        );
+    });
+}
+
+// ---- L2: the claim, on the relay's own statements ----
+
+/// bsv-low #591 L2, the send's side: a send writes its row and then reads
+/// the claim. While a reclaim holds the key the claim is seen; were the bytes
+/// gone, the row is an orphan and the route logs it with its key. A claim
+/// let go of, or one older than five minutes, is no claim.
+#[test]
+fn a_send_that_names_a_key_a_reclaim_holds_sees_the_claim_and_an_orphan_is_named() {
+    on_a_small_stack(|| {
+        let world = World::new();
+        let rows = Rows(&world.db);
+        let seams = seams!(world, rows);
+        let key = format!("{}/upload.beef", sender());
+        world
+            .blobs
+            .objects
+            .borrow_mut()
+            .insert(key.clone(), (vec![1, 2, 3], "uploaded".into()));
+        // No claim: nothing to say, the bytes or not.
+        assert!(!block_on(orphaned(&seams, &key)));
+        block_on(RowRefs::claim(&rows, &key)).unwrap();
+        assert!(block_on(RowRefs::claimed(&rows, &key)).unwrap());
+        assert!(
+            !block_on(orphaned(&seams, &key)),
+            "the bytes are still there"
+        );
+        world.blobs.objects.borrow_mut().remove(&key);
+        assert!(
+            block_on(orphaned(&seams, &key)),
+            "an orphan, named by its key"
+        );
+        block_on(RowRefs::unclaim(&rows, &key)).unwrap();
+        assert!(!block_on(orphaned(&seams, &key)), "the claim is let go of");
+        // A stale claim is no claim.
+        world
+            .db
+            .execute(
+                "INSERT INTO beef_reclaiming (key, claimed_at) VALUES (?, 1)",
+                [&key],
+            )
+            .unwrap();
+        assert!(!block_on(RowRefs::claimed(&rows, &key)).unwrap());
+    });
+}
+
+/// And the reclaim's side on the same statements: a reclaim that finds the
+/// key named by a row deletes nothing and lets go of its claim.
+#[test]
+fn a_reclaim_lets_go_of_its_claim_whatever_it_finds() {
+    on_a_small_stack(|| {
+        let world = World::new();
+        let chain = chain_atomic_beef(3, 0);
+        let spool_key = format!("{}/5b0c1f6e2d3a4c7b8e9f0a1b2c3d4e5f.beef", sender());
+        block_on(send_into(&world, &chain, None, true, "m-1", &spool_key));
+        let rows = Rows(&world.db);
+        let seams = seams!(world, rows);
+        assert_eq!(
+            block_on(rust_message_box::handoff::reclaim(&seams, &spool_key)),
+            Ok(false)
+        );
+        assert!(world.has(&spool_key));
+        assert!(!block_on(RowRefs::claimed(&rows, &spool_key)).unwrap());
+    });
+}
+
+// ---- L3: an object nobody names is reclaimed by its deadline ----
+
+/// bsv-low #591 L3: through 0.4.3 an object no send named (an upload URL
+/// minted and used, then never sent) was never looked at again. Since 0.4.4
+/// every key the relay mints is recorded with a deadline (the URL's life and
+/// a day); the scheduled event deletes, past it, what nothing names, leaves
+/// what a row names to the row, and waits on a reading still pending.
+#[test]
+fn a_minted_upload_never_sent_is_reclaimed_after_its_deadline_and_a_sent_one_is_not() {
+    on_a_small_stack(|| {
+        let world = World::new();
+        let rows = Rows(&world.db);
+        let deadline = NOW + 600 + MINTED_MARGIN_SECS;
+        let never = format!("{}/never-sent.beef", sender());
+        let sent = format!("{}/sent.beef", sender());
+        let pending = format!("{}/pending.beef", sender());
+        for key in [&never, &sent, &pending] {
+            block_on(RowRefs::mint(&rows, key, deadline)).unwrap();
+            world
+                .blobs
+                .objects
+                .borrow_mut()
+                .insert(key.clone(), (vec![7; 10], "uploaded".into()));
+        }
+        // The sent one: a send names it (its own bytes, a valid payment).
+        world.blobs.objects.borrow_mut().remove(&sent);
+        let chain = chain_atomic_beef(3, 0);
+        let sent_key: &'static str = Box::leak(sent.clone().into_boxed_str());
+        block_on(send_into(
+            &world,
+            &chain,
+            Some(sent_key),
+            true,
+            "m-1",
+            "unused",
+        ));
+        // The pending one: a reading saved its place beside it.
+        world
+            .blobs
+            .states
+            .borrow_mut()
+            .insert(format!("door-state/{pending}"), vec![1]);
+
+        let seams = seams!(world, rows);
+        assert_eq!(
+            block_on(reclaim_minted(&seams, deadline - 1, 25)).unwrap(),
+            Expired::default(),
+            "nothing before the deadline"
+        );
+        assert_eq!(
+            block_on(reclaim_minted(&seams, deadline, 25)).unwrap(),
+            Expired {
+                deleted: 1,
+                named: 1,
+                put_off: 1
+            }
+        );
+        assert!(!world.has(&never), "the never-sent upload is reclaimed");
+        assert!(world.has(&sent), "the sent one is the row's");
+        assert!(world.has(&pending), "the pending one waits");
+        // The two looked at are forgotten; the pending one comes back in an
+        // hour.
+        assert_eq!(
+            block_on(RowRefs::minted_due(&rows, deadline + 3_599, 25)).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            block_on(RowRefs::minted_due(&rows, deadline + 3_600, 25)).unwrap(),
+            vec![pending.clone()]
+        );
+    });
+}
+
+// ---- R403-M1: no in-place copy ----
+
+/// bsv-low #591 R403-M1: through 0.4.3 an upload kept by a send that did not
+/// name the relay as its reader was opened whole and written again to the
+/// same key, in the request, after the verdict: the etag changed, so a row
+/// or a fee naming the old etag named "another upload". Since 0.4.4 the
+/// reader is named at mint time (a signed header of the presigned PUT), and
+/// an object at rest with no reader has it recorded beside its key in the
+/// row. A 135 MB upload is named without a byte read and keeps its etag.
+#[test]
+fn a_135_mb_object_at_rest_is_named_without_a_byte_read_and_its_etag_never_changes() {
+    on_a_small_stack(|| {
+        let world = World::new();
+        let key = UPLOADED;
+        world
+            .blobs
+            .objects
+            .borrow_mut()
+            .insert(key.to_string(), (vec![0; 135_000_000], "uploaded".into()));
+        let door = Stamp {
+            size: 135_000_000,
+            etag: "uploaded".into(),
+        };
+        let payment = json!({
+            "beefR2Key": key,
+            "outputs": [delivery_output(), recipient_output()],
+        });
+        let stored_rows = Rows(&world.db);
+        let handed = block_on(hand_off(
+            &seams!(world, stored_rows),
+            &Paid {
+                payment: &payment,
+                r2_key: Some(key),
+                spooled: None,
+                spool_key: "unused",
+                server_output: Some(&delivery_output()),
+                stamp: Some(&door),
+                txid: Some(&"ab".repeat(32)),
+                rows: true,
+                reader: &relay(),
+                now: NOW,
+            },
+        ))
+        .expect("handed off");
+        assert_eq!(world.blobs.opened.get(), 0, "not a byte read");
+        assert_eq!(world.blobs.spools.get(), 0, "nothing written");
+        assert_eq!(
+            world.blobs.objects.borrow()[key].1,
+            "uploaded",
+            "the etag holds"
+        );
+        assert_eq!(handed.payment["beefEtag"], "uploaded");
+        assert_eq!(
+            handed.payment["beefReader"],
+            relay(),
+            "the reader beside the key"
+        );
+        assert_eq!(handed.fee, Fee::Deferred);
+        assert_eq!(world.ledger.rows.borrow()[0].etag, "uploaded");
+    });
+}
+
+// ---- R403-L1: a held fee ends; a transient one has a ceiling ----
+
+fn fee_at(key: &str, etag: &str, args: &str, attempts: u32) -> DeferredFee {
+    DeferredFee {
+        key: key.to_string(),
+        etag: etag.to_string(),
+        txid: "aa".into(),
+        args: args.to_string(),
+        named: false,
+        attempts,
+        next_at: 0,
+    }
+}
+
+/// bsv-low #591 R403-L1: through 0.4.3 a fee held for a reason that cannot
+/// clear by itself took the transient failure's backoff, daily, without end.
+/// Since 0.4.4 each such reason ends the fee at once with its reason on its
+/// row and on the health figure, and the drain never takes it up again; a
+/// transient refusal keeps the backoff up to `FEE_ATTEMPTS_CEILING`, then
+/// ends; a refusal that says wallet-infra cannot read the relay's bucket is
+/// recorded as the relay's word, the health figure names it, and no fee is
+/// deferred into that wallet-infra while it stands.
+#[test]
+fn each_held_reason_ends_the_fee_and_the_health_figure_says_so() {
+    on_a_small_stack(|| {
+        let world = World::new();
+        let rows = Rows(&world.db);
+        let args = fee_args_text();
+        let put = |key: &str, etag: &str| {
+            world
+                .blobs
+                .objects
+                .borrow_mut()
+                .insert(key.to_string(), (vec![1; 10], etag.to_string()));
+        };
+        put("02a/other.beef", "now");
+        put("02a/bad-args.beef", "e1");
+        put("02a/transient.beef", "e1");
+        put("02a/last-try.beef", "e1");
+        for fee in [
+            fee_at("02a/other.beef", "then", &args, 0),
+            fee_at("02a/gone.beef", "e1", &args, 0),
+            fee_at("02a/bad-args.beef", "e1", "not json", 0),
+            fee_at("02a/transient.beef", "e1", &args, 0),
+            fee_at("02a/last-try.beef", "e1", &args, FEE_ATTEMPTS_CEILING - 1),
+        ] {
+            world.ledger.rows.borrow_mut().push(fee);
+        }
+        world.wallet.down.set(true);
+        let seams = seams!(world, rows);
+        let drained = block_on(drain_fees(&seams, NOW, 10)).unwrap();
+        assert_eq!((drained.settled, drained.put_off, drained.ended), (0, 1, 4));
+        let ended: HashMap<String, String> = world.ledger.ended.borrow().iter().cloned().collect();
+        assert_eq!(ended["02a/other.beef"], "another upload is at the key");
+        assert_eq!(ended["02a/gone.beef"], "the object is not in the store");
+        assert_eq!(
+            ended["02a/bad-args.beef"],
+            "the row's arguments do not parse"
+        );
+        assert_eq!(
+            ended["02a/last-try.beef"],
+            format!(
+                "not recorded after {} attempts: wallet-infra answered 502",
+                FEE_ATTEMPTS_CEILING
+            )
+        );
+        // The transient one is still owed, one attempt on.
+        let owed = world.ledger.rows.borrow().clone();
+        assert_eq!(owed.len(), 1);
+        assert_eq!(
+            (owed[0].key.as_str(), owed[0].attempts),
+            ("02a/transient.beef", 1)
+        );
+        // The drain takes up no ended fee again.
+        let again = block_on(drain_fees(&seams, NOW + 86_400 * 2, 10)).unwrap();
+        assert_eq!(again.ended, 0);
+
+        // No bucket named: ends at once too.
+        world.blobs.nameless.set(true);
+        world.wallet.down.set(false);
+        let nameless = block_on(drain_fees(&seams, NOW + 86_400 * 4, 10)).unwrap();
+        assert_eq!(nameless.ended, 1);
+        assert_eq!(
+            world.ledger.ended.borrow().last().unwrap().1,
+            "the deployment names no bucket for the reference"
+        );
+        world.blobs.nameless.set(false);
+
+        let figure = block_on(health_figure(&world.ledger)).unwrap();
+        eprintln!("handoff_at_rest: health {figure}");
+        assert_eq!(figure["owed"], 0);
+        assert_eq!(figure["ended"], 5);
+        assert_eq!(
+            figure["lastEnded"],
+            "the deployment names no bucket for the reference"
+        );
+        assert!(figure.get("walletInfra").is_none());
+    });
+}
+
+#[test]
+fn a_wallet_infra_that_cannot_read_the_bucket_is_named_and_no_fee_is_deferred_into_it() {
+    on_a_small_stack(|| {
+        // A deferred fee meets wallet-infra's own word for a bucket it does
+        // not bind (rust-wallet-infra@50a282f src/beef_at_rest.rs:430-434).
+        let sent = send_with(chain_atomic_beef(10, 0), Some(UPLOADED), true, true);
+        assert_eq!(sent.handed.fee, Fee::Deferred);
+        let word = "Internalize failed: beefAtRest: bucket bsv-messagebox-beefs is not bound here (this Worker reads wallet-beefs)";
+        struct Refusing(String);
+        #[async_trait::async_trait(?Send)]
+        impl FeeWallet for Refusing {
+            async fn internalize(&self, _args: &Value) -> Result<bool, String> {
+                Err(self.0.clone())
+            }
+        }
+        let wallet = Refusing(word.to_string());
+        let rows = Rows(&sent.db);
+        let seams = Seams {
+            blobs: &sent.blobs,
+            wallet: &wallet,
+            ledger: &sent.ledger,
+            rows: &rows,
+            announcer: None,
+        };
+        let drained = block_on(drain_fees(&seams, NOW, 10)).unwrap();
+        assert_eq!(drained.ended, 1, "ended at once, not retried");
+        let figure = block_on(health_figure(&sent.ledger)).unwrap();
+        eprintln!("handoff_at_rest: health {figure}");
+        assert_eq!(figure["walletInfra"]["readsTheBucket"], false);
+        assert_eq!(
+            figure["walletInfra"]["word"],
+            format!("wallet-infra cannot read the relay's bucket: {}", word)
+        );
+
+        // The next payment too large to record in the request: not deferred
+        // into that wallet-infra; it ends with its reason, the message goes.
+        let world = World::new();
+        *world.ledger.word.borrow_mut() = sent.ledger.word.borrow().clone();
+        let chain = chain_atomic_beef(20_000, 0);
+        assert!(chain.beef.len() as u64 > 1024 * 1024);
+        let spool = format!("{}/5b0c1f6e2d3a4c7b8e9f0a1b2c3d4e5f.beef", sender());
+        let (_, handed) = block_on(send_into(&world, &chain, None, true, "m-1", &spool));
+        assert_eq!(handed.fee, Fee::Ended);
+        assert!(
+            world.ledger.rows.borrow().is_empty(),
+            "nothing owed into it"
+        );
+        assert!(world.ledger.ended.borrow()[0]
+            .1
+            .starts_with("not deferred: wallet-infra cannot read the relay's bucket"));
+        assert_eq!(world.listed().len(), 1, "the message is delivered");
+        // A day on, a fee is deferred into it again, to be tried once more.
+        let later = World::new();
+        *later.ledger.word.borrow_mut() = Some(("w".into(), NOW - 86_400));
+        let (_, handed) = block_on(send_into(&later, &chain, None, true, "m-1", &spool));
+        assert_eq!(handed.fee, Fee::Deferred);
+    });
+}
+
+fn fee_args_text() -> String {
+    rust_message_box::handoff::fee_args(&delivery_output(), &json!({})).to_string()
 }

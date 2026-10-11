@@ -21,6 +21,22 @@ WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
 #     account (error 1042 behind a 404, the callee never invoked).
 #   - HEADER_SERVICE_URL, a var. A Worker elsewhere may use the URL.
 # The binding wins when both exist.
+# The broadcaster a verified payment's subject is announced to (0.4.4,
+# bsv-low #591 M2): ARC_URL names an ARC (its /v1/tx takes the BEEF as bytes);
+# the ARC_API_KEY secret, when set, is its bearer token. Not set here: a
+# deployment names its own. With none named the relay announces nothing and
+# each paid row says so ("announced": no broadcaster is configured). The
+# broadcaster's word is a hint: delivery never waits on it, and a word that is
+# not an acceptance is asked again by the scheduled drain (announce_owed,
+# migration 0005).
+# ARC_URL = "https://arc.example"
+# The per-identity send budget on /sendMessage (0.4.4, bsv-low #591 M3): at
+# most SEND_BUDGET_SENDS sends (default 100, one listing of a box) and
+# SEND_BUDGET_BYTES bytes of message and payment text no delivery fee judges
+# (default 4194304, one payment body of 0.3.28) per identity in each window of
+# SEND_BUDGET_WINDOW_SECS (default 60); the next is 429 ERR_SEND_BUDGET naming
+# the window (send_budget table, migration 0006).
+# SEND_BUDGET_SENDS = "100"
 # Flip to "true" after setting the FIREBASE_SERVICE_ACCOUNT_JSON secret.
 ENABLE_FIREBASE = "false"
 
@@ -38,12 +54,30 @@ ENABLE_FIREBASE = "false"
 #   R2_ACCESS_KEY_ID              — R2 S3 access key for presigning BEEF uploads.
 #   R2_SECRET_ACCESS_KEY          — R2 S3 secret.
 #   R2_ACCOUNT_ID                 — Cloudflare account ID (for the R2 S3 host).
+#   ARC_API_KEY: optional, the bearer token for ARC_URL (0.4.4).
 # And the plain [vars] R2_BUCKET_NAME should match the [[r2_buckets]].bucket_name.
 
 R2_BUCKET_NAME = "bsv-messagebox-beefs"
 
 [build]
 command = "worker-build --release"
+
+# The CPU one request may spend (0.4.4, bsv-low #591 H1), stated rather than
+# left to the default. The payment door reads in slices of 15 s
+# (VERIFY_SLICE_MILLIS, wall time, which a Worker's clock moves only at I/O)
+# and, on bsv-rs 0.4.4, pauses between two inputs of a transaction at 20,000
+# inputs (SCRIPT_INPUTS_PER_PASS) or at a weight of 10,000,000,000, each input
+# weighing its transaction's bytes (SCRIPT_WEIGHT_PER_PASS). So a request
+# spends its slice plus the widest stretch with no I/O in it, no longer a
+# whole element. Measured on the lane's host, release
+# (tests/hostile_wide_door.rs, the_widest_element_at_0_4_4): the widest is
+# the weight's slice of a subject signed over the original digest, 4,969 ms
+# native, about 6,000 ms in wasm32 under V8 (1.2 times native, measured with
+# bsv-rs 0.4.4's verify_stream in node 26, not in workerd). 15 s + 6 s is
+# 21 s; 30 s is that with half again. The 64,000-input subject that set 60 s
+# before the re-pin is 46 ms native at 0.4.4.
+[limits]
+cpu_ms = 30000
 
 [[d1_databases]]
 binding = "DB"
@@ -63,6 +97,14 @@ id = "<your-kv-namespace-id>"
 # must not expire an object a row or a deferred fee still names; the relay
 # deletes an object itself, and only when no stored row (messages.beef_key,
 # migration 0004) and no deferred fee names its key.
+#
+# Since 0.4.4 (bsv-low #591 L3) every key the relay mints (an upload URL, an
+# inline spool) is recorded with a deadline (the URL's life and a day,
+# beef_minted, migration 0008), and the scheduled event deletes, past it, an
+# object nothing names. The door's own states live under the prefix
+# door-state/: give the bucket an object lifecycle rule that expires that
+# prefix (seven days is ample: a reading pending longer has been abandoned),
+# and no other rule.
 [[r2_buckets]]
 binding = "BEEF_BLOBS"
 bucket_name = "bsv-messagebox-beefs"

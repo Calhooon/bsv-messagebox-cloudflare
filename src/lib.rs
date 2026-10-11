@@ -23,9 +23,10 @@ mod d1;
 mod error;
 mod retention;
 mod routes;
+mod send_budget;
 mod storage;
 mod types;
-mod validation;
+pub mod validation;
 
 /// The payment door's reader (0.4.0): a payment's BEEF as a stream, one
 /// element in hand, a cursor at rest for an object in R2. Public beside
@@ -99,6 +100,11 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     init_panic_hook();
     payments::run_fee_drain(&env).await;
     retention::run_scheduled_sweep(&env).await;
+    // The send budget's closed windows (0.4.4, bsv-low #591 M3).
+    if let Ok(db) = env.d1("DB") {
+        let now = worker::Date::now().as_millis() / 1000;
+        send_budget::forget_closed(&db, &send_budget::Budget::from_env(&env), now).await;
+    }
 }
 
 /// A CORS-bearing 500, built infallibly so the error path can never itself
@@ -427,10 +433,19 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // /health behind auth matches TS and Go ("all routes require auth").
         // Authed GET /health returns 200; unauthed requests are rejected by
         // the BRC-31 middleware with UNAUTHORIZED + "Mutual-authentication failed!".
-        (Method::Get, "/") | (Method::Get, "/health") => (
-            json!({ "status": "success", "message": "rust-message-box is running" }),
-            200,
-        ),
+        (Method::Get, "/") | (Method::Get, "/health") => {
+            let mut health =
+                json!({ "status": "success", "message": "rust-message-box is running" });
+            // The delivery fees, owed and ended, and the relay's word on
+            // wallet-infra's reach into its bucket (0.4.4, bsv-low #591
+            // R403-L1). A store that cannot answer leaves the figure out.
+            if let Ok(db) = env.d1("DB") {
+                if let Ok(fees) = handoff::health_figure(&storage::D1Ledger { db: &db }).await {
+                    health["fees"] = fees;
+                }
+            }
+            (health, 200)
+        }
         (Method::Post, "/sendMessage") => {
             // 0.3.19 (bsv-low loop-10 promotion, the tower review's HIGH-1,
             // 2026-09-09): the FIRST-PARTY boxes (`low_events`, `broadcast-*`)
@@ -439,17 +454,17 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
             // forged tower `case` event into a seat's box. Refused here, at
             // the door, before validation (the reference server has no such
             // box; a divergence by design, recorded in bsv-low's register).
-            if let Some((status, code, description)) =
-                serde_json::from_slice::<serde_json::Value>(&request_body)
-                    .ok()
-                    .and_then(|v| first_party_box_refusal(&v))
-            {
-                (
-                    json!({ "status": "error", "code": code, "description": description }),
-                    status,
-                )
-            } else {
-                handle_send_message(&request_body, identity_key, &env, &store).await
+            // The body is read once (0.4.4, bsv-low #591 NOTE-4: held to its
+            // bound before it is parsed, a byte-array payment read as bytes).
+            match validation::read_send_body(&request_body) {
+                Err(refused) => refused,
+                Ok(body) => match first_party_box_refusal(&body) {
+                    Some((status, code, description)) => (
+                        json!({ "status": "error", "code": code, "description": description }),
+                        status,
+                    ),
+                    None => handle_send_body(body, identity_key, &env, &store).await,
+                },
             }
         }
         (Method::Post, "/listMessages") => {
@@ -824,7 +839,20 @@ async fn handle_send_message(
     env: &Env,
     store: &storage::Storage<'_>,
 ) -> (serde_json::Value, u16) {
-    let validated = match validation::validate_send_message(raw_body) {
+    match validation::read_send_body(raw_body) {
+        Err(refused) => refused,
+        Ok(body) => handle_send_body(body, sender_key, env, store).await,
+    }
+}
+
+/// `handle_send_message` on a body already read (`validation::read_send_body`).
+async fn handle_send_body(
+    body: serde_json::Value,
+    sender_key: &str,
+    env: &Env,
+    store: &storage::Storage<'_>,
+) -> (serde_json::Value, u16) {
+    let validated = match validation::validate_send_value(body) {
         Ok(v) => v,
         Err((body, status)) => {
             return routes::send_message::outcome_to_http(

@@ -318,6 +318,8 @@ fn measure(links: usize, ballast: Ballast) -> (u64, usize, f64) {
             millis: u64::MAX,
         },
         lookups: usize::MAX,
+        inputs: u64::MAX,
+        weight: u64::MAX,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
