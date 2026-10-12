@@ -6,7 +6,7 @@ Hibernation is working on prod. A `MessageHub` Durable Object that idles for 60 
 
 ## Test artifact
 
-`tests/e2e_ws_hibernation_prod.py` — Python script, ~190 lines. Connects via signed BRC-31 to `wss://<your-relay>.workers.dev/ws`, primes DO state with a `joinRoom`, idles 60 s with no frames in either direction, then sends another `joinRoom` and asserts the response arrives.
+`tests/e2e_ws_hibernation_prod.py` — Python script, ~190 lines. Connects via signed BRC-31 to `wss://your-worker.your-account.workers.dev/ws`, primes DO state with a `joinRoom`, idles 60 s with no frames in either direction, then sends another `joinRoom` and asserts the response arrives.
 
 ```
 [PASS] 0. Built signed BRC-31 headers for prod /ws
@@ -38,13 +38,13 @@ Hibernation is working on prod. A `MessageHub` Durable Object that idles for 60 
 
 Use the CF GraphQL Analytics API. Required:
 
-- Account ID: `<redacted-cloudflare-id>`
+- Account ID: `<your-account-id>`
 - MessageHub namespace ID: `b29f0bb08bd24c9895a7da2439918f3d` (resolved via `GET /accounts/.../workers/durable_objects/namespaces`)
 - A CF API token with `Analytics: Read` permission (the deploy token in `secrets.md` works)
 
 ```bash
 TOKEN=$(grep "^export CLOUDFLARE_API_TOKEN=" secrets.md | head -1 | sed 's/^export CLOUDFLARE_API_TOKEN=//' | tr -d '"')
-ACCOUNT_ID=<redacted-cloudflare-id>
+ACCOUNT_ID=<your-account-id>
 NS=b29f0bb08bd24c9895a7da2439918f3d
 END=$(python3 -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))")
 START=$(python3 -c "from datetime import datetime, timezone, timedelta; print((datetime.now(timezone.utc) - timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ'))")

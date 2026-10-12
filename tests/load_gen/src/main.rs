@@ -2,8 +2,8 @@
 //!
 //! Usage:
 //!   cargo run --release --bin load_gen -- \
-//!     --server https://<your-relay>.workers.dev \
-//!     --ws wss://<your-relay>.workers.dev/ws \
+//!     --server https://your-worker.your-account.workers.dev \
+//!     --ws wss://your-worker.your-account.workers.dev/ws \
 //!     --n 10 --soak-secs 30 \
 //!     --concurrent-handshakes 64 --concurrent-upgrades 256
 //!
@@ -31,9 +31,9 @@ struct Cli {
 enum Cmd {
     /// Run a single load wave: handshake → upgrade → soak → drop.
     Run {
-        #[arg(long, default_value = "https://<your-relay>.workers.dev")]
+        #[arg(long, default_value = "https://your-worker.your-account.workers.dev")]
         server: String,
-        #[arg(long, default_value = "wss://<your-relay>.workers.dev/ws")]
+        #[arg(long, default_value = "wss://your-worker.your-account.workers.dev/ws")]
         ws: String,
         #[arg(long, default_value_t = 10)]
         n: usize,
@@ -52,7 +52,7 @@ enum Cmd {
     Analytics {
         #[arg(long, env = "CLOUDFLARE_API_TOKEN")]
         token: String,
-        #[arg(long, default_value = "<redacted-cloudflare-id>")]
+        #[arg(long, default_value = "<your-account-id>")]
         account_id: String,
         #[arg(long, default_value = "b29f0bb08bd24c9895a7da2439918f3d")]
         namespace_id: String,

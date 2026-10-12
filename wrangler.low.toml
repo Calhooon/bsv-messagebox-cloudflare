@@ -1,0 +1,190 @@
+# LOW's dedicated message-box instance ("god tier = own deployment, not own
+# implementation"). Bone-stock rust-message-box, deployed under its own worker
+# name with LOW-tuned configuration. The shared `rust-message-box` worker is
+# NOT touched by this config; deploy with:
+#
+#   wrangler deploy -c wrangler.low.toml
+#
+# Differences from wrangler.toml are configuration ONLY: worker name, own
+# D1/KV/R2 resources, and SESSION_TTL_SECONDS=28800 (a multi-hand table
+# sitting outlives the default 1h auth session).
+
+name = "low-relay"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-04-07"
+account_id = "<your-account-id>"
+
+[vars]
+BSV_NETWORK = "mainnet"
+WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
+ENABLE_FIREBASE = "false"
+# 8h: a LOW table session must outlive the 1h default (PLAN-M4-RELAY.md, #25).
+SESSION_TTL_SECONDS = "28800"
+R2_BUCKET_NAME = "low-relay-beefs"
+# Transcript retention-until-terminal (bsv-low #252 stage E, owner decision
+# 2026-08-06): LOW's per-hand game boxes (`low_game_<gameId>`) RETAIN their
+# envelope chain — acknowledge marks delivered instead of deleting, so a
+# reloaded client with no local state re-fetches the chain via /listTranscript
+# and resumes mid-hand without the peer being alive. Rows delete at game end
+# (/purgeTranscript) with the TTL backstop below. Lobby boxes (`low_lobby_*`)
+# stay plain mailboxes. Requires migration 0002 applied to low-relay-prod
+# BEFORE deploying this build (`npm run migrate:low`).
+RETAIN_BOX_PREFIXES = "low_game_"
+RETAIN_TTL_DAYS = "14"
+
+# Secrets (set via `wrangler secret put <NAME> -c wrangler.low.toml`):
+#   SERVER_PRIVATE_KEY — fresh BRC-31 identity for the LOW relay (NOT the
+#                        shared instance's key, never a player key).
+#   R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_ACCOUNT_ID — only needed for
+#                        >100MB BEEF presigned uploads; unset in LOW v1.
+
+[build]
+# Pinned (the loop-10 promotion, 2026-09-09): the GLOBAL worker-build flips between repos (chaintracks pins 0.7.5 for worker 0.7); this crate is worker 0.8 → worker-build 0.8.5, installed on demand.
+command = "cargo install -q worker-build@0.8.5 && worker-build --release"
+
+# TTL backstop sweep for retained transcripts (daily; the sweep no-ops unless
+# RETAIN_BOX_PREFIXES is set). Abandoned games expire at RETAIN_TTL_DAYS.
+[triggers]
+crons = ["23 4 * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "low-relay-prod"
+database_id = "<your-d1-database-id>"
+
+[[kv_namespaces]]
+binding = "AUTH_SESSIONS"
+id = "<your-account-id>"
+
+[[r2_buckets]]
+binding = "BEEF_BLOBS"
+bucket_name = "low-relay-beefs"
+
+# The header service (0.3.30): rust-chaintracks runs on this account, so the relay reaches it through a
+# SERVICE BINDING (a plain fetch between two Workers of one account is refused, error 1042); every lookup is
+# a request to https://header-service/<path>. ONE header-service deployment exists (production), so beta binds
+# to it too. Without it every payment that owes a delivery fee is refused 500 (fail closed); LOW's seats never
+# pay and first-party writes bypass the payment path. (bsv-low #589, 2026-10-09)
+[[services]]
+binding = "HEADER_SERVICE"
+service = "rust-chaintracks"
+
+[[durable_objects.bindings]]
+name = "MESSAGE_HUB"
+class_name = "MessageHub"
+
+[[durable_objects.bindings]]
+name = "ENGINEIO_SESSION"
+class_name = "EngineIoSession"
+
+# bsv-low W-D (2026-09-10): the BRC-104 session store (bsv-middleware-cloudflare
+# 0.3.3 `AuthSessionStore`): one object per session nonce, no KV write per request.
+[[durable_objects.bindings]]
+name = "AUTH_SESSION_STORE"
+class_name = "AuthSessionStore"
+
+# Same DO migration history as the parent config so the classes exist.
+[[migrations]]
+tag = "v1"
+new_classes = ["MessageRoom"]
+
+[[migrations]]
+tag = "v2"
+deleted_classes = ["MessageRoom"]
+
+[[migrations]]
+tag = "v3"
+new_classes = ["MessageHub"]
+
+[[migrations]]
+tag = "v4"
+new_classes = ["EngineIoSession"]
+
+# ══════════════════════════════════════════════════════════════════════════
+# beta — the isolated pre-release stack's OWN relay (bsv-low, 2026-08-12)
+#
+#   wrangler deploy -c wrangler.low.toml --env beta
+#   npx wrangler d1 migrations apply low-relay-beta -c wrangler.low.toml --env beta --remote
+#   npx wrangler secret put SERVER_PRIVATE_KEY -c wrangler.low.toml --env beta
+#
+# The relay is the one LOW service where sharing would have been leak-SAFE:
+# there is no global room and no directory, every box and presence room is
+# derived from a gameId or an identity key, and the lobby is served entirely
+# by the overlay. Beta gets its own anyway for ONE reason — WIPEABILITY. LOW
+# retains per-hand transcripts (RETAIN_BOX_PREFIXES) for 14 days, so beta
+# hands would otherwise leave rows sitting in the prod relay's database, and
+# "wipe beta without touching prod" would stop being true.
+#
+# Nothing is inherited: wrangler env blocks redeclare vars and every binding.
+# ══════════════════════════════════════════════════════════════════════════
+
+[[durable_objects.bindings]]
+name = "BROADCAST_REGISTRY"
+class_name = "BroadcastRegistry"
+
+[[migrations]]
+tag = "v9-broadcast-registry"
+new_classes = ["BroadcastRegistry"]
+
+[[migrations]]
+tag = "v10-auth-session-store"
+new_classes = ["AuthSessionStore"]
+
+# Workers Logs (2026-09-03): persistent, queryable invocation logs for the fleet —
+# `wrangler tail` samples under load and a tail is a laptop process; these are not.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[env.beta]
+name = "low-relay-beta"
+
+[env.beta.vars]
+BSV_NETWORK = "mainnet"
+WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
+ENABLE_FIREBASE = "false"
+SESSION_TTL_SECONDS = "28800"
+R2_BUCKET_NAME = "low-relay-beefs-beta"
+RETAIN_BOX_PREFIXES = "low_game_"
+RETAIN_TTL_DAYS = "14"
+
+[env.beta.triggers]
+crons = ["23 4 * * *"]
+
+[[env.beta.d1_databases]]
+binding = "DB"
+database_name = "low-relay-beta"
+database_id = "<your-d1-database-id>"
+
+[[env.beta.kv_namespaces]]
+binding = "AUTH_SESSIONS"
+id = "<your-account-id>"
+
+[[env.beta.r2_buckets]]
+binding = "BEEF_BLOBS"
+bucket_name = "low-relay-beefs-beta"
+
+# The header service (0.3.30): rust-chaintracks runs on this account, so the relay reaches it through a
+# SERVICE BINDING (a plain fetch between two Workers of one account is refused, error 1042); every lookup is
+# a request to https://header-service/<path>. ONE header-service deployment exists (production), so beta binds
+# to it too. Without it every payment that owes a delivery fee is refused 500 (fail closed); LOW's seats never
+# pay and first-party writes bypass the payment path. (bsv-low #589, 2026-10-09)
+[[env.beta.services]]
+binding = "HEADER_SERVICE"
+service = "rust-chaintracks"
+
+[[env.beta.durable_objects.bindings]]
+name = "MESSAGE_HUB"
+class_name = "MessageHub"
+
+[[env.beta.durable_objects.bindings]]
+name = "ENGINEIO_SESSION"
+class_name = "EngineIoSession"
+
+[[env.beta.durable_objects.bindings]]
+name = "BROADCAST_REGISTRY"
+class_name = "BroadcastRegistry"
+
+[[env.beta.durable_objects.bindings]]
+name = "AUTH_SESSION_STORE"
+class_name = "AuthSessionStore"

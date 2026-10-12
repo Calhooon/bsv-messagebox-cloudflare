@@ -1,4 +1,11 @@
-> **Public release mirror.** This repository receives tagged releases of a private canonical repository (every Cloudflare resource identifier is scrubbed; deployment configs are placeholders). Issues and PRs are welcome here; development happens upstream and lands as the next release.
+> **THIS IS THE CANONICAL RELAY REPOSITORY (private): `github.com/Calgooon/rust-message-box`, branch `main`.**
+> It deploys `low-relay` and `low-relay-beta` (`npx wrangler deploy -c wrangler.low.toml [--env beta]`) and the generic
+> `rust-message-box` worker (`wrangler.toml`). Develop and commit HERE only.
+>
+> Public releases are cut from here with `scripts/release-public.sh` into the public mirror
+> `github.com/Calhooon/bsv-messagebox-cloudflare` (every Cloudflare resource identifier scrubbed, private config
+> files excluded, verified before commit). Never develop in the mirror. The public fork
+> `github.com/Calgooon/bsv-messagebox-cloudflare` is a PR vehicle only — its `main` is not the code.
 
 # rust-message-box
 
