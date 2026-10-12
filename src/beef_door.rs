@@ -2,7 +2,7 @@
 //! read as a stream, one element in hand, never refused for its size or its
 //! counts.
 //!
-//! The reader is bsv-rs 0.4.4's `StreamVerifier`
+//! The reader is bsv-rs 0.4.5's `StreamVerifier`
 //! (`src/transaction/beef_stream.rs:2770-2950`): one step per element, a
 //! `Cursor` between any two, and under a budget a pause between two inputs
 //! of a transaction (`step_until`, `Timed::Paused`), the cursor then naming
@@ -21,6 +21,8 @@
 //! (`StreamVerifier::new`, `BeefIndex::check_spends_of`, `:2063-2167`). A
 //! spend the interpreter refuses is refused here, at the input's offset
 //! (`SpendRefused`): a payment whose ancestry nobody signed is no payment.
+//! A LOCAL Work decline instead leaves validity undetermined and names the
+//! per-input budget and the work spent. The budget is reapplied after resume.
 //! What that costs is said plainly: beside the index the reader keeps each
 //! transaction's outputs until an input of the BEEF spends them, so an
 //! output nothing in the BEEF spends is held to the end of the reading.
@@ -67,7 +69,8 @@ use bsv_middleware_rs::{
     verify_payment_output_only, HeaderLookupError, HeaderService, PaymentToVerify, PaymentVerdict,
     UnverifiableReason,
 };
-use bsv_rs::transaction::beef_stream::{display_hex, Hash32};
+use bsv_rs::script::ScriptResource;
+use bsv_rs::transaction::beef_stream::{display_hex, Hash32, SpendRefusal};
 use bsv_rs::transaction::{Cursor, Headers, Progress, StreamVerifier, Timed, Verdict};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -106,6 +109,20 @@ pub const SCRIPT_INPUTS_PER_PASS: u64 = 20_000;
 /// 4.8 s of that work native (2.1 billion weighed a second, measured); a
 /// transaction under 500 KB is held by the count first. A slice, not a bound.
 pub const SCRIPT_WEIGHT_PER_PASS: u64 = 10_000_000_000;
+
+/// Default LOCAL work per input: reached opcodes plus bytes fed to hashes.
+/// This declines evaluation and says nothing about network validity.
+pub const DEFAULT_WORK_UNITS: u64 = 10_000_000;
+
+mod configured_limits {
+    include!(concat!(env!("OUT_DIR"), "/work_limit.rs"));
+}
+
+/// The relay's build-time knob in `[limits] work_units` in wrangler.toml.
+/// Rebuild after changing it. An absent knob uses the measured default.
+pub fn work_units_per_input() -> u64 {
+    configured_limits::WORK_UNITS.unwrap_or(DEFAULT_WORK_UNITS)
+}
 
 // ---------------------------------------------------------------------------
 // The sources
@@ -353,6 +370,7 @@ struct Since<'a> {
     /// The weight they may carry (`Slices::weight`).
     weight: u64,
     weighed: Cell<u64>,
+    work_units: u64,
 }
 
 impl<'a> Since<'a> {
@@ -364,6 +382,7 @@ impl<'a> Since<'a> {
             ran: Cell::new(0),
             weight: slices.weight,
             weighed: Cell::new(0),
+            work_units: slices.work_units,
         }
     }
 
@@ -404,6 +423,11 @@ async fn read(
         (None, Pass::Structure) => StreamVerifier::structure_only(feed.clone(), AskedAfter, None),
         (None, Pass::Scripts) => StreamVerifier::new(feed.clone(), AskedAfter, None),
     };
+    // The work budget is local configuration, absent from the cursor.
+    // Set it after every construction, including every resumed reader.
+    verifier.set_work_limit(Some(
+        slice.map_or_else(work_units_per_input, |since| since.work_units),
+    ));
     // Where the element in hand began, in the bytes handed over: an input
     // weighs what was fetched since.
     let element_from = Cell::new(0u64);
@@ -538,18 +562,24 @@ fn refusal_word(refused: Verdict) -> DoorVerdict {
             txid,
             input,
             why,
-        } => (
-            UnverifiableReason::SpendRefused {
-                offset,
-                txid: display_hex(&txid),
-                input,
-                why,
-            },
-            Named {
-                offset,
-                kind: "SpendRefused".to_string(),
-            },
-        ),
+        } => {
+            let kind = match &why {
+                SpendRefusal::Resource(limit) if limit.resource == ScriptResource::Work => "Work",
+                _ => "SpendRefused",
+            };
+            (
+                UnverifiableReason::SpendRefused {
+                    offset,
+                    txid: display_hex(&txid),
+                    input,
+                    why,
+                },
+                Named {
+                    offset,
+                    kind: kind.to_string(),
+                },
+            )
+        }
         // A reading that ended valid is no refusal: this cannot come back,
         // and is a refusal if it does.
         Verdict::Valid { .. } => (
@@ -1066,6 +1096,8 @@ pub struct Slices<'a> {
     /// The weight those inputs may carry, each the bytes of its transaction
     /// (`SCRIPT_WEIGHT_PER_PASS`).
     pub weight: u64,
+    /// LOCAL work per input, reapplied to the reader after every resume.
+    pub work_units: u64,
 }
 
 /// The object at `key` through the door, for one slice: read from the saved
@@ -1873,6 +1905,7 @@ pub(crate) mod tests {
                 lookups,
                 inputs: u64::MAX,
                 weight: u64::MAX,
+                work_units: crate::beef_door::work_units_per_input(),
             },
         )
         .await
@@ -1895,6 +1928,7 @@ pub(crate) mod tests {
                 lookups: usize::MAX,
                 inputs: u64::MAX,
                 weight: u64::MAX,
+                work_units: crate::beef_door::work_units_per_input(),
             },
         )
         .await
@@ -2147,6 +2181,7 @@ pub(crate) mod tests {
             lookups: 1,
             inputs: u64::MAX,
             weight: u64::MAX,
+            work_units: crate::beef_door::work_units_per_input(),
         };
         assert_eq!(
             verify_at_rest(&store, KEY, &terms(), None, &slices)
@@ -2187,6 +2222,7 @@ pub(crate) mod tests {
             lookups: usize::MAX,
             inputs: u64::MAX,
             weight: u64::MAX,
+            work_units: crate::beef_door::work_units_per_input(),
         };
         let mut pauses = 0;
         loop {

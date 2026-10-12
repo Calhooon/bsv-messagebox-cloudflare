@@ -632,6 +632,7 @@ async fn send_into(
                 lookups: ROOT_LOOKUPS_PER_PASS,
                 inputs: SCRIPT_INPUTS_PER_PASS,
                 weight: SCRIPT_WEIGHT_PER_PASS,
+                work_units: rust_message_box::beef_door::work_units_per_input(),
             };
             judge_delivery_at_rest(
                 &world.blobs,
@@ -1347,6 +1348,7 @@ fn inline_in_slices(world: &World, tx: &Value, chain: &Chain, fee: u64) -> Spool
         lookups: usize::MAX,
         inputs: u64::MAX,
         weight: u64::MAX,
+        work_units: rust_message_box::beef_door::work_units_per_input(),
     };
     let mut phases = Vec::new();
     loop {
@@ -1665,6 +1667,7 @@ fn bytes_replaced_between_the_verdict_and_the_hand_off_are_never_recorded_verifi
             lookups: ROOT_LOOKUPS_PER_PASS,
             inputs: SCRIPT_INPUTS_PER_PASS,
             weight: SCRIPT_WEIGHT_PER_PASS,
+            work_units: rust_message_box::beef_door::work_units_per_input(),
         };
         let judged = block_on(judge_delivery_at_rest(
             &world.blobs,

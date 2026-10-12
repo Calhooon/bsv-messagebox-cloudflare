@@ -50,11 +50,25 @@ Cloudflare Workers caps request bodies at 100 MB. The TS and Go servers have no 
 
 ### No payment is refused for its size (0.4.0)
 
-A valid payment's BEEF is never refused for its size or for how many transactions or BUMPs it carries, inline or from R2. A refusal is for invalid bytes, or for a spend no script allows, and names them: the error carries `offset` and `kind` beside `code` and `description`. The door runs the scripts of unproven transactions (`kind: "SpendRefused"` at the input), and a transaction with no input is invalid bytes (`kind: "NoInputs"`).
+A valid payment's BEEF is never refused for its size or for how many transactions or BUMPs it carries, inline or from R2. A refusal names invalid bytes, a spend no script allows, or a local evaluator resource decline: the error carries `offset` and `kind` beside `code` and `description`. The door runs the scripts of unproven transactions (`kind: "SpendRefused"` at the input), and a transaction with no input is invalid bytes (`kind: "NoInputs"`).
 
 Nothing after the verdict refuses the sender either. A paid message's BEEF stays at rest in R2 (an inline payment is spooled there), and the recipient's stored row carries the key, the verdict and the subject's txid, never the BEEF. `/listMessages` hands a payment of up to 2,000,000 bytes back inside `payment.tx` as before, streamed from R2; a larger one is listed by its key, and its recipient reads it through `POST /beef/download-url` (a presigned R2 GET). The delivery fee's internalize into the wallet service runs in the request when the BEEF is at most 1 MiB (as `tx` in hex), and is otherwise deferred to the `fee_internalize` table, which the scheduled event drains with a backoff, handing the wallet service a reference to the object at rest (`beefAtRest: { r2Key, size, etag, bucket }`, the bucket `R2_BUCKET_NAME`) and never its bytes, so no fee is too large to drain; every object a payment rests in carries the custom metadata `recipient-identity-key`, the relay's identity key (the recipient of the delivery fee), which the wallet service checks against the caller before it reads a reference (a spooled object is written with it; a sender's upload is written again in place, once, when it is kept); the message is delivered on the verdict either way. An object in R2 belongs to what names it: it is deleted only when no stored row and no deferred fee names its key, so a key sent again cannot take the bytes from a row, and the object of an acknowledged message is reclaimed by the scheduled event once nothing names it.
 
 An R2 object is read one element at a time and is never held whole while it is verified (the reader keeps an output until an input of the BEEF spends it, so outputs nothing spends are held to the end of the reading). When one request cannot finish the reading, the server saves its place beside the object and answers `503 ERR_PAYMENT_PENDING` with `phase`, `elements`, `input`, `offset`, `size`, `rootsChecked` and `roots`; send the same `/sendMessage` again and it continues from there. A request pauses between two elements or, inside a wide transaction, between two of its inputs (`input` names the input reached, and the next request runs the scripts from it). An inline `payment.tx` that pays the delivery fee is put at rest before its scripts run and read the same way; where no bucket is bound it is verified in one request.
+
+### Payment words (0.4.5)
+
+| HTTP | Body word | What the tenant reads |
+|---|---|---|
+| 400 | `ERR_INVALID_PAYMENT` | Invalid bytes or a spend, output or root refusal; byte refusals carry `offset` and `kind`. |
+| 400 | `ERR_INSUFFICIENT_PAYMENT` | The delivery output pays less than the fee. |
+| 422 | `ERR_PAYMENT_WORK` | `resource: "Work"`, `input`, `budget`, `workSpent`, `attempted`, `offset` and `txid`. The local evaluator declined; payment validity is undetermined. |
+| 500 | `ERR_SERVER_MISCONFIGURED` | No header service is configured. |
+| 503 | `ERR_PAYMENT_UNAVAILABLE` | A header lookup could not answer; retry the payment. |
+| 503 | `ERR_PAYMENT_PENDING` | The reading paused between inputs or elements; repeat the request to resume. |
+| 503 | `ERR_PAYMENT_CHANGED` | The object changed between verification and hand-off. |
+
+`[limits] work_units` in `wrangler.toml` is the relay's build-time work budget per input, default 10,000,000. Rebuild after changing it. Work is reached opcodes plus bytes fed to hashes, as reserved by bsv-rs 0.4.5 before that work runs. Every reader, including one resumed from a saved cursor, receives the budget; it is absent from the cursor. The count and weight slices still pause between inputs. A Work decline clears the saved reading like other script refusals, keeps the uploaded object, and records no verified subject or delivered message. It supplies no within-script resume and says nothing about validity under the node's rules.
 
 ### Compatibility rules
 
@@ -181,6 +195,10 @@ Five tables in `migrations/0001_initial.sql`, the transcript retention columns o
 - `device_registrations` — FCM token lifecycle
 
 ## Build and Deploy
+
+### For the deploy
+
+LOW keeps `HEADER_SERVICE` unbound until its 0.4.5 lens passes, then binds it before beta's paying door is exercised. Carry the measured `[limits] cpu_ms` into the deployment configuration; the compiled `[limits] work_units` comes from `wrangler.toml`. This release adds no migration; apply the existing 0005 through 0009 migrations in order, retain the lifecycle rule on `door-state/`, and keep the announcement and send-budget settings from 0.4.4. The captain lands the canonical PR, tags 0.4.5, cuts the mirror, then hands that tag to LOW for its lens and beta before D19.
 
 ```bash
 npm install

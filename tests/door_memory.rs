@@ -320,6 +320,7 @@ fn measure(links: usize, ballast: Ballast) -> (u64, usize, f64) {
         lookups: usize::MAX,
         inputs: u64::MAX,
         weight: u64::MAX,
+        work_units: rust_message_box::beef_door::work_units_per_input(),
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()

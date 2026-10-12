@@ -62,22 +62,17 @@ R2_BUCKET_NAME = "bsv-messagebox-beefs"
 [build]
 command = "worker-build --release"
 
-# The CPU one request may spend (0.4.4, bsv-low #591 H1), stated rather than
-# left to the default. The payment door reads in slices of 15 s
-# (VERIFY_SLICE_MILLIS, wall time, which a Worker's clock moves only at I/O)
-# and, on bsv-rs 0.4.4, pauses between two inputs of a transaction at 20,000
-# inputs (SCRIPT_INPUTS_PER_PASS) or at a weight of 10,000,000,000, each input
-# weighing its transaction's bytes (SCRIPT_WEIGHT_PER_PASS). So a request
-# spends its slice plus the widest stretch with no I/O in it, no longer a
-# whole element. Measured on the lane's host, release
-# (tests/hostile_wide_door.rs, the_widest_element_at_0_4_4): the widest is
-# the weight's slice of a subject signed over the original digest, 4,969 ms
-# native, about 6,000 ms in wasm32 under V8 (1.2 times native, measured with
-# bsv-rs 0.4.4's verify_stream in node 26, not in workerd). 15 s + 6 s is
-# 21 s; 30 s is that with half again. The 64,000-input subject that set 60 s
-# before the re-pin is 46 ms native at 0.4.4.
+# R404-H1, bsv-rs 0.4.5: a LOCAL work budget inside each input.
+# Native release, whole door including parsing: the widest budget-boundary
+# witness observed 1127.292 ms. The retained between-input slice reached
+# 9811 ms, so use that larger stretch. The 0.4.4 V8 estimate is 1.2 times native:
+# (15000 + 11193 * 1.2) * 1.5 = 42647.4 ms, rounded up to 43000 (the widest
+# stretch measured: 11,193 ms in the keeper's verification at the tip; 9,811 ms in the lane's).
+# Not measured in workerd. Count and weight slices between inputs stay.
 [limits]
-cpu_ms = 30000
+cpu_ms = 43000
+# Relay build-time work budget per input. Rebuild when changing it.
+work_units = 10000000
 
 [[d1_databases]]
 binding = "DB"

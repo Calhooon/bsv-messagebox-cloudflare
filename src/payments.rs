@@ -6,8 +6,11 @@ use std::collections::{HashMap, HashSet};
 use bsv_middleware_cloudflare::WorkerStorageClient;
 use bsv_middleware_rs::{
     brc29_locking_script, header_service_url, HeaderLookupError, HeaderService, PaymentVerdict,
+    UnverifiableReason,
 };
 use bsv_rs::primitives::PrivateKey;
+use bsv_rs::script::ScriptResource;
+use bsv_rs::transaction::beef_stream::SpendRefusal;
 use bsv_rs::wallet::ProtoWallet;
 use serde_json::{json, Value};
 use worker::Env;
@@ -130,6 +133,7 @@ pub async fn process_payment(
             lookups: ROOT_LOOKUPS_PER_PASS,
             inputs: SCRIPT_INPUTS_PER_PASS,
             weight: SCRIPT_WEIGHT_PER_PASS,
+            work_units: crate::beef_door::work_units_per_input(),
         };
         let judged = match r2_key {
             Some(key) => {
@@ -887,6 +891,26 @@ pub fn delivery_answer(verdict: PaymentVerdict) -> Result<u64, RouteResult> {
             &format!("The server delivery output is invalid: {}", description),
         )),
         PaymentVerdict::NoHeaderService => Err(err(500, "ERR_SERVER_MISCONFIGURED", &description)),
+        PaymentVerdict::Unverifiable(UnverifiableReason::SpendRefused {
+            offset,
+            txid,
+            input,
+            why: SpendRefusal::Resource(limit),
+        }) if limit.resource == ScriptResource::Work => Err((
+            json!({
+                "status": "error",
+                "code": "ERR_PAYMENT_WORK",
+                "description": "The local evaluator declined this input at its work budget; payment validity is undetermined.",
+                "resource": "Work",
+                "offset": offset,
+                "txid": txid,
+                "input": input,
+                "budget": limit.limit,
+                "workSpent": limit.work_spent,
+                "attempted": limit.attempted,
+            }),
+            422,
+        )),
         PaymentVerdict::Unverifiable(reason) if reason.is_server_side() => {
             Err(err(503, "ERR_PAYMENT_UNAVAILABLE", &description))
         }
@@ -2079,6 +2103,7 @@ mod tests {
                 lookups: ROOT_LOOKUPS_PER_PASS,
                 inputs: u64::MAX,
                 weight: u64::MAX,
+                work_units: crate::beef_door::work_units_per_input(),
             },
         )
         .await

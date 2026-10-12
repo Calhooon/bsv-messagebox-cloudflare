@@ -275,6 +275,15 @@ impl PaymentStore for Store {
 /// The door on the object at rest, with a slice of `millis` of wall time a
 /// request, every request sent again until a verdict.
 fn at_rest(beef: &[u8], root: &str, millis: u64) -> Run {
+    at_rest_with_work(
+        beef,
+        root,
+        millis,
+        rust_message_box::beef_door::work_units_per_input(),
+    )
+}
+
+fn at_rest_with_work(beef: &[u8], root: &str, millis: u64, work_units: u64) -> Run {
     let beef = beef.to_vec();
     let root = root.to_string();
     on_a_thread(move || {
@@ -294,6 +303,7 @@ fn at_rest(beef: &[u8], root: &str, millis: u64) -> Run {
             lookups: usize::MAX,
             inputs: u64::MAX,
             weight: u64::MAX,
+            work_units,
         };
         let before = scripted_elements();
         let started = Instant::now();
@@ -420,17 +430,13 @@ fn the_wide_frame_paying_the_price_at_64000_inputs() {
     paid(WIDE);
 }
 
-/// The CPU one request may spend, set explicitly in `wrangler.toml` (H1):
-/// the slice of reading (`VERIFY_SLICE_MILLIS`, 15 s, wall time read at
-/// I/O) plus the widest stretch a request runs with no I/O in it. Since
-/// bsv-rs 0.4.4 that is no longer a whole element: the door pauses between
-/// inputs at `SCRIPT_INPUTS_PER_PASS` inputs or `SCRIPT_WEIGHT_PER_PASS` of
-/// weight. Measured (`the_widest_element_at_0_4_4`, release, the lane's
-/// host): the widest is the weight's slice of an original-digest subject,
-/// 4,969 ms native; the same reading in wasm32 under V8 (node 26, bsv-rs
-/// 0.4.4's `verify_stream`, a scratch crate) is 1.2 times native, so about
-/// 6,000 ms. The 64,000-input subject that set 0.4.4's first 60 s is 46 ms
-/// now. The stated CPU covers that need and is not more than twice it.
+/// The CPU setting derives from the measured budget boundary, scaled by
+/// the 0.4.4 V8 factor, plus the 15 s slice and half again. The largest
+/// observed single-input door run was 1,127.292 ms (V8 estimate 1,353 ms).
+/// The retained between-input slice reached 9,811 ms in the lane's run and
+/// 11,193 ms in the keeper's verification at the tip under a loaded host
+/// (V8 estimate 13,432 ms), so use the largest stretch measured and round
+/// the final CPU up to a whole second.
 #[test]
 fn the_deployment_states_the_cpu_a_request_may_spend() {
     let toml = include_str!("../wrangler.toml");
@@ -445,15 +451,12 @@ fn the_deployment_states_the_cpu_a_request_may_spend() {
         .trim()
         .parse()
         .expect("cpu_ms is a number");
-    let widest_stretch_wasm_ms = 6_000;
+    let widest_stretch_wasm_ms = 13_432;
     let need = rust_message_box::beef_door::VERIFY_SLICE_MILLIS + widest_stretch_wasm_ms;
-    assert!(
-        cpu_ms >= need,
-        "cpu_ms {cpu_ms} covers the slice and the widest stretch measured, {need}"
-    );
-    assert!(
-        cpu_ms <= 2 * need,
-        "cpu_ms {cpu_ms} is the need measured at 0.4.4 with a margin, not more than twice {need}"
+    let measured_cpu_ms = (need * 3).div_ceil(2).div_ceil(1_000) * 1_000;
+    assert_eq!(
+        cpu_ms, measured_cpu_ms,
+        "CPU is the measured need plus half again, rounded up"
     );
     assert!(cpu_ms <= 300_000, "within the platform's ceiling");
 }
@@ -521,6 +524,7 @@ fn paced(
             lookups: usize::MAX,
             inputs,
             weight,
+            work_units: rust_message_box::beef_door::work_units_per_input(),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -847,4 +851,173 @@ fn an_input_over_the_original_digest_weighs_its_transaction() {
     }
     assert_eq!(run.scripted, 3);
     assert_eq!(run.asked, 1);
+}
+
+// LOW R404-H1: phantom source P, one paying input S and a fabricated BUMP.
+// One signature is duplicated for k successful checks over the original digest.
+fn single_input_work(k: usize, padding: usize) -> (Vec<u8>, String) {
+    let (beef, root, _) = single_input_work_measured(k, padding);
+    (beef, root)
+}
+
+fn single_input_work_measured(k: usize, padding: usize) -> (Vec<u8>, String, u64) {
+    let key = PrivateKey::from_bytes(&[0x11; 32]).unwrap();
+    let mut lock = Vec::new();
+    for _ in 0..k {
+        lock.push(0x76); // DUP
+        push(&key.public_key().to_compressed(), &mut lock);
+        lock.push(0xad); // CHECKSIGVERIFY
+    }
+    lock.extend_from_slice(&[0x75, 0x51]); // DROP TRUE
+    let parent = raw(&[([0x11; 32], 0, vec![])], &[(1_000, lock.clone())]);
+    let prev = hash(&parent);
+    // Output zero pays the exact BRC-29 script. A zero-value data output
+    // widens the original preimage without changing that delivery output.
+    let mut data = vec![0x6a];
+    data.resize(padding + 1, 0);
+    let outputs = vec![(FEE, server_script()), (0, data)];
+    let scope = SIGHASH_ALL | SIGHASH_FORKID | SIGHASH_CHRONICLE;
+    let cache = TxSighashCache::new(
+        1,
+        vec![TxInput {
+            txid: prev,
+            output_index: 0,
+            script: vec![],
+            sequence: u32::MAX,
+        }],
+        outputs
+            .iter()
+            .map(|(satoshis, script)| TxOutput {
+                satoshis: *satoshis,
+                script: script.clone(),
+            })
+            .collect(),
+        0,
+    );
+    // With no code separators, the original preimage is this serialization
+    // with the locking script substituted, plus the four-byte scope.
+    let per_check = raw(&[(prev, 0, lock.clone())], &outputs).len() as u64 + 4 + 32;
+    let work = k as u64 * (per_check + 3) + 3; // 3 opcodes/check, push + DROP TRUE
+    let digest = cache.sighash_dispatched_for_signing(0, &lock, 1_000, scope);
+    let sig = TransactionSignature::new(key.sign(&digest).unwrap(), scope).to_low_s();
+    let mut unlock = Vec::new();
+    push(&sig.to_checksig_format(), &mut unlock);
+    let (beef, root) = frame(&parent, &raw(&[(prev, 0, unlock)], &outputs));
+    (beef, root, work)
+}
+
+#[test]
+fn r404_h1_one_paying_input_is_declined_by_work_before_the_slice() {
+    let (beef, _) = single_input_work(10_000, 1_000_000);
+    for (path, run) in [
+        ("at rest", at_rest(&beef, WRONG_ROOT, u64::MAX)),
+        ("inline", inline(&beef, WRONG_ROOT)),
+    ] {
+        eprintln!(
+            "R404-H1 {path}: {} bytes, {:?}, {:.3} ms, roots {}, pending {}",
+            beef.len(),
+            run.answer.as_ref().map_err(|(status, body)| (
+                status,
+                &body["code"],
+                &body["resource"],
+                &body["budget"],
+                &body["workSpent"]
+            )),
+            run.took.as_secs_f64() * 1e3,
+            run.asked,
+            run.pending
+        );
+        let (status, body) = run.answer.expect_err("local work decline");
+        assert_eq!(status, 422, "{body}");
+        assert_eq!(body["code"], "ERR_PAYMENT_WORK", "{body}");
+        assert_eq!(body["resource"], "Work", "{body}");
+        assert_eq!(body["kind"], "Work", "{body}");
+        assert_eq!(body["input"], 0, "{body}");
+        assert!(body["workSpent"].as_u64().unwrap() <= body["budget"].as_u64().unwrap());
+        assert_eq!(run.asked, 0, "declined before the fabricated root");
+        assert_eq!(
+            run.pending, 0,
+            "one input is declined, not resumed inside its script"
+        );
+        assert!(run.took < Duration::from_millis(rust_message_box::beef_door::VERIFY_SLICE_MILLIS));
+    }
+}
+
+#[test]
+fn r404_h1_work_is_reapplied_after_resume_on_both_spooled_paths() {
+    let (beef, _) = single_input_work(10_000, 1_000_000);
+    for path in [Path::AtRest, Path::Inline] {
+        let (run, pending, _) = paced(
+            &beef,
+            WRONG_ROOT,
+            path,
+            Clock::Frozen,
+            0,
+            u64::MAX,
+            u64::MAX,
+        );
+        eprintln!(
+            "R404-H1 resumed {path:?}: {:.3} ms, pending {}, {:?}",
+            run.took.as_secs_f64() * 1e3,
+            pending.len(),
+            run.answer
+        );
+        assert!(pending.iter().any(|p| p["phase"] == "scripts"));
+        let (status, body) = run.answer.unwrap_err();
+        assert_eq!(status, 422, "{body}");
+        assert_eq!(body["code"], "ERR_PAYMENT_WORK", "{body}");
+        assert_eq!(
+            body["budget"],
+            rust_message_box::beef_door::work_units_per_input()
+        );
+        assert_eq!(body["input"], 0);
+        assert_eq!(run.asked, 0);
+    }
+}
+
+#[test]
+fn r404_h1_exact_budget_keeps_the_valid_payment_and_one_less_declines() {
+    let (beef, root, work) = single_input_work_measured(9, 1_100_000);
+    assert!(work <= rust_message_box::beef_door::work_units_per_input());
+    assert_eq!(at_rest_with_work(&beef, &root, 0, work).answer, Ok(FEE));
+    let declined = at_rest_with_work(&beef, &root, 0, work - 1);
+    let (status, body) = declined.answer.unwrap_err();
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(body["budget"], work - 1);
+    assert_eq!(body["workSpent"], work - 1);
+    assert_eq!(body["attempted"], work);
+    assert_eq!(declined.asked, 0);
+}
+
+#[test]
+#[ignore = "native budget calibration: run --release --ignored --nocapture --test-threads=1"]
+fn r404_h1_widest_single_input_at_the_budget() {
+    let budget = rust_message_box::beef_door::work_units_per_input();
+    for k in [1usize, 7, 9, 100, 500] {
+        // Each extra padding byte costs k units. Account for a varint
+        // width change, then fill the budget to within k-1 units.
+        let probe = 1_000;
+        let (_, _, work) = single_input_work_measured(k, probe);
+        let mut padding = probe + ((budget - work) / k as u64) as usize;
+        let (_, _, filled) = single_input_work_measured(k, padding);
+        if filled > budget {
+            padding -= (filled - budget).div_ceil(k as u64) as usize;
+        }
+        let (beef, root, work) = single_input_work_measured(k, padding);
+        assert!(work <= budget && budget - work < k as u64);
+        // At exactly the measured work it is valid; one less must decline.
+        let below = at_rest_with_work(&beef, &root, u64::MAX, work - 1);
+        assert_eq!(below.answer.unwrap_err().0, 422);
+        for sample in 1..=3 {
+            for (path, run) in [
+                ("at rest", at_rest(&beef, &root, u64::MAX)),
+                ("inline", inline(&beef, &root)),
+            ] {
+                eprintln!("R404-H1 budget calibration: k={k}, padding={padding}, bytes={}, work={work}/{budget}, sample={sample}, {path}: {:.3} ms, {:?}", beef.len(), run.took.as_secs_f64()*1e3, run.answer);
+                assert_eq!(run.answer, Ok(FEE));
+                assert_eq!(run.asked, 1);
+                assert_eq!(run.pending, 0);
+            }
+        }
+    }
 }

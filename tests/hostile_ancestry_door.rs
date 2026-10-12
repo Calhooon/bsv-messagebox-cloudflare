@@ -261,6 +261,7 @@ fn at_rest(beef: &[u8], root: &str, resumed: bool) -> (Answer, usize, usize, boo
                     lookups: usize::MAX,
                     inputs: u64::MAX,
                     weight: u64::MAX,
+                    work_units: rust_message_box::beef_door::work_units_per_input(),
                 };
                 let mut pending = 0usize;
                 loop {

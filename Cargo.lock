@@ -184,9 +184,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-rs"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1e259211cb7002ff74656c0b0347e6159209238df43760e2a24d87ce9da6621"
+checksum = "3e0abc5bc3001271236a5da213ece6412e86612353aaa53b9adf2ecee1425c2a"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "rust-message-box"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "async-trait",
  "base64",
