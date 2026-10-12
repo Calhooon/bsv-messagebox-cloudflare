@@ -10,20 +10,20 @@
 //! BRC-103 auth handshake, so cold-start outliers cause flaky
 //! `"WebSocket authentication timed out!"` failures.
 //!
-//! Phase 2 eliminates the DO from the entire polling path. The Worker
+//! Polling auth uses the sid DO as its strongly consistent authority (#80).
+//! Queues and transport markers stay in KV. The Worker
 //! (always warm) handles:
 //!   * The Engine.IO `0{...}` handshake (done in Phase 1, in `lib.rs`).
 //!   * Engine.IO `2`/`3` Ping/Pong and `1` Close on polling-POST.
 //!   * Socket.IO `0` CONNECT (replies CONNACK) and `1` DISCONNECT.
-//!   * Socket.IO `2` EVENT — including `authMessage` (full BRC-103 in
-//!     Worker, no DO involvement) and post-auth events like
+//!   * Socket.IO `2` EVENT — including `authMessage` (handshake in the
+//!     Worker, verified-state handoff and General selection in the sid DO) and post-auth events like
 //!     `joinRoom` / `sendMessage` (forwarded to `MessageHub` via the
 //!     existing `/internal/socketio-event` endpoint).
 //!   * Polling-GET long-poll on the KV queue.
 //!
-//! The per-sid `EngineIoSession` DO is touched only when the client
-//! upgrades to WebSocket. At upgrade time the DO loads the verified
-//! BRC-103 state from KV and accepts the WS attachment; from there
+//! The per-sid `EngineIoSession` DO persists completed auth rounds before
+//! polling responses are published. Upgrade uses that durable state; from there
 //! all WS traffic flows through the DO exactly as before.
 //!
 //! ## Storage layout
@@ -69,7 +69,7 @@ use worker::{
 
 use crate::engineio::auth::{
     build_outbound_general, decode_event_payload, encode_event_payload, handle_auth_message,
-    make_wallet, session_from_initial_response, AuthOutcome, SessionAuthState,
+    make_wallet, session_from_initial_response, AuthOutcome, PollingAuthInput, SessionAuthState,
 };
 use crate::engineio::codec::{
     decode_polling_batch, encode_polling_batch, EngineIoPacket, SocketIoPacket,
@@ -507,6 +507,34 @@ async fn handle_socketio_event(env: &Env, kv: &KvStore, sid: &str, nsp: &str, da
     }
 }
 
+async fn auth_round_in_do(
+    env: &Env,
+    sid: &str,
+    arg: &Value,
+    completed: Option<SessionAuthState>,
+) -> Result<(AuthOutcome, SessionAuthState)> {
+    let namespace = env.durable_object("ENGINEIO_SESSION")?;
+    let stub = namespace.id_from_name(sid)?.get_stub()?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post).with_body(Some(
+        serde_json::to_string(&PollingAuthInput {
+            message: arg.clone(),
+            completed,
+        })?
+        .into(),
+    ));
+    let url = format!("https://do.local/internal/auth-round?sid={sid}");
+    let mut response = stub
+        .fetch_with_request(Request::new_with_init(&url, &init)?)
+        .await?;
+    if response.status_code() != 200 {
+        return Err(worker::Error::RustError(
+            "auth authority unavailable".into(),
+        ));
+    }
+    response.json().await
+}
+
 async fn handle_authmessage(env: &Env, kv: &KvStore, sid: &str, nsp: &str, arg: &Value) {
     let ttl = sio_ttl(env);
     let server_key = match env.secret("SERVER_PRIVATE_KEY") {
@@ -524,29 +552,55 @@ async fn handle_authmessage(env: &Env, kv: &KvStore, sid: &str, nsp: &str, arg: 
         }
     };
 
-    let current = load_auth_state(kv, sid).await;
-    let outcome = handle_auth_message(arg, &current, &wallet).await;
+    // The Worker completes the InitialRequest, then hands its verified
+    // state directly to the sid DO. Generals use that same authority to
+    // select a completed round; a stale KV nonce is never consulted.
+    let local = if arg.get("messageType").and_then(Value::as_str) == Some("initialRequest") {
+        Some(handle_auth_message(arg, &SessionAuthState::default(), &wallet).await)
+    } else {
+        None
+    };
+    let completed = match &local {
+        Some(AuthOutcome::Outbound(msgs)) => {
+            let state = msgs
+                .first()
+                .ok_or("missing InitialResponse")
+                .and_then(|out| {
+                    session_from_initial_response(arg, out).map_err(|_| "invalid InitialResponse")
+                });
+            match state {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    console_log!("SIOW: cannot hand off completed auth sid={sid}: {e}");
+                    mark_closed(kv, sid, ttl).await;
+                    return;
+                }
+            }
+        }
+        _ => None,
+    };
+    let (remote, current) = match auth_round_in_do(env, sid, arg, completed).await {
+        Ok(result) => result,
+        Err(e) => {
+            console_log!("SIOW: auth handoff failed sid={sid}: {e}");
+            mark_closed(kv, sid, ttl).await;
+            return;
+        }
+    };
+    let outcome = local.unwrap_or(remote);
+    save_auth_state(kv, sid, &current, ttl).await;
+    if let Some(identity) = current.verified_identity_key() {
+        save_identity(kv, sid, identity, ttl).await;
+    }
     match outcome {
         AuthOutcome::Outbound(msgs) => {
             // BRC-103 InitialRequest → InitialResponse. Enqueue the
-            // InitialResponse and promote session state to
-            // Authenticated.
+            // InitialResponse after its round has been committed to the DO.
             for out_msg in &msgs {
                 let frame = encode_outbound_authmessage(out_msg);
                 append_to_queue(kv, sid, frame, ttl).await;
             }
-            if let Some(out) = msgs.first() {
-                if let Ok(new_state) = session_from_initial_response(arg, out) {
-                    if let Some(identity) = new_state.verified_identity_key() {
-                        save_identity(kv, sid, identity, ttl).await;
-                    }
-                    save_auth_state(kv, sid, &new_state, ttl).await;
-                    console_log!(
-                        "SIOW: BRC-103 complete sid={sid} identity={}",
-                        new_state.verified_identity_key().unwrap_or("<unknown>")
-                    );
-                }
-            }
+            console_log!("SIOW: BRC-103 round committed sid={sid}");
         }
         AuthOutcome::AuthenticatedGeneral { payload } => {
             // Client sent its first post-auth General. The legacy

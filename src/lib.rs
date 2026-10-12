@@ -1347,10 +1347,9 @@ async fn route_socketio_request(mut req: Request, env: &Env, ctx: &Context) -> R
     let sid = sid_opt.expect("sid present");
 
     // M11 Phase 2 — Worker handles ALL polling traffic. KV is the
-    // single source of truth for per-sid polling state (auth, queue,
-    // CONNECT/closed flags). The `EngineIoSession` DO is touched only
-    // at WS upgrade, where it reads the verified BRC-103 state from
-    // KV and accepts the WebSocket.
+    // polling cache for queues and CONNECT/closed flags. BRC-103 auth is
+    // synchronously committed in the sid DO before the Worker replies.
+    // WS upgrade reads that same authority and accepts the attachment.
     if transport == "polling" {
         match req.method() {
             Method::Post => {
