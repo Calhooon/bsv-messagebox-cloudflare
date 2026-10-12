@@ -4,6 +4,17 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## 0.4.6 (2026-10-12)
+
+- Websocket auth failures close with code 1008 and reason `authentication failed; reconnect`, using the ping-timeout teardown. A client can reconnect and re-handshake instead of waiting on a socket that drops every General.
+- The Worker completes the polling handshake, then synchronously hands its verified state to the sid Durable Object before publishing the InitialResponse. That object owns completed rounds, the upgrade state and the attachment snapshot. KV remains a polling cache and a legacy upgrade fallback. This restores a DO hop on polling auth; cold-start latency needs a runtime lens.
+- Retain the last 16 completed rounds plus the selected session. A General selects by nonce and then verifies its signature; a later InitialRequest cannot orphan that session. Round history lives in DO storage, outside the 2 KB websocket attachment. Delayed warm-up cannot reset a live session.
+- The pin stays bsv-rs `=0.4.5`: bsv-middleware-cloudflare 0.5.1 (core 0.2.1) and bsv-middleware-rs 0.4.1 require bsv-rs 0.4, so one SDK in the lock cannot be 0.5.0 until their 0.5.0-based releases exist; the relay re-locks with that wave, nothing in this release waits on it.
+
+Transport pins are RED on the 0.4.5 sources and GREEN after. On bsv-rs 0.4.5, the final release suite passes 505 tests (four expected ignored), all 22 payment vectors match, and all 13 wide-door witnesses pass with measurements enabled. Formatting, host/wasm clippy, the release wasm library and Worker packaging pass. Runtime flap recovery and the 0.5.0 gate remain unverified.
+
+LOW deploy note: an unverifiable General now closes its socket. Clients must reconnect, establish a fresh session and rejoin their rooms. A client without reconnect will see closes it previously did not see. Use the captain's mirror tag only after dependency alignment, the runtime transport lens and paying beta. No publish, tag, mirror cut or deployment in this lane.
+
 ## 0.4.5 (2026-10-11)
 
 ### R404-H1: a local work budget inside one paying input (bsv-stack-lean #75 B)

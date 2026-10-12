@@ -141,8 +141,8 @@ impl SessionAuthState {
 ///     Socket.IO `authMessage` EVENT.
 ///   * `Authenticated { .. }` → flip session state, stage post-auth
 ///     follow-up emit (`authenticated` event for Phase B).
-///   * `Drop` / `Error` → no-op or log.
-#[derive(Debug, Clone)]
+///   * `Quiet` → no state change; `Error` → close a websocket transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthOutcome {
     /// One or more outbound `authMessage` JSON payloads ready to send.
     /// Each entry is a fully serialised `AuthMessage` JSON object —
@@ -279,6 +279,80 @@ async fn process_initial_request(msg: &AuthMessage, wallet: &ProtoWallet) -> Res
     response.signature = Some(sig.signature);
 
     serde_json::to_value(&response).map_err(|e| format!("serialise InitialResponse: {e}"))
+}
+
+/// Bounded completed polling rounds, stored in the sid DO, never in KV/WS attachments.
+pub async fn advance_auth_rounds(
+    raw: &Value,
+    current: &mut SessionAuthState,
+    rounds: &mut Vec<SessionAuthState>,
+    wallet: &ProtoWallet,
+) -> AuthOutcome {
+    // K=16 bounds auth work/state by this sid's activity. Select by nonce,
+    // then verify the signature, never trust a nonce alone. Round storage
+    // stays in the DO so the WS attachment holds only the selected session.
+    if raw.get("messageType").and_then(Value::as_str) == Some("general") {
+        for candidate in std::iter::once(&*current).chain(rounds.iter().rev()) {
+            let SessionAuthState::Authenticated {
+                server_session_nonce,
+                ..
+            } = candidate
+            else {
+                continue;
+            };
+            if raw.get("yourNonce").and_then(Value::as_str) != Some(server_session_nonce) {
+                continue;
+            }
+            let outcome = handle_auth_message(raw, candidate, wallet).await;
+            if matches!(outcome, AuthOutcome::AuthenticatedGeneral { .. }) {
+                *current = candidate.clone();
+            }
+            return outcome;
+        }
+        return AuthOutcome::Error("General session not found for nonce".into());
+    }
+    let outcome = handle_auth_message(raw, current, wallet).await;
+    if let AuthOutcome::Outbound(msgs) = &outcome {
+        if let Some(out) = msgs.first() {
+            if let Ok(state) = session_from_initial_response(raw, out) {
+                remember_auth_round(current, rounds, state);
+            }
+        }
+    }
+    outcome
+}
+
+/// Called only after this relay has completed/signed an InitialResponse.
+/// Shared by WS auth and the Worker's strongly consistent polling handoff.
+pub fn remember_auth_round(
+    current: &mut SessionAuthState,
+    rounds: &mut Vec<SessionAuthState>,
+    state: SessionAuthState,
+) {
+    if rounds.is_empty() && current.is_authenticated() {
+        rounds.push(current.clone());
+    }
+    rounds.push(state.clone());
+    if rounds.len() > 16 {
+        rounds.remove(0);
+    }
+    // Keep the selected session until a General proves another round.
+    if !current.is_authenticated() {
+        *current = state;
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PollingAuthInput {
+    pub message: Value,
+    /// Internal Worker-only handoff, never accepted from a public request.
+    pub completed: Option<SessionAuthState>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuthRoundState {
+    pub current: SessionAuthState,
+    pub rounds: Vec<SessionAuthState>,
 }
 
 /// Server-side `process_general`. We verify the signature against the
@@ -695,5 +769,185 @@ mod tests {
         assert_eq!(n, "hello");
         assert_eq!(d["a"], 1);
         assert_eq!(d["b"], "x");
+    }
+}
+
+#[cfg(test)]
+mod relay_80 {
+    use super::*;
+    use bsv_rs::auth::types::{AuthMessage, MessageType};
+    use bsv_rs::primitives::PrivateKey;
+    use bsv_rs::wallet::ProtoWallet;
+    use serde_json::Value;
+
+    async fn initial(wallet: &ProtoWallet) -> Value {
+        let identity = wallet_identity_key(wallet).unwrap();
+        let mut msg = AuthMessage::new(MessageType::InitialRequest, identity);
+        msg.initial_nonce = Some(
+            bsv_rs::auth::utils::create_nonce(wallet, None, "bsv-auth-cloudflare")
+                .await
+                .unwrap(),
+        );
+        serde_json::to_value(msg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn g2_worker_second_initial_does_not_orphan_earlier_general() {
+        let server = make_wallet(&"11".repeat(32)).unwrap();
+        let client = ProtoWallet::new(Some(PrivateKey::from_hex(&"22".repeat(32)).unwrap()));
+        let mut current = SessionAuthState::default();
+        let mut rounds = Vec::new();
+        let request = initial(&client).await;
+        assert!(matches!(
+            advance_auth_rounds(&request, &mut current, &mut rounds, &server).await,
+            AuthOutcome::Outbound(_)
+        ));
+        let SessionAuthState::Authenticated {
+            server_session_nonce,
+            peer_nonce,
+            peer_identity_key: _,
+        } = current.clone()
+        else {
+            panic!("handshake");
+        };
+        let server_identity = wallet_identity_key(&server).unwrap().to_hex();
+        let client_state = SessionAuthState::Authenticated {
+            server_session_nonce: peer_nonce,
+            peer_nonce: server_session_nonce,
+            peer_identity_key: server_identity,
+        };
+        let general = build_outbound_general(b"room".to_vec(), &client_state, &client).unwrap();
+        for _ in 0..8 {
+            assert!(matches!(
+                advance_auth_rounds(&initial(&client).await, &mut current, &mut rounds, &server)
+                    .await,
+                AuthOutcome::Outbound(_)
+            ));
+        }
+        assert!(
+            matches!(advance_auth_rounds(&general, &mut current, &mut rounds, &server).await, AuthOutcome::AuthenticatedGeneral { payload } if payload == b"room")
+        );
+    }
+
+    #[tokio::test]
+    async fn g2_session_empty_upgrade_kv_never_silently_drops_general() {
+        let server = make_wallet(&"11".repeat(32)).unwrap();
+        let client = make_wallet(&"22".repeat(32)).unwrap();
+        let mut current = SessionAuthState::default();
+        let mut rounds = Vec::new();
+        advance_auth_rounds(&initial(&client).await, &mut current, &mut rounds, &server).await;
+        let SessionAuthState::Authenticated {
+            server_session_nonce,
+            peer_nonce,
+            ..
+        } = current
+        else {
+            panic!("handshake");
+        };
+        let client_state = SessionAuthState::Authenticated {
+            server_session_nonce: peer_nonce,
+            peer_nonce: server_session_nonce,
+            peer_identity_key: wallet_identity_key(&server).unwrap().to_hex(),
+        };
+        let general = build_outbound_general(b"joinRoom".to_vec(), &client_state, &client).unwrap();
+        assert!(matches!(
+            handle_auth_message(&general, &SessionAuthState::default(), &server).await,
+            AuthOutcome::Error(_)
+        ));
+        let src = include_str!("session.rs");
+        let arm = src
+            .rsplit("AuthOutcome::Error(e) => {")
+            .next()
+            .unwrap()
+            .split("/// Wrap an AuthMessage")
+            .next()
+            .unwrap();
+        assert!(
+            arm.contains("teardown_ws_transport") && arm.contains("ws.close"),
+            "unverifiable General must close with the ping-timeout teardown"
+        );
+        assert!(
+            arm.find("ws.close").unwrap() < arm.find("teardown_ws_transport").unwrap(),
+            "hub cleanup must not delay reconnect"
+        );
+    }
+
+    #[test]
+    fn g2_worker_auth_uses_sid_do_and_upgrade_preserves_its_snapshot() {
+        let worker = include_str!("../socketio_worker.rs");
+        let body = worker
+            .split("async fn handle_authmessage(")
+            .nth(1)
+            .unwrap()
+            .split("// Polling-GET:")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("auth_round_in_do"),
+            "Worker must synchronously hand auth to the sid DO"
+        );
+        let session = include_str!("session.rs");
+        assert!(session.contains("/internal/auth-round") && session.contains("auth-rounds"));
+    }
+}
+
+#[cfg(test)]
+mod round_bounds {
+    use super::*;
+
+    #[tokio::test]
+    async fn selected_session_survives_round_eviction_and_bad_signature_never_selects() {
+        let server = make_wallet(&"11".repeat(32)).unwrap();
+        let client = make_wallet(&"22".repeat(32)).unwrap();
+        let mut current = SessionAuthState::default();
+        let mut rounds = Vec::new();
+        for i in 0..32 {
+            let mut req = AuthMessage::new(
+                MessageType::InitialRequest,
+                wallet_identity_key(&client).unwrap(),
+            );
+            req.initial_nonce = Some(format!("synthetic-client-{i}"));
+            assert!(matches!(
+                advance_auth_rounds(
+                    &serde_json::to_value(req).unwrap(),
+                    &mut current,
+                    &mut rounds,
+                    &server
+                )
+                .await,
+                AuthOutcome::Outbound(_)
+            ));
+            assert!(rounds.len() <= 16);
+        }
+        let selected = serde_json::to_value(&current).unwrap();
+        let SessionAuthState::Authenticated {
+            server_session_nonce,
+            peer_nonce,
+            ..
+        } = &current
+        else {
+            panic!("session");
+        };
+        let peer = SessionAuthState::Authenticated {
+            server_session_nonce: peer_nonce.clone(),
+            peer_nonce: server_session_nonce.clone(),
+            peer_identity_key: wallet_identity_key(&server).unwrap().to_hex(),
+        };
+        let general = build_outbound_general(b"selected".to_vec(), &peer, &client).unwrap();
+        assert!(matches!(
+            advance_auth_rounds(&general, &mut current, &mut rounds, &server).await,
+            AuthOutcome::AuthenticatedGeneral { .. }
+        ));
+        let mut invalid = general;
+        invalid["payload"] = serde_json::json!([0]);
+        assert!(matches!(
+            advance_auth_rounds(&invalid, &mut current, &mut rounds, &server).await,
+            AuthOutcome::Error(_)
+        ));
+        assert_eq!(serde_json::to_value(&current).unwrap(), selected);
+        let stored = AuthRoundState { current, rounds };
+        let decoded: AuthRoundState =
+            serde_json::from_value(serde_json::to_value(&stored).unwrap()).unwrap();
+        assert_eq!(decoded.rounds.len(), 16);
     }
 }

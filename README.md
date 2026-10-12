@@ -80,3 +80,13 @@ an inline request reaches the Worker.
 The source for these contracts is [src/beef_door.rs](src/beef_door.rs),
 [src/payments.rs](src/payments.rs) and [src/routes/send_message.rs](src/routes/send_message.rs).
 Licensed under [MIT](LICENSE).
+
+### 0.4.6 transport deploy note for LOW
+
+An unverifiable websocket General closes the socket with code 1008 and reason
+`authentication failed; reconnect`. The client must reconnect, re-handshake on a
+fresh session and rejoin its rooms. A client without reconnect now sees closes it
+previously did not see. Polling auth synchronously reaches the sid Durable Object;
+include its cold-start latency in the transport lens.
+
+0.4.6 is released on bsv-rs `=0.4.5` (the 0.5.0 re-lock follows the middleware crates' own 0.5.0 releases). LOW takes the mirror's tag `v0.4.6`, runs its lens, then its beta. Keep the existing header binding, migrations, payment-door configuration and object lifecycle requirements.

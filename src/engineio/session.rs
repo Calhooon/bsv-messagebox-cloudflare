@@ -50,8 +50,8 @@ use serde_json::{json, Value};
 use worker::*;
 
 use crate::engineio::auth::{
-    self, build_outbound_general, encode_event_payload, handle_auth_message, make_wallet,
-    session_from_initial_response, AuthOutcome, SessionAuthState,
+    self, build_outbound_general, encode_event_payload, make_wallet, session_from_initial_response,
+    AuthOutcome, SessionAuthState,
 };
 use crate::engineio::codec::{
     decode_polling_batch, encode_polling_batch, EngineIoPacket, SocketIoPacket,
@@ -714,6 +714,11 @@ impl DurableObject for EngineIoSession {
         // yet) or it routed a follow-up polling/WS request and we're
         // re-hydrating after an eviction.
         self.ensure_inner(&qp);
+        if req.method() == Method::Post && path == "/internal/auth-round" {
+            let input: auth::PollingAuthInput = req.json().await?;
+            let (outcome, state) = self.auth_round(&input.message, input.completed).await?;
+            return Response::from_json(&(outcome, state));
+        }
 
         let upgrade_hdr = req
             .headers()
@@ -1059,9 +1064,11 @@ impl EngineIoSession {
             Some(s) if !s.is_empty() => s.clone(),
             _ => return Response::error("missing sid", 400),
         };
-        // Reset in case (somehow) this DO was reused; for fresh sids
-        // it's just a one-time initialisation.
-        *self.inner.borrow_mut() = Some(SessionState::new(sid.clone()));
+        // A delayed Worker warm-up must not reset auth already committed
+        // by /internal/auth-round or erase an attached socket's rooms.
+        if self.inner.borrow().is_none() {
+            *self.inner.borrow_mut() = Some(SessionState::new(sid.clone()));
+        }
         let body = open_handshake_packet(&sid).encode();
         polling_text_response(&body, 200)
     }
@@ -1142,6 +1149,52 @@ impl EngineIoSession {
         polling_text_response("ok", 200)
     }
 
+    /// One authority for polling and WS auth. Storage input/output gates
+    /// serialize the read-modify-write; nonce generation/signature checking
+    /// perform no network I/O between the read and the single durable write.
+    async fn auth_round(
+        &self,
+        arg: &Value,
+        completed: Option<SessionAuthState>,
+    ) -> Result<(AuthOutcome, SessionAuthState)> {
+        let key = self.env.secret("SERVER_PRIVATE_KEY")?.to_string();
+        let wallet = make_wallet(&key).map_err(Error::RustError)?;
+        let mut rounds = self
+            .state
+            .storage()
+            .get::<auth::AuthRoundState>("auth-rounds")
+            .await?
+            .unwrap_or_else(|| auth::AuthRoundState {
+                current: self
+                    .inner
+                    .borrow()
+                    .as_ref()
+                    .map(|s| s.auth.clone())
+                    .unwrap_or_default(),
+                rounds: Vec::new(),
+            });
+        let outcome = if let Some(state) = completed {
+            // The protected DO endpoint receives only this Worker's verified
+            // InitialResponse state, before it enqueues that response.
+            if !state.is_authenticated() {
+                return Err(Error::RustError("incomplete auth handoff".into()));
+            }
+            auth::remember_auth_round(&mut rounds.current, &mut rounds.rounds, state);
+            AuthOutcome::Quiet
+        } else {
+            auth::advance_auth_rounds(arg, &mut rounds.current, &mut rounds.rounds, &wallet).await
+        };
+        self.state.storage().put("auth-rounds", &rounds).await?;
+        if let Some(state) = self.inner.borrow_mut().as_mut() {
+            state.auth = rounds.current.clone();
+            if state.auth.is_authenticated() {
+                state.connected = true;
+            }
+        }
+        self.persist_to_ws_attachment();
+        Ok((outcome, rounds.current))
+    }
+
     /// WebSocket upgrade. After the handshake we mark the transport as
     /// upgrade-pending; the actual switch to WS-only happens once the
     /// client sends `5` (Engine.IO upgrade packet).
@@ -1156,20 +1209,25 @@ impl EngineIoSession {
             return Response::error("WS upgrade requires existing session sid", 400);
         }
 
-        // M11 Phase 2: if the BRC-103 handshake happened in the
-        // Worker (via `crate::socketio_worker`) the DO's in-memory
-        // `inner.auth` is still `NotAuthenticated`. Pull the verified
-        // state out of KV here, BEFORE serialising the attachment, so
-        // every subsequent WS frame's rehydrate-from-attachment sees
-        // the right nonces and verifies signed Generals correctly.
-        let kv_auth = crate::socketio_worker::load_auth_state_public(&self.env, &sid).await;
+        // #80 / T5: polling auth is committed through a sid DO fetch before
+        // its response reaches the client. A single eventually-consistent KV
+        // read cannot be an authority: an empty upgrade snapshot wedges every
+        // later General. Durable rounds win; KV is only a legacy fallback.
+        // A handoff after upgrade updates both memory and the WS attachment.
+        let durable = self
+            .state
+            .storage()
+            .get::<auth::AuthRoundState>("auth-rounds")
+            .await?;
+        let kv_auth = if let Some(rounds) = durable {
+            rounds.current
+        } else {
+            crate::socketio_worker::load_auth_state_public(&self.env, &sid).await
+        };
         if kv_auth.is_authenticated() {
             if let Some(state) = self.inner.borrow_mut().as_mut() {
-                if !state.auth.is_authenticated() {
-                    state.auth = kv_auth;
-                    state.connected = true;
-                    console_log!("EngineIoSession: hydrated KV auth state on WS upgrade sid={sid}");
-                }
+                state.auth = kv_auth;
+                state.connected = true;
             }
         }
 
@@ -1462,16 +1520,10 @@ impl EngineIoSession {
             }
         };
 
-        // Snapshot the current auth state — we never hold the borrow
-        // across the await below.
-        let current_state = self
-            .inner
-            .borrow()
-            .as_ref()
-            .map(|s| s.auth.clone())
-            .unwrap_or_default();
-
-        let outcome = handle_auth_message(arg, &current_state, &wallet).await;
+        let outcome = match self.auth_round(arg, None).await {
+            Ok((outcome, _)) => outcome,
+            Err(e) => AuthOutcome::Error(format!("auth authority unavailable: {e}")),
+        };
         match outcome {
             AuthOutcome::Outbound(msgs) => {
                 // Send the InitialResponse back as an authMessage event.
@@ -1504,9 +1556,6 @@ impl EngineIoSession {
                             .verified_identity_key()
                             .map(String::from)
                             .unwrap_or_default();
-                        if let Some(state) = self.inner.borrow_mut().as_mut() {
-                            state.auth = new_state.clone();
-                        }
                         // Persist the verified identity + nonces. If the
                         // DO is evicted before the client's first
                         // post-auth General, we need to be able to
@@ -1729,6 +1778,12 @@ impl EngineIoSession {
             AuthOutcome::Quiet => {}
             AuthOutcome::Error(e) => {
                 console_log!("EngineIoSession: auth error: {e}");
+                if let Some(ws) = ws_for_response {
+                    // Close before awaiting hub cleanup: a cold hub must not
+                    // leave an unverifiable transport wedged during teardown.
+                    let _ = ws.close(Some(1008), Some("authentication failed; reconnect"));
+                    self.teardown_ws_transport(ws).await;
+                }
             }
         }
     }
