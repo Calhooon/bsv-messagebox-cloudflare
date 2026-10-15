@@ -8,9 +8,9 @@
 #![allow(dead_code)]
 
 use bsv_middleware_rs::{HeaderLookupError, HeaderService};
+use bsv_rs::primitives::sha256d;
 use bsv_rs::primitives::{PrivateKey, PublicKey};
 use bsv_rs::wallet::{Counterparty, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel};
-use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -84,7 +84,7 @@ pub fn raw_tx(prev: &[u8; 32], satoshis: u64, script: &[u8], ballast: usize) -> 
 
 /// The txid in internal byte order.
 pub fn hash(raw: &[u8]) -> [u8; 32] {
-    Sha256::digest(Sha256::digest(raw)).into()
+    sha256d(raw)
 }
 
 /// The script of an output the next link spends: `OP_TRUE`, which that

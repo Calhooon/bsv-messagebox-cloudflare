@@ -17,7 +17,7 @@
 
 /// The published version the relay is expected to ship with (see Cargo.toml's
 /// `bsv-middleware-cloudflare` entry and the 2026-07-23 #249 note beneath it).
-const EXPECTED_VERSION: &str = "0.5.1";
+const EXPECTED_VERSION: &str = "0.6.2";
 const CRATE: &str = "bsv-middleware-cloudflare";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
@@ -92,13 +92,13 @@ fn lock_dependencies_of(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// The BRC-31 layer is on bsv-rs 0.4 (bsv-middleware-cloudflare 0.5.1, on
-/// bsv-middleware-core 0.2.1, since 0.4.5; 0.5.0 before): the
-/// copy of bsv-rs it is built on is the relay's 0.4.5, so the session, the
+/// The BRC-31 layer is on bsv-rs 0.6 (bsv-middleware-cloudflare 0.6.2, on
+/// bsv-middleware-core 0.3.2, since 0.5.0; 0.5.1 on bsv-rs 0.4 before): the
+/// copy of bsv-rs it is built on is the relay's 0.6.0, so the session, the
 /// wallet and the auth message it takes are the types the relay holds, and no
 /// value crosses from one copy of the SDK to the other on the BRC-31 path.
 #[test]
-fn the_brc31_layer_is_built_on_the_relays_bsv_rs_0_4_5() {
+fn the_brc31_layer_is_built_on_the_relays_bsv_rs_0_6_0() {
     let lock = manifest_file("Cargo.lock");
     let copies = lock.matches("name = \"bsv-rs\"\n").count();
     let deps = lock_dependencies_of(CRATE);
@@ -106,8 +106,8 @@ fn the_brc31_layer_is_built_on_the_relays_bsv_rs_0_4_5() {
     assert_eq!(sdk.len(), 1, "{CRATE} names one bsv-rs: {deps:?}");
     let named = sdk[0].as_str();
     assert!(
-        named == "bsv-rs 0.4.5" || (named == "bsv-rs" && copies == 1),
-        "{CRATE} is built on {named}, not the relay's bsv-rs 0.4.5"
+        named == "bsv-rs 0.6.0" || (named == "bsv-rs" && copies == 1),
+        "{CRATE} is built on {named}, not the relay's bsv-rs 0.6.0"
     );
 }
 
@@ -126,16 +126,17 @@ fn cargo_toml_has_no_patch_section() {
     );
 }
 
-/// The 0.4 line: the payment words are bsv-middleware-rs 0.4.1's, built on
-/// the relay's bsv-rs 0.4.5 (the spend linear in its inputs and a clock
-/// between inputs, bsv-low #591), and bsv-rs is one copy. The door keeps its own
+/// The 0.6 line (the relay's 0.5.0): the payment words are
+/// bsv-middleware-rs 0.5.0's, built on the relay's bsv-rs 0.6.0 (0.4.1 on
+/// 0.4.5 before; 0.4.x asks bsv-rs ^0.4.1 and cannot share 0.6.0), and
+/// bsv-rs is one copy. The door keeps its own
 /// reading (the structure, the scripts, the cursor at rest) and hands the
 /// middleware the subject alone, for the output check
 /// (`verify_payment_output_only` over a byte source). No bsv-rs 0.3 is in the
 /// graph and the manifest names no second copy. A move of either is a move of
 /// this test in the same commit.
 #[test]
-fn the_payment_words_are_bsv_middleware_rs_0_4_1_on_bsv_rs_0_4_5_one_copy() {
+fn the_payment_words_are_bsv_middleware_rs_0_5_0_on_bsv_rs_0_6_0_one_copy() {
     let lock = manifest_file("Cargo.lock");
     let versions = |name: &str| -> Vec<String> {
         lock.split("[[package]]")
@@ -149,11 +150,11 @@ fn the_payment_words_are_bsv_middleware_rs_0_4_1_on_bsv_rs_0_4_5_one_copy() {
             })
             .collect()
     };
-    assert_eq!(versions("bsv-middleware-rs"), ["0.4.1"]);
-    assert_eq!(versions("bsv-rs"), ["0.4.5"]);
-    // 0.4.5: the BRC-31 layer's core is 0.2.1 (a patch: bsv-rs 0.4.1 the
-    // floor, the reader's `NoInputs` word), one copy.
-    assert_eq!(versions("bsv-middleware-core"), ["0.2.1"]);
+    assert_eq!(versions("bsv-middleware-rs"), ["0.5.0"]);
+    assert_eq!(versions("bsv-rs"), ["0.6.0"]);
+    // 0.5.0: the BRC-31 layer's core is 0.3.2 (the middleware's release on
+    // bsv-rs 0.6.0), pinned exactly beside it, one copy.
+    assert_eq!(versions("bsv-middleware-core"), ["0.3.2"]);
     let toml = manifest_file("Cargo.toml");
     let sdk_lines: Vec<&str> = toml
         .lines()

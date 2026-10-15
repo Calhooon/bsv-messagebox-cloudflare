@@ -24,10 +24,7 @@
 //! For PUT uploads we use `UNSIGNED-PAYLOAD` as the payload-hash so the
 //! client can stream a body without precomputing its SHA-256.
 
-use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
-
-type HmacSha256 = Hmac<Sha256>;
+use bsv_rs::primitives::{sha256, sha256_hmac};
 
 pub const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 pub const SERVICE: &str = "s3";
@@ -140,7 +137,7 @@ fn presign_r2(method: &str, input: &PresignInput, headers: &[(&str, &str)]) -> P
         method, canonical_path, canonical_query, canonical_headers, signed_headers, payload_hash
     );
 
-    let hashed_canonical = hex::encode(Sha256::digest(canonical_request.as_bytes()));
+    let hashed_canonical = hex::encode(sha256(canonical_request.as_bytes()));
 
     let string_to_sign = format!(
         "{}\n{}\n{}\n{}",
@@ -171,9 +168,7 @@ fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> 
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    sha256_hmac(key, data).to_vec()
 }
 
 /// RFC 3986 URI encoding.
@@ -214,6 +209,24 @@ fn encode_key_path(k: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The signing key's HMAC chain against AWS's published example (the
+    /// SigV4 "derive a signing key" page: secret `wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY`,
+    /// 20120215, us-east-1, iam). Pinned on the move of the HMAC from the
+    /// hmac crate to `bsv_rs::primitives::sha256_hmac`: the bytes are the same.
+    #[test]
+    fn the_signing_key_is_aws_s_published_example() {
+        let key = derive_signing_key(
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20120215",
+            "us-east-1",
+            "iam",
+        );
+        assert_eq!(
+            hex::encode(key),
+            "f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d"
+        );
+    }
 
     #[test]
     fn uri_encode_matches_rfc_3986() {

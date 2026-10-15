@@ -1,6 +1,6 @@
 [package]
 name = "rust-message-box"
-version = "0.4.7"
+version = "0.5.2"
 license = "MIT"
 edition = "2021"
 
@@ -22,22 +22,26 @@ hex = "0.4"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "js"] }
 
-# FCM v1 JWT signing (RS256, PKCS#8 PEM parsing) — in-WASM RSA signing path.
-# sha2 needs the `oid` feature so it implements AssociatedOid, which
-# Pkcs1v15Sign::new::<Sha256>() requires.
-rsa = "0.9"
-sha2 = { version = "0.10", features = ["oid"] }
-pkcs8 = { version = "0.10", features = ["pem"] }
+# FCM v1 JWT signing (RS256 from the service account's PKCS#8 PEM), in WASM,
+# by ring (`RsaKeyPair::from_pkcs8`, `RSA_PKCS1_SHA256`). Not the `rsa` crate:
+# RUSTSEC-2023-0071 has no patched release and the stack's deny template takes
+# no advisory ignore. `wasm32_unknown_unknown_js` names ring's random source
+# on the Worker (getrandom's `js`, as the relay's own getrandom above).
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+# The one hash bsv-rs 0.6.0 cannot serve: `beef_door::inline_spool_key` hashes
+# the inline payment a chunk at a time; bsv-rs exposes one-shot hashes only.
+sha2 = "0.10"
 
-# S3 v4 presigning for R2 uploads larger than the Workers 100 MB body cap.
-hmac = "0.12"
+# S3 v4 presigning for R2 uploads larger than the Workers 100 MB body cap
+# signs with `bsv_rs::primitives::sha256_hmac`; no direct hmac.
 
 # BSV
-# The BRC-31 layer (0.5.1: on bsv-middleware-core 0.2.1 and bsv-rs 0.4; a
-# patch of 0.5.0, bsv-rs 0.4.1 the floor and the reader's `NoInputs` word, no
-# host behavior change). Pinned exactly. Its session, wallet and auth message
-# are the relay's own bsv-rs 0.4.5 types.
-bsv-middleware-cloudflare = "=0.5.1"
+# The BRC-31 layer (0.6.2: on bsv-middleware-core 0.3.2 and bsv-rs 0.6.0, the
+# middleware's releases on the stack's bsv-rs line). Pinned exactly, with the
+# core it is built on. Its session, wallet and auth message are the relay's
+# own bsv-rs 0.6.0 types.
+bsv-middleware-cloudflare = "=0.6.2"
+bsv-middleware-core = "=0.3.2"
 # The SDK and the streaming BEEF reader (0.4.0: `verify_stream`, `BeefDecoder`,
 # `StreamVerifier`, `Cursor`; 0.4.1: a transaction with no input is invalid
 # bytes, `Kind::NoInputs`; 0.4.3: a transaction with no output is invalid
@@ -46,14 +50,16 @@ bsv-middleware-cloudflare = "=0.5.1"
 # inside a transaction, bsv-low #591). Pinned exactly: the door reads the subject's
 # offset out of the cursor's bytes (`beef_door::tip_of`), a layout of this
 # release. 0.4.5 adds a local per-input work budget and a named resource decline.
-bsv-rs = { version = "=0.4.5", features = ["auth", "wallet", "transaction", "wasm"] }
+# 0.6.0: the stack's line (the chain primitives in one home, the hashes and
+# HMAC the relay takes from `bsv_rs::primitives`).
+bsv-rs = { version = "=0.6.0", features = ["auth", "wallet", "transaction", "wasm"] }
 # The shared payment check (P0-3): the six-word verdict, the BRC-29 script and
-# the header service as a trait. 0.4.1 asks bsv-rs ^0.4.1, so it is built on
-# the relay's 0.4.5 and the words take the relay's own wallet and reader
-# types. The door keeps its own reading (the
+# the header service as a trait. 0.5.0 asks bsv-rs ^0.6.0 (0.4.x asks ^0.4.1
+# and cannot share the relay's 0.6.0), so it is built on the relay's 0.6.0
+# and the words take the relay's own wallet and reader types. The door keeps its own reading (the
 # cursor at rest) and asks the middleware the output check on the subject
 # alone (`verify_payment_output_only`).
-bsv-middleware-rs = "0.4.1"
+bsv-middleware-rs = "0.5.0"
 # The header service is a trait of bsv-middleware-rs (`HeaderService`),
 # declared with async-trait; the box implements it over the HEADER_SERVICE
 # service binding or the Worker fetch of a URL.
@@ -63,8 +69,6 @@ futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
-# Test-only RNG for generating ephemeral RSA test keys. Not used at runtime.
-rand = "0.8"
 # Dev-only: the ack statements are planned and executed on a real SQLite with the
 # real migrations (retention.rs tests). Never compiled into the worker.
 rusqlite = { version = "0.32", features = ["bundled", "limits"] }

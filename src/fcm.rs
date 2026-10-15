@@ -8,8 +8,9 @@
 //! Authentication path:
 //! 1. Require the full Google service-account JSON as a secret
 //!    (`FIREBASE_SERVICE_ACCOUNT_JSON`).
-//! 2. Sign a JWT in WASM via `fcm_jwt::build_fcm_jwt` (deterministic RS256 +
-//!    PKCS#1 v1.5 signing — no RNG, no native crypto dependency).
+//! 2. Sign a JWT in WASM via `fcm_jwt::build_fcm_jwt` (deterministic RS256,
+//!    RSASSA-PKCS1-v1_5 by ring, compiled into the Worker's wasm; no external
+//!    signing service).
 //! 3. Exchange the JWT for a short-lived access token via Google's OAuth2
 //!    endpoint (`fcm_token::exchange_jwt_for_token`).
 //! 4. Cache the token in KV (`fcm_cache::get_cached_or_fresh_token`) so
