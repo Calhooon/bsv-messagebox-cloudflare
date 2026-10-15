@@ -69,10 +69,15 @@ use bsv_middleware_rs::{
     verify_payment_output_only, HeaderLookupError, HeaderService, PaymentToVerify, PaymentVerdict,
     UnverifiableReason,
 };
+use bsv_rs::primitives::sha256d;
 use bsv_rs::script::ScriptResource;
 use bsv_rs::transaction::beef_stream::{display_hex, Hash32, SpendRefusal};
 use bsv_rs::transaction::{Cursor, Headers, Progress, StreamVerifier, Timed, Verdict};
 use serde_json::Value;
+// The one hash bsv-rs 0.6.0 cannot serve: `inline_spool_key` hashes the
+// decoded inline payment a chunk at a time, and `bsv_rs::primitives` exposes
+// one-shot hashes only (`sha256(&[u8])`); collecting the chunks would hold the
+// whole payment the door never holds (bsv-low #591 H1).
 use sha2::{Digest, Sha256};
 
 /// The bytes the door decodes from an inline payment at a time.
@@ -536,10 +541,12 @@ pub enum DoorError {
 }
 
 /// A refusal of the reading in the middleware's words, bsv-middleware-rs
-/// 0.4.1's own (`src/payment_core.rs:122-168`): invalid bytes are
+/// 0.5.0's own (`src/payment_core.rs:122-196`): invalid bytes are
 /// `InvalidBeef` with the offset and the kind (a transaction with no input or
 /// no output is one), a spend the interpreter refused is `SpendRefused` at its input. Both
-/// are the payer's side. The route's body names the offset and the kind.
+/// are the payer's side. A mining check with no tip is
+/// `MiningContextUnavailable`, the server's side. The route's body names the
+/// offset and the kind.
 fn refusal_word(refused: Verdict) -> DoorVerdict {
     let (reason, named) = match refused {
         Verdict::Invalid {
@@ -580,6 +587,27 @@ fn refusal_word(refused: Verdict) -> DoorVerdict {
                 },
             )
         }
+        // bsv-rs 0.5.0: a mining check (finality, coinbase maturity) with no
+        // tip to judge it is a decline of the server's, never the payer's
+        // bytes; the middleware's own word for it (bsv-middleware-rs 0.5.0
+        // `src/payment_core.rs:605-617`), named at the offset with the check.
+        Verdict::Unverifiable {
+            offset,
+            txid,
+            input,
+            check,
+        } => (
+            UnverifiableReason::MiningContextUnavailable {
+                offset,
+                txid: display_hex(&txid),
+                input,
+                check,
+            },
+            Named {
+                offset,
+                kind: format!("{:?}", check),
+            },
+        ),
         // A reading that ended valid is no refusal: this cannot come back,
         // and is a refusal if it does.
         Verdict::Valid { .. } => (
@@ -602,12 +630,13 @@ fn malformed(what: impl Into<String>) -> PaymentVerdict {
 }
 
 /// The last raw transaction a reading folded and the offset of its leading
-/// byte: the subject. bsv-rs 0.4.4's verifier does not hand out the element
+/// byte: the subject. bsv-rs 0.6.0's verifier does not hand out the element
 /// it stepped, so this is read from the cursor's own bytes
-/// (`Cursor::to_binary`, `beef_stream.rs:2402-2512`, between two elements
-/// byte for byte 0.4.1's: the magic `BSC1`, the frame, then the index's
-/// `last_raw`; a paused cursor appends after them, and the door reads a tip
-/// only at a reading's end). The door holds the bytes it then
+/// (`Cursor::to_binary`, `beef_stream.rs:2639-2765` at 0.6.0: the magic
+/// `BSC2`, the frame, then the index's `last_raw`, the same fields in the same
+/// order as 0.4.4's `BSC1` up to `last_raw`; 0.5.0 renamed the magic when it
+/// added the coinbase heights after them; a paused cursor appends after them,
+/// and the door reads a tip only at a reading's end). The door holds the bytes it then
 /// fetches to this txid (`subject_raw`), so a cursor laid out otherwise is an
 /// error here and never a wrong answer.
 fn tip_of(cursor: &Cursor) -> Result<Option<(Hash32, u64)>, DoorError> {
@@ -619,7 +648,7 @@ fn tip_of(cursor: &Cursor) -> Result<Option<(Hash32, u64)>, DoorError> {
         at += n;
         slice
     };
-    if take(4)? != b"BSC1" {
+    if take(4)? != b"BSC2" {
         return Err(short());
     }
     take(1)?; // spends checked
@@ -688,7 +717,7 @@ fn raw_tx_len(bytes: &[u8]) -> Option<usize> {
 fn subject_raw(mut tail: Vec<u8>, txid: &Hash32) -> Result<Vec<u8>, DoorError> {
     let wrong = || DoorError::Internal("the subject read back is not the one verified".to_string());
     tail.truncate(raw_tx_len(&tail).ok_or_else(wrong)?);
-    let hashed: Hash32 = Sha256::digest(Sha256::digest(&tail)).into();
+    let hashed: Hash32 = sha256d(&tail);
     (hashed == *txid).then_some(tail).ok_or_else(wrong)
 }
 
@@ -1296,7 +1325,7 @@ pub(crate) mod tests {
     }
 
     fn txid(raw: &[u8]) -> Hash32 {
-        Sha256::digest(Sha256::digest(raw)).into()
+        sha256d(raw)
     }
 
     const PAID: &[u8] = &[0x51; 25];
@@ -1955,6 +1984,36 @@ pub(crate) mod tests {
         }
     }
 
+    /// bsv-rs 0.5.0 renamed the cursor's magic `BSC1` to `BSC2` and refuses
+    /// the old one ("restart their reading"). A door state saved by the
+    /// relay on 0.4.x is no state on 0.6.0: the next pass reads the object
+    /// from its start and comes to the whole reading's verdict.
+    #[tokio::test]
+    async fn a_state_saved_under_bsv_rs_0_4_is_no_state_and_the_reading_starts_over() {
+        let (bytes, root) = chain(50);
+        let headers = Roots::of(&[(HEIGHT, root)]);
+        let store = MemStore::with(KEY, &bytes);
+        assert!(matches!(
+            pass(&store, &headers, usize::MAX).await,
+            AtRest::Pending(_)
+        ));
+        let saved = store.state(KEY).expect("a pause saves its state");
+        assert!(Rest::from_binary(&saved).is_some());
+        let at = saved
+            .windows(4)
+            .position(|w| w == b"BSC2")
+            .expect("the cursor's magic");
+        let mut old = saved.clone();
+        old[at..at + 4].copy_from_slice(b"BSC1");
+        assert_eq!(Rest::from_binary(&old), None);
+        store.states.borrow_mut().insert(state_key(KEY), old);
+        assert_eq!(
+            whole(&store, &headers).await,
+            AtRest::Done(inline(&bytes, &headers).await)
+        );
+        assert_eq!(store.state(KEY), None, "a verdict leaves no state");
+    }
+
     #[tokio::test]
     async fn an_object_at_rest_in_one_pass_is_the_inline_verdict() {
         let (bytes, root) = chain(50);
@@ -2241,5 +2300,35 @@ pub(crate) mod tests {
         // About 6,200 bytes read twice (the structure, then the scripts) in
         // 40-byte chunks, 50 fetches a slice.
         assert!((4..=10).contains(&pauses), "{pauses} pauses");
+    }
+
+    /// bsv-rs 0.5.0 added `Verdict::Unverifiable` (a mining check with no
+    /// tip); the door answers it with the middleware's server-side word,
+    /// never a refusal of the payer's bytes, named at the offset and check.
+    #[test]
+    fn a_mining_check_with_no_tip_is_the_server_s_decline() {
+        let refused = Verdict::Unverifiable {
+            offset: 7,
+            txid: [0xab; 32],
+            input: Some(1),
+            check: bsv_rs::transaction::beef_stream::MiningCheck::Finality,
+        };
+        let door = refusal_word(refused);
+        match &door.word {
+            PaymentVerdict::Unverifiable(reason) => {
+                assert!(reason.is_server_side(), "{reason:?}");
+                assert!(matches!(
+                    reason,
+                    UnverifiableReason::MiningContextUnavailable {
+                        offset: 7,
+                        input: Some(1),
+                        ..
+                    }
+                ));
+            }
+            other => panic!("{other:?}"),
+        }
+        let named = door.named.expect("named");
+        assert_eq!((named.offset, named.kind.as_str()), (7, "Finality"));
     }
 }

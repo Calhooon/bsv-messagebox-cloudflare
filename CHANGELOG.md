@@ -4,6 +4,20 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## [0.5.1] - 2026-10-15
+
+- The PEM header and footer of the FCM signer assembled from parts in code (no change in behaviour): the public mirror's scan and the stack's secret-shape leg read a whole header literal as a key shape.
+
+## [0.5.0] - 2026-10-15
+
+bsv-rs types sit in the relay's public API (the door's `Verdict`, `Cursor`, `Hash32`, the middleware's words), so the move is a minor release.
+
+- **The pins.** bsv-rs `=0.6.0` (was `=0.4.5`), bsv-middleware-cloudflare `=0.6.2` (was `=0.5.1`) with bsv-middleware-core `=0.3.2` pinned beside it (was 0.2.1 through the BRC-31 layer), bsv-middleware-rs 0.5.0 (was 0.4.1; 0.4.x asks bsv-rs ^0.4.1). One bsv-rs in the lock. The version guard moves with them.
+- **The door on bsv-rs 0.5.0 and 0.6.0.** A mining check with no tip (`Verdict::Unverifiable`, finality or coinbase maturity) is the middleware's server-side `MiningContextUnavailable`, never a refusal of the payer's bytes. The cursor's magic is `BSC2` (`tip_of` reads it; the layout up to `last_raw` is unchanged); a door state saved under 0.4.x holds a `BSC1` cursor, reads as no state, and its reading starts over from the object's start. Non-canonical varints are now `BadVarint` (0.6.0): the memory test's fixture writes canonical lengths. The relay supplies no mining tip, so a payment with a nonzero lock time and a non-final sequence is declined as unavailable (5xx), not judged.
+- **The hashes from bsv-rs.** sha256, double sha256 and HMAC-SHA256 come from `bsv_rs::primitives` (`sha256`, `sha256d`, `sha256_hmac`): the R2 presigner, the session MACs, the lane's body digest, the minted `messageId`, the door's subject check and the tests' txids. The direct `hmac` is gone. A known-answer test pins the presigner's signing key to AWS's published example; the cross-repo session MAC vectors re-derive unchanged. One site stays on the direct `sha2`: `inline_spool_key` hashes the inline payment a chunk at a time, and bsv-rs exposes one-shot hashes only.
+- **The FCM signer on ring.** The service-account JWT (RS256) is signed by ring 0.17 (`RsaKeyPair::from_pkcs8`, `RSA_PKCS1_SHA256`) from the same `FIREBASE_SERVICE_ACCOUNT_JSON` secret in the same PKCS#8 PEM form. `rsa`, `pkcs8` and the dev `rand` leave the manifest; `rsa` leaves the lock, and with it RUSTSEC-2023-0071. The tests generate their key in the test, verify the signature with ring and, apart from ring, against RFC 8017's padding by modular exponentiation, and pin the signing input's bytes. ring compiles C for wasm32: a wasm32 build needs a clang with the WebAssembly target (`CC_wasm32_unknown_unknown`; Apple's clang has none).
+- **The deny file.** The stack's template, byte for byte (sha256 `a2495808...d60570c`, bsv-stack-lean `2f1b513`). `cargo deny check`: advisories, licenses and sources green; bans red on `sha2` (the relay's `inline_spool_key`, bsv-middleware-cloudflare 0.6.2, bsv-middleware-core 0.3.2) and `hmac` (bsv-middleware-core 0.3.2). No allowance is added here.
+
 ## [0.4.7] - 2026-10-15
 
 - **The load generator on the registry.** `tests/load_gen` pins bsv-rs `=0.6.0` from crates.io (was a path dependency on one machine's checkout) with its own `Cargo.lock`, and takes the BRC-104 length prefix from `bsv_rs::primitives::to_var_int`; the hand-rolled `write_varint` is deleted. Two tests hold the bytes at every varint width and for one request frame. The generator stays its own workspace and is not in the workflow; the relay crate keeps bsv-rs `=0.4.5` (its 0.5.0 re-lock follows the agents' middleware crates).

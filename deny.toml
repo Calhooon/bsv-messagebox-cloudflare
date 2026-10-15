@@ -27,7 +27,7 @@ wildcards = "deny"
 # reason: diagnostic text makes the migration obligation visible.
 deny = [
     # bsv-rs 0.5.0 (8c44ad9): bsv-rs, k256 0.13.4 and p256 0.13.2.
-    { name = "sha2", wrappers = ["bsv-rs", "k256", "p256"], reason = "Use bsv-rs hashing" },
+    { name = "sha2", wrappers = ["bsv-rs", "k256", "p256", "sqlx-core", "sqlx-macros-core", "sqlx-mysql"], reason = "Use bsv-rs hashing; the sqlx family hashes migration files (sqlx-core, sqlx-macros-core under the forced migrate feature) and the MySQL auth handshake (sqlx-mysql), no chain primitive (the owner's word of 2026-10-15: sqlx-core as a sha2 wrapper; its sqlx siblings are the same hashing read from cargo tree -i sha2 --depth 1 in the toolbox)" },
     # bsv-rs 0.5.0 (8c44ad9): bsv-rs alone.
     { name = "ripemd", wrappers = ["bsv-rs"], reason = "Use bsv-rs hashing" },
     # bsv-rs 0.5.0 (8c44ad9): secp256k1 absent; retain bsv-rs alone.
