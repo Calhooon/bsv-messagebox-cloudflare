@@ -4,6 +4,11 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## [0.4.7] - 2026-10-15
+
+- **The load generator on the registry.** `tests/load_gen` pins bsv-rs `=0.6.0` from crates.io (was a path dependency on one machine's checkout) with its own `Cargo.lock`, and takes the BRC-104 length prefix from `bsv_rs::primitives::to_var_int`; the hand-rolled `write_varint` is deleted. Two tests hold the bytes at every varint width and for one request frame. The generator stays its own workspace and is not in the workflow; the relay crate keeps bsv-rs `=0.4.5` (its 0.5.0 re-lock follows the agents' middleware crates).
+- **The deny file.** `deny.toml` is the stack's template, byte for byte (sha256 `ba065ed0...8ed5083`, bsv-stack-lean `stack.toml`). `cargo deny check` is red on the relay crate until its own migration: the relay's direct `sha2` and `hmac`, those of bsv-middleware-cloudflare 0.5.1 and bsv-middleware-core 0.2.1, and `rsa` 0.9.10 (RUSTSEC-2023-0071, no patched release; the FCM JWT signer). No allowance is added here. The workflow runs no deny job.
+
 ## 0.4.6 (2026-10-12)
 
 - Websocket auth failures close with code 1008 and reason `authentication failed; reconnect`, using the ping-timeout teardown. A client can reconnect and re-handshake instead of waiting on a socket that drops every General.
