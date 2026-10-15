@@ -5,25 +5,12 @@
 //! clients use against the bsv-middleware-cloudflare server. Pure
 //! function, no I/O — safe to call repeatedly under fan-out.
 
+use bsv_rs::primitives::to_var_int;
+
 pub const EMPTY_SENTINEL: [u8; 9] = [0xFF; 9];
 
-pub fn write_varint(buf: &mut Vec<u8>, n: u64) {
-    if n <= 252 {
-        buf.push(n as u8);
-    } else if n <= 0xFFFF {
-        buf.push(0xFD);
-        buf.extend_from_slice(&(n as u16).to_le_bytes());
-    } else if n <= 0xFFFF_FFFF {
-        buf.push(0xFE);
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
-    } else {
-        buf.push(0xFF);
-        buf.extend_from_slice(&n.to_le_bytes());
-    }
-}
-
 fn write_varint_bytes(buf: &mut Vec<u8>, data: &[u8]) {
-    write_varint(buf, data.len() as u64);
+    buf.extend_from_slice(&to_var_int(data.len() as u64));
     buf.extend_from_slice(data);
 }
 
@@ -42,7 +29,7 @@ fn write_optional_bytes(buf: &mut Vec<u8>, data: Option<&[u8]>) {
 }
 
 fn write_headers(buf: &mut Vec<u8>, headers: &[(String, String)]) {
-    write_varint(buf, headers.len() as u64);
+    buf.extend_from_slice(&to_var_int(headers.len() as u64));
     for (key, value) in headers {
         write_varint_bytes(buf, key.as_bytes());
         write_varint_bytes(buf, value.as_bytes());
@@ -116,4 +103,47 @@ pub fn build_auth_headers(
         ("x-bsv-auth-signature".into(), signature_hex.into()),
         ("x-bsv-auth-request-id".into(), request_id_b64.into()),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The length prefix at every width boundary, byte for byte as the
+    /// hand-rolled writer emitted it before bsv-rs 0.6.0 became its home.
+    #[test]
+    fn length_prefix_bytes_at_each_width() {
+        let rows: [(u64, &[u8]); 8] = [
+            (0, &[0x00]),
+            (252, &[0xFC]),
+            (253, &[0xFD, 0xFD, 0x00]),
+            (0xFFFF, &[0xFD, 0xFF, 0xFF]),
+            (0x1_0000, &[0xFE, 0x00, 0x00, 0x01, 0x00]),
+            (0xFFFF_FFFF, &[0xFE, 0xFF, 0xFF, 0xFF, 0xFF]),
+            (0x1_0000_0000, &[0xFF, 0, 0, 0, 0, 1, 0, 0, 0]),
+            (u64::MAX, &EMPTY_SENTINEL),
+        ];
+        for (n, want) in rows {
+            assert_eq!(to_var_int(n), want, "length {n}");
+        }
+    }
+
+    #[test]
+    fn request_frame_is_unchanged() {
+        let id = [7u8; 32];
+        let headers = vec![("content-type".to_string(), "application/json".to_string())];
+        let got = serialize_request(
+            &id,
+            "POST",
+            Some("/sendMessage"),
+            None,
+            &headers,
+            Some(b"{}"),
+        );
+        let mut want = id.to_vec();
+        want.extend_from_slice(b"\x04POST\x0c/sendMessage");
+        want.extend_from_slice(&EMPTY_SENTINEL);
+        want.extend_from_slice(b"\x01\x0ccontent-type\x10application/json\x02{}");
+        assert_eq!(got, want);
+    }
 }
