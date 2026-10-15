@@ -337,10 +337,18 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         if !b.box_name.starts_with("broadcast-") {
             return Response::error("box must be broadcast-*", 400);
         }
-        let (subscribers, pushed) = fan_out_broadcast(&env, &b.box_name, &b.body).await;
-        return Response::from_json(
-            &serde_json::json!({ "subscribers": subscribers, "pushed": pushed }),
-        );
+        let t = fan_out_broadcast(&env, &b.box_name, &b.body).await;
+        // bsv-low #668: per-subscriber outcomes so the app layer can count a reached socket apart
+        // from a missed one; `pushed` stays the delivered count (the pre-#668 field).
+        return Response::from_json(&serde_json::json!({
+            "subscribers": t.subscribers,
+            "pushed": t.delivered,
+            "delivered": t.delivered,
+            "noSocket": t.no_socket,
+            "timedOut": t.timed_out,
+            "failed": t.failed,
+            "skipped": t.skipped,
+        }));
     }
 
     if req.path() == "/ws" && is_websocket_upgrade(&req) {
@@ -1480,17 +1488,208 @@ pub(crate) fn ladder_event_push_body(
     )
 }
 
+/// bsv-low #668: one subscriber's delivery outcome in a `/broadcast` fan-out. A refused
+/// `/internal/push` carries the hub's `{delivered, socketioDelivered}` so the caller can tell a
+/// socket that was reached from one that was not, and a cold/hung hub DO from a transport fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PushOutcome {
+    /// The hub answered 2xx and at least one live socket in the room took the frame.
+    Delivered,
+    /// The hub answered 2xx but no live socket had joined the room (`delivered == 0`): the
+    /// subscriber picks the message up on its next `listMessages`. Built only from a real hub answer
+    /// (`classify_push_answer`, wasm); the host lib never constructs it (the pins build it directly).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    NoSocket,
+    /// The per-push [`hub_forward::FORWARD_OP_TIMEOUT_MS`] bound fired (a cold/relocating hub DO):
+    /// the push is dropped and RETRIED once if the fan-out budget allows.
+    TimedOut,
+    /// A transport error or a non-2xx from the hub (not a timeout).
+    Failed,
+    /// Not attempted: the fan-out's wall budget was spent before this subscriber. The client's poll
+    /// belt and the next pot event recover it.
+    Skipped,
+}
+
+/// bsv-low #668: at most this many hub pushes in flight at once (the 16 registry reads' own pattern,
+/// `lib.rs:1500`). The whole room then delivers in about ONE hub round-trip rather than N in series,
+/// and one cold DO can stall at most its own window, never the subscribers behind it.
+pub(crate) const BROADCAST_FANOUT_CONCURRENCY: usize = 32;
+/// bsv-low #668: the fan-out's whole wall budget. Subscribers reached after it is spent are
+/// `Skipped` (recovered by the client poll and the next event). Below the app layer's 20 s announce
+/// wall (`low-app-layer` `ANNOUNCE_WALL_MS`) so a normal room answers inside the announce's window.
+pub(crate) const BROADCAST_FANOUT_WALL_BUDGET_MS: u64 = 15_000;
+/// The hard ceiling on a single fan-out (unchanged from the sequential loop).
+pub(crate) const BROADCAST_FANOUT_CAP: usize = 500;
+
+/// A fan-out's per-subscriber tally (for the `/broadcast` answer and the log line).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FanOut {
+    pub subscribers: usize,
+    pub delivered: u32,
+    pub no_socket: u32,
+    pub timed_out: u32,
+    pub failed: u32,
+    pub skipped: u32,
+}
+
+impl FanOut {
+    fn of(subscribers: usize, outcomes: &[PushOutcome]) -> Self {
+        let mut t = FanOut {
+            subscribers,
+            ..Default::default()
+        };
+        for o in outcomes {
+            match o {
+                PushOutcome::Delivered => t.delivered += 1,
+                PushOutcome::NoSocket => t.no_socket += 1,
+                PushOutcome::TimedOut => t.timed_out += 1,
+                PushOutcome::Failed => t.failed += 1,
+                PushOutcome::Skipped => t.skipped += 1,
+            }
+        }
+        t
+    }
+}
+
+/// bsv-low #668: poll every future of one window CONCURRENTLY, writing each to `out[i]` as it
+/// resolves and dropping it then. On the single-threaded Worker this keeps every hub fetch of the
+/// window in flight at once, so a push that resolves LATE (a cold DO) never holds back the ones that
+/// resolve first. Pure `poll_fn` (the `with_do_op_timeout` idiom), so the pins drive it on the host.
+async fn join_window<Fut>(items: Vec<(usize, Fut)>, out: &mut [PushOutcome])
+where
+    Fut: std::future::Future<Output = PushOutcome>,
+{
+    use std::task::Poll;
+    let mut futs: Vec<Option<(usize, std::pin::Pin<Box<Fut>>)>> = items
+        .into_iter()
+        .map(|(i, f)| Some((i, Box::pin(f))))
+        .collect();
+    let mut remaining = futs.len();
+    std::future::poll_fn(|cx| {
+        for slot in futs.iter_mut() {
+            if let Some((i, f)) = slot {
+                if let Poll::Ready(o) = f.as_mut().poll(cx) {
+                    out[*i] = o;
+                    *slot = None;
+                    remaining -= 1;
+                }
+            }
+        }
+        if remaining == 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+/// bsv-low #668: drive the pushes of `idxs` in windows of `width`, each window concurrent
+/// ([`join_window`]). Before each window, stop if the wall budget is spent (leaving the rest at
+/// their current outcome, `Skipped` on the first pass). `push(i, attempt)` is the caller's one
+/// bounded push.
+async fn drive_windows<F, Fut>(
+    idxs: &[usize],
+    attempt: u32,
+    width: usize,
+    out: &mut [PushOutcome],
+    now: &dyn Fn() -> u64,
+    deadline_ms: u64,
+    push: &F,
+) where
+    F: Fn(usize, u32) -> Fut,
+    Fut: std::future::Future<Output = PushOutcome>,
+{
+    for window in idxs.chunks(width.max(1)) {
+        if now() >= deadline_ms {
+            break;
+        }
+        let items: Vec<(usize, Fut)> = window.iter().map(|&i| (i, push(i, attempt))).collect();
+        join_window(items, out).await;
+    }
+}
+
+/// bsv-low #668: the fan-out POLICY, pure and host-testable. Drive `count` pushes with at most
+/// `width` in flight; a push that times out is retried ONCE (attempt 1) when the budget still has
+/// room. `now`/`deadline_ms` bound the whole fan-out. Each `push(i, attempt)` is the caller's own
+/// per-push-bounded delivery (the Worker wraps the hub fetch in `with_do_op_timeout`).
+pub(crate) async fn fan_out_with<F, Fut>(
+    count: usize,
+    width: usize,
+    now: &dyn Fn() -> u64,
+    deadline_ms: u64,
+    push: F,
+) -> Vec<PushOutcome>
+where
+    F: Fn(usize, u32) -> Fut,
+    Fut: std::future::Future<Output = PushOutcome>,
+{
+    let mut out = vec![PushOutcome::Skipped; count];
+    let all: Vec<usize> = (0..count).collect();
+    drive_windows(&all, 0, width, &mut out, now, deadline_ms, &push).await;
+    // One retry of the timed-out pushes, within the same request, only if the budget allows
+    // (`FORWARD_OP_TIMEOUT_MS` was dropped; a fresh subrequest typically routes to a now-warm DO).
+    //
+    // LOW-1 (lens fold): every broadcast payload MUST be client-idempotent. There is no server
+    // dedup on the hub's `/internal/push` (it is emit-only, unlike the forward path's
+    // `INSERT OR IGNORE` on a unique key), and a push the per-push bound recorded as `TimedOut`
+    // may have LANDED on the platform before the bound dropped the answer, so this one retry can
+    // double-emit to a live socket. Only `TimedOut` is retried: a transport `Failed` (a non-2xx or
+    // connection error) is NOT, because a non-2xx is deterministic (a retry repeats it) and a
+    // transient transport error is left to the client's poll belt.
+    let retry: Vec<usize> = (0..count)
+        .filter(|&i| out[i] == PushOutcome::TimedOut)
+        .collect();
+    if !retry.is_empty() && now() < deadline_ms {
+        drive_windows(&retry, 1, width, &mut out, now, deadline_ms, &push).await;
+    }
+    out
+}
+
+/// Classify one hub `/internal/push` answer (bsv-low #668): a non-2xx is `Failed`; a 2xx with at
+/// least one socket reached is `Delivered`, else `NoSocket` (an unparseable 2xx body counts as
+/// delivered, the pre-#668 contract: the push landed).
+#[cfg(target_arch = "wasm32")]
+async fn classify_push_answer(resp: &mut Response) -> PushOutcome {
+    let code = resp.status_code();
+    if !(200..300).contains(&code) {
+        return PushOutcome::Failed;
+    }
+    match resp.json::<serde_json::Value>().await {
+        Ok(v) => {
+            let reached =
+                v["delivered"].as_u64().unwrap_or(0) + v["socketioDelivered"].as_u64().unwrap_or(0);
+            if reached >= 1 {
+                PushOutcome::Delivered
+            } else {
+                PushOutcome::NoSocket
+            }
+        }
+        Err(_) => PushOutcome::Delivered,
+    }
+}
+
 /// Fan ONE body into every subscriber's own `<identity>-<box_name>` room
 /// (the `/broadcast` route's core, shared with the hub's lobby-departure
-/// producer). Returns `(subscribers, pushed)`. Best-effort per hub; a shard
-/// read failure is logged as a partial fan-out.
+/// producer). bsv-low #668: the fan-out is BOUNDED-CONCURRENT ([`fan_out_with`]), each hub push
+/// bounded by [`hub_forward::FORWARD_OP_TIMEOUT_MS`] (so one cold/hung hub DO cannot stall the
+/// subscribers behind it) and retried once on a timeout; the whole fan-out is bounded by
+/// [`BROADCAST_FANOUT_WALL_BUDGET_MS`]. Returns the per-subscriber [`FanOut`] tally. Best-effort per
+/// hub; a shard read failure is logged as a partial fan-out.
+///
+/// CONSTRAINT (lens LOW-1): this is a SHARED primitive (the pots announce and the lobby host-left
+/// both fan through it), and every payload fanned here MUST be client-idempotent. There is no
+/// server dedup on the hub's `/internal/push` (it is emit-only), and the one retry of a `TimedOut`
+/// push can double-emit to a live socket (the first attempt may have landed before the per-push
+/// bound dropped it). Both current payloads satisfy this (pots dedup on `intentId` and re-read
+/// rows; a duplicate lobby `peerGone` is a no-op); a new caller must too.
 pub(crate) async fn fan_out_broadcast(
     env: &Env,
     box_name: &str,
     body: &serde_json::Value,
-) -> (usize, u32) {
+) -> FanOut {
     let Ok(reg) = env.durable_object("BROADCAST_REGISTRY") else {
-        return (0, 0);
+        return FanOut::default();
     };
     // 16 nibble-shards, read in parallel (see the join-notify twin).
     let mut shard_futs = Vec::new();
@@ -1519,32 +1718,8 @@ pub(crate) async fn fan_out_broadcast(
         }
     }
     let Ok(namespace) = env.durable_object("MESSAGE_HUB") else {
-        return (identities.len(), 0);
+        return FanOut::of(identities.len(), &[]);
     };
-    let message_id = format!("bcast-{}", Date::now().as_millis());
-    let mut delivered_to = 0u32;
-    const BROADCAST_FANOUT_CAP: usize = 500;
-    for identity in identities.iter().take(BROADCAST_FANOUT_CAP) {
-        let Ok(stub) = namespace.id_from_name(identity).and_then(|i| i.get_stub()) else {
-            continue;
-        };
-        let push = serde_json::json!({
-            "roomId": format!("{identity}-{box_name}"),
-            "sender": "broadcast-producer",
-            "messageId": message_id,
-            "body": body,
-        })
-        .to_string();
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post);
-        init.with_body(Some(push.into()));
-        let Ok(preq) = Request::new_with_init("https://hub/internal/push", &init) else {
-            continue;
-        };
-        if stub.fetch_with_request(preq).await.is_ok() {
-            delivered_to += 1;
-        }
-    }
     if identities.len() > BROADCAST_FANOUT_CAP {
         console_log!(
             "broadcast {box_name}: fan-out CAPPED at {} of {} subscribers (scale note: shard)",
@@ -1552,7 +1727,78 @@ pub(crate) async fn fan_out_broadcast(
             identities.len()
         );
     }
-    (identities.len(), delivered_to)
+    identities.truncate(BROADCAST_FANOUT_CAP);
+    let message_id = format!("bcast-{}", Date::now().as_millis());
+    let deadline_ms = Date::now().as_millis() + BROADCAST_FANOUT_WALL_BUDGET_MS;
+    let now = || Date::now().as_millis();
+    // Capture by shared reference (all Copy), so each concurrent push future holds its own copy.
+    let identities_ref = &identities;
+    let message_id_ref = message_id.as_str();
+    let namespace_ref = &namespace;
+    let push = move |i: usize, _attempt: u32| async move {
+        let identity = &identities_ref[i];
+        let Ok(stub) = namespace_ref
+            .id_from_name(identity)
+            .and_then(|i| i.get_stub())
+        else {
+            return PushOutcome::Failed;
+        };
+        let push = serde_json::json!({
+            "roomId": format!("{identity}-{box_name}"),
+            "sender": "broadcast-producer",
+            "messageId": message_id_ref,
+            "body": body,
+        })
+        .to_string();
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post);
+        init.with_body(Some(push.into()));
+        let Ok(preq) = Request::new_with_init("https://hub/internal/push", &init) else {
+            return PushOutcome::Failed;
+        };
+        #[cfg(target_arch = "wasm32")]
+        {
+            match crate::hub_forward::with_do_op_timeout(
+                stub.fetch_with_request(preq),
+                crate::hub_forward::FORWARD_OP_TIMEOUT_MS,
+            )
+            .await
+            {
+                Ok(mut resp) => classify_push_answer(&mut resp).await,
+                Err(e) if crate::hub_forward::is_op_timeout(&e) => PushOutcome::TimedOut,
+                Err(_) => PushOutcome::Failed,
+            }
+        }
+        // On the host target there is no JS event loop to drive `Delay`; the push POLICY
+        // (concurrency, timeout retry, budget) is pinned on `fan_out_with` with injected outcomes,
+        // never a real hub fetch.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (preq, stub);
+            PushOutcome::Delivered
+        }
+    };
+    let outcomes = fan_out_with(
+        identities.len(),
+        BROADCAST_FANOUT_CONCURRENCY,
+        &now,
+        deadline_ms,
+        push,
+    )
+    .await;
+    let t = FanOut::of(identities.len(), &outcomes);
+    if t.timed_out > 0 || t.failed > 0 || t.skipped > 0 {
+        console_log!(
+            "broadcast {box_name}: fan-out {} subscriber(s) → delivered={} noSocket={} timedOut={} failed={} skipped={}",
+            t.subscribers,
+            t.delivered,
+            t.no_socket,
+            t.timed_out,
+            t.failed,
+            t.skipped
+        );
+    }
+    t
 }
 
 /// Split a `/push` body into the producer's identity (`sender`, a compressed
@@ -2202,6 +2448,237 @@ mod session_attest_tests {
         assert!(
             route.contains("hub-unavailable") && route.contains("with_status(503)"),
             "a dead hub is 503, never a refusal"
+        );
+    }
+}
+
+/// bsv-low #668: the `/broadcast` fan-out is BOUNDED-CONCURRENT with a per-push timeout, a one-shot
+/// retry of the timed-out pushes and a whole-fan-out wall budget. These pin the pure policy
+/// ([`fan_out_with`], host-drivable) and the source shape; the real hub fetch is wasm-only.
+#[cfg(test)]
+mod fanout_668_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
+
+    /// A push future that resolves only on its `polls_needed`-th poll, recording its completion
+    /// order. Between polls it self-wakes so the executor re-polls it. Lets a host test distinguish
+    /// a CONCURRENT driver (every window future polled each round) from a SEQUENTIAL one (each
+    /// awaited to completion before the next starts).
+    struct Counted {
+        idx: usize,
+        polls_needed: u32,
+        polled: u32,
+        outcome: PushOutcome,
+        completed: Rc<RefCell<Vec<usize>>>,
+    }
+    impl Future for Counted {
+        type Output = PushOutcome;
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<PushOutcome> {
+            self.polled += 1;
+            if self.polled >= self.polls_needed {
+                let idx = self.idx;
+                self.completed.borrow_mut().push(idx);
+                Poll::Ready(self.outcome)
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    // RED on a SEQUENTIAL loop (`for identity { stub.fetch().await }`): there, a cold subscriber
+    // (index 0, three polls to resolve) would be awaited to completion BEFORE the others start, so
+    // the others would finish AFTER it. Under the bounded-concurrent driver every push of the
+    // window is in flight at once, so the fast ones (one poll) finish while the slow one is still
+    // pending: the slow one completes LAST and never stalled them.
+    #[tokio::test]
+    async fn a_slow_push_does_not_stall_the_window() {
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let c = completed.clone();
+        let out = fan_out_with(3, 32, &|| 0, u64::MAX, move |i, _attempt| Counted {
+            idx: i,
+            polls_needed: if i == 0 { 3 } else { 1 },
+            polled: 0,
+            outcome: PushOutcome::Delivered,
+            completed: c.clone(),
+        })
+        .await;
+        assert_eq!(
+            out,
+            vec![PushOutcome::Delivered; 3],
+            "every subscriber is delivered despite the slow one"
+        );
+        let order = completed.borrow().clone();
+        assert_eq!(order.len(), 3);
+        assert_eq!(
+            order.last(),
+            Some(&0),
+            "the slow push (index 0) completes LAST — the fast ones were not awaited behind it"
+        );
+        assert!(
+            order[..2].contains(&1) && order[..2].contains(&2),
+            "the two fast pushes completed before the slow one"
+        );
+    }
+
+    // The per-push timeout is retried ONCE: a cold DO (index 1) times out on attempt 0 and a fresh
+    // subrequest (attempt 1) lands; a push that never answers stays TimedOut; a delivered push is
+    // never retried; and the timed-out one never changed the others' outcomes.
+    #[tokio::test]
+    async fn a_timed_out_push_is_retried_once_within_budget() {
+        let calls: Rc<Vec<Cell<u32>>> = Rc::new((0..3).map(|_| Cell::new(0)).collect());
+        let c = calls.clone();
+        let out = fan_out_with(3, 32, &|| 0, u64::MAX, move |i, attempt| {
+            c[i].set(c[i].get() + 1);
+            async move {
+                match i {
+                    // the cold DO: a timeout the first time, a warm instance on the retry.
+                    1 if attempt == 0 => PushOutcome::TimedOut,
+                    1 => PushOutcome::Delivered,
+                    // index 2 is cold for good: it stays timed out after the one retry.
+                    2 => PushOutcome::TimedOut,
+                    _ => PushOutcome::Delivered,
+                }
+            }
+        })
+        .await;
+        assert_eq!(out[0], PushOutcome::Delivered, "fast push, untouched");
+        assert_eq!(out[1], PushOutcome::Delivered, "recovered on the one retry");
+        assert_eq!(out[2], PushOutcome::TimedOut, "still cold after the retry");
+        assert_eq!(calls[0].get(), 1, "a delivered push is never retried");
+        assert_eq!(calls[1].get(), 2, "the recovered push was pushed twice");
+        assert_eq!(
+            calls[2].get(),
+            2,
+            "the stubborn timeout was retried once, then reported"
+        );
+    }
+
+    // LOW-1 (lens fold): the one retry can DOUBLE-EMIT, and only client idempotency absorbs it. A
+    // cold push whose first attempt LANDED on the hub but was dropped by the per-push bound is
+    // recorded `TimedOut` and retried; `/internal/push` is emit-only (no `messageId` dedup), so the
+    // live socket sees the same frame TWICE. This pins the constraint recorded at `fan_out_broadcast`
+    // and the retry: two server emits, one effective delivery once a client dedups on the message id.
+    #[tokio::test]
+    async fn the_retry_can_double_emit_and_only_client_dedup_absorbs_it() {
+        // The hub's live-socket emit log: a push that REACHES the hub appends the frame's id, dedup
+        // or not. The first attempt lands AND times out (the bound dropped the answer, not the emit).
+        let emits: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let e = emits.clone();
+        let out = fan_out_with(1, 32, &|| 0, u64::MAX, move |_i, attempt| {
+            let e = e.clone();
+            async move {
+                e.borrow_mut().push("bcast-1");
+                if attempt == 0 {
+                    PushOutcome::TimedOut
+                } else {
+                    PushOutcome::Delivered
+                }
+            }
+        })
+        .await;
+        assert_eq!(out[0], PushOutcome::Delivered, "recovered on the one retry");
+        assert_eq!(
+            emits.borrow().len(),
+            2,
+            "the frame reached the socket TWICE: no server dedup on /internal/push"
+        );
+        let seen: std::collections::HashSet<&str> = emits.borrow().iter().copied().collect();
+        assert_eq!(
+            seen.len(),
+            1,
+            "a client dedup on the message id collapses the double-emit to one delivery"
+        );
+    }
+
+    // The whole fan-out is bounded by its wall budget: once the clock passes the deadline, the
+    // subscribers not yet reached are Skipped (the client poll and the next event recover them),
+    // and a Skipped push is NOT retried (only TimedOut is).
+    #[tokio::test]
+    async fn the_budget_skips_the_subscribers_past_the_wall() {
+        // A clock that advances 10 units per read; width 1 so each subscriber is its own window.
+        let clock = Cell::new(0u64);
+        let now = || {
+            let t = clock.get();
+            clock.set(t + 10);
+            t
+        };
+        let out = fan_out_with(10, 1, &now, 25, move |_i, _attempt| async move {
+            PushOutcome::Delivered
+        })
+        .await;
+        let delivered = out.iter().filter(|o| **o == PushOutcome::Delivered).count();
+        let skipped = out.iter().filter(|o| **o == PushOutcome::Skipped).count();
+        assert!(
+            (1..10).contains(&delivered),
+            "some delivered, the rest skipped"
+        );
+        assert_eq!(
+            delivered + skipped,
+            10,
+            "every subscriber is delivered or skipped"
+        );
+        assert!(
+            skipped > 0,
+            "the budget stopped the fan-out short of the whole room"
+        );
+    }
+
+    // The per-subscriber tally counts each outcome kind (the `/broadcast` answer's shape).
+    #[test]
+    fn the_tally_counts_each_outcome() {
+        let t = FanOut::of(
+            6,
+            &[
+                PushOutcome::Delivered,
+                PushOutcome::Delivered,
+                PushOutcome::NoSocket,
+                PushOutcome::TimedOut,
+                PushOutcome::Failed,
+                PushOutcome::Skipped,
+            ],
+        );
+        assert_eq!(t.subscribers, 6);
+        assert_eq!(t.delivered, 2);
+        assert_eq!(t.no_socket, 1);
+        assert_eq!(t.timed_out, 1);
+        assert_eq!(t.failed, 1);
+        assert_eq!(t.skipped, 1);
+    }
+
+    // Source shape (RED on the pre-#668 sequential loop): the fan-out no longer awaits each hub push
+    // inside a bare `for identity` loop; it drives through `fan_out_with` and bounds each push with
+    // `with_do_op_timeout`. The old loop's `stub.fetch_with_request(preq).await.is_ok()` is gone.
+    #[test]
+    fn the_fan_out_is_bounded_concurrent_not_a_sequential_loop() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("pub(crate) async fn fan_out_broadcast(")
+            .expect("the fan-out");
+        let end = src[start..]
+            .find("pub(crate) fn is_first_party_box(")
+            .expect("the next item")
+            + start;
+        let body = &src[start..end];
+        assert!(
+            body.contains("fan_out_with("),
+            "the fan-out drives the bounded-concurrent policy"
+        );
+        assert!(
+            body.contains("with_do_op_timeout("),
+            "each hub push is bounded by the forward op timeout"
+        );
+        assert!(
+            body.contains("BROADCAST_FANOUT_WALL_BUDGET_MS"),
+            "the whole fan-out is wall-bounded"
+        );
+        assert!(
+            !body.contains("stub.fetch_with_request(preq).await.is_ok()"),
+            "the pre-#668 sequential await-each-push loop is gone"
         );
     }
 }

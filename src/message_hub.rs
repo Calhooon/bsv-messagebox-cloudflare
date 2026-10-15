@@ -269,11 +269,32 @@ const REJOIN_DEADLINE_PREFIX: &str = "rejoindeadline:";
 const PENDING_LEFT_PREFIX: &str = "pendingleft:";
 /// `presence_told:<room>` — what this hub LAST TOLD ITS OWNER about the
 /// room's counterparty (`present` / `absent`). The arrival/departure events
-/// (`peerJoined` / `peerLeft`) and the join-time snapshot all flow through
-/// `told_transition`, so the owner hears a change exactly once — a second
-/// tab joining, a flap the debounce absorbed, or a duplicate cross-DO push
-/// emits nothing. Storage, not attachment: it is per ROOM, not per socket.
+/// (`peerJoined` / `peerLeft`) flow through `told_transition`, so the owner
+/// hears a change exactly once — a second tab joining, a flap the debounce
+/// absorbed, or a duplicate cross-DO push emits nothing. Storage, not
+/// attachment: it is per ROOM, not per socket. Since LOW #85 the join-time
+/// SNAPSHOT no longer writes it: the told-state is PUSH-driven only (a
+/// self-read on a re-listen must never be the thing that records the peer
+/// absent).
 const PRESENCE_TOLD_PREFIX: &str = "presence_told:";
+
+/// `confirmed_gone:<room>` — this hub's OWN-room confirmed-departure marker
+/// (LOW #85, loop 29). DISTINCT from `presence_told:` on purpose: that key
+/// is the owner's view of the PEER (written by the counterparty's
+/// `peerLeft`/`peerJoined` pushes, read by the parked-replay path), whereas
+/// THIS key is a fact about the owner's OWN room as read back by a peer's
+/// `/internal/presence` GET (`handle_presence` answers about this hub's own
+/// occupancy). Written `Absent` by the ONE place a close is confirmed —
+/// `run_departure_debounce_alarm`, when the trailing re-check finds the room
+/// STILL empty — and `Present` (cleared) on a join to the room. Read by
+/// `presence_answer`: an empty room is `false` only when this marker is
+/// `Absent`; every other empty state is `None` (no signal). Reuses the
+/// `ToldPresence` value type but NEVER the `presence_told:` key (sharing it
+/// would corrupt the peer-view dedupe). Same unbounded-by-TTL lifecycle as
+/// `presence_told:`/`lastseen:` — cleared on re-join, never swept (DO
+/// storage has no TTL primitive in this crate; the design's "expiry with the
+/// idle window" has no counterpart here, so the marker follows its siblings).
+const CONFIRMED_GONE_PREFIX: &str = "confirmed_gone:";
 
 /// Trailing debounce window for the peer-left push. Must comfortably
 /// exceed the watchdog's self-heal gap (~1-2s) while adding only a small
@@ -1044,6 +1065,11 @@ impl MessageHub {
                 }
                 // Advisory heartbeat: a join is a high-signal room touch.
                 self.stamp_last_seen(&room_id).await;
+                // LOW #85: the owner is present in its OWN room again — clear any
+                // confirmed-gone marker so a prior close never leaks into a later
+                // flap's snapshot (`presence_answer` reads this marker).
+                self.write_confirmed_gone(&room_id, ToldPresence::Present)
+                    .await;
                 emit_joined_room(ws, &room_id)?;
                 // #410 (bsv-low, 2026-08-25) — the JOIN HELLO. LOW's client is
                 // HTTP-first until a WS-DELIVERED frame proves the socket
@@ -1384,6 +1410,10 @@ impl MessageHub {
                 .await;
                 // Advisory heartbeat: a join is a high-signal room touch.
                 self.stamp_last_seen(&room_id).await;
+                // LOW #85: clear the OWN-room confirmed-gone marker on join (as the
+                // raw-WS path does) — the owner is present in its own room again.
+                self.write_confirmed_gone(&room_id, ToldPresence::Present)
+                    .await;
                 // P2 (2026-09-02): the socket.io path gets what the raw path
                 // gets — the join hello (#410; it was raw-WS only, so LOW's
                 // socket.io seats never received it and played http-first
@@ -2099,14 +2129,14 @@ impl MessageHub {
         // watcher re-probes presence and its own confirm window decides.
         if crate::is_lobby_room(room) {
             if let Some(body) = crate::lobby_departure_body(room, leaver, Date::now().as_millis()) {
-                let (subscribers, pushed) =
+                let t =
                     crate::fan_out_broadcast(&self.env, crate::LOBBY_BROADCAST_BOX, &body).await;
                 console_log!(
                     "MessageHub: lobby host-left {} (room {}) → {} of {} lobby subscribers",
                     leaver,
                     room,
-                    pushed,
-                    subscribers
+                    t.delivered,
+                    t.subscribers
                 );
             }
             return;
@@ -2270,6 +2300,11 @@ impl MessageHub {
                 .await;
             let still_occupied = self.room_still_occupied(&room, None, None).await;
             if departure_push_due(still_occupied) {
+                // LOW #85: THE one place a close is CONFIRMED. Stamp the OWN-room
+                // confirmed-gone marker so a peer's later `/internal/presence` GET
+                // reads `false` (a real departure), then push. A suppressed flap
+                // (below) writes nothing, so its snapshot stays `None`.
+                self.write_confirmed_gone(&room, ToldPresence::Absent).await;
                 self.push_peer_left(&room, &entry.leaver).await;
             } else {
                 console_log!(
@@ -2652,6 +2687,35 @@ impl MessageHub {
         }
     }
 
+    /// LOW #85: the OWN-room confirmed-departure marker (`CONFIRMED_GONE_PREFIX`).
+    /// `Some(Absent)` = this room's last departure was CONFIRMED still-gone by the
+    /// debounce; `Some(Present)` = cleared by a join; `None` = never confirmed.
+    async fn read_confirmed_gone(&self, room: &str) -> Option<ToldPresence> {
+        let v: Option<String> = self
+            .state
+            .storage()
+            .get(&format!("{CONFIRMED_GONE_PREFIX}{room}"))
+            .await
+            .ok()
+            .flatten();
+        told_from_str(v.as_deref())
+    }
+
+    /// Stamp the OWN-room confirmed-departure marker. `Absent` only from the
+    /// confirm path (`run_departure_debounce_alarm`); `Present` on a join
+    /// (clears a stale `Absent` so a later flap never reads a prior close).
+    /// Best-effort: never fails the caller's path.
+    async fn write_confirmed_gone(&self, room: &str, marker: ToldPresence) {
+        if let Err(e) = self
+            .state
+            .storage()
+            .put(&format!("{CONFIRMED_GONE_PREFIX}{room}"), marker.as_str())
+            .await
+        {
+            console_log!("MessageHub: confirmed_gone put failed for {room}: {e}");
+        }
+    }
+
     /// `/internal/peer-joined` — the counterparty's hub says they ARRIVED in
     /// the shared conversation. Mirror of `handle_peer_left`: fan `peerJoined`
     /// to this owner's sessions (raw sockets joined to the room; socket.io
@@ -2795,9 +2859,11 @@ impl MessageHub {
     /// The `presence` snapshot for a JOINING socket: the counterparty's live
     /// occupancy asked ONCE, hub-to-hub, at join time. Unknown peer (no
     /// envelope exchanged yet) ⇒ `identityKey: null, present: null` — an
-    /// explicit "nothing learned", never a guessed absence. Records the
-    /// told-state so the following `peerJoined`/`peerLeft` dedupe against
-    /// what the owner has actually seen.
+    /// explicit "nothing learned", never a guessed absence. Since LOW #85 it
+    /// READS only: it never writes this hub's told-state (that is push-driven
+    /// now), and the peer's hub decides `present` with its own confirmed-gone
+    /// marker (`presence_answer`), so a re-listen's self-read can neither claim
+    /// an absence nor dedupe a real push.
     async fn presence_snapshot(&self, room: &str) -> Value {
         let key = format!("{PEER_BY_ROOM_PREFIX}{room}");
         let peer: Option<String> = self.state.storage().get(&key).await.ok().flatten();
@@ -2824,10 +2890,11 @@ impl MessageHub {
         let present = v.get("present").and_then(Value::as_bool);
         let last_seen = v.get("lastSeenMs").and_then(Value::as_u64);
         let rejoin_deadline = v.get("rejoinDeadlineMs").and_then(Value::as_u64);
-        if let Some(p) = present {
-            let (_, next) = told_transition(self.read_told(room).await, p);
-            self.write_told(room, next).await;
-        }
+        // LOW #85: the snapshot READS the peer's occupancy and delivers it to the
+        // joining socket, but NO LONGER writes this hub's told-state. The told-state
+        // is push-driven only (`peerJoined`/`peerLeft`); a self-read on a re-listen
+        // must never record the peer absent and dedupe the real push behind it (the
+        // loop-13 hazard). The peer's own confirmed-gone marker now gates `false`.
         presence_snapshot_json(room, Some(&peer), present, last_seen, rejoin_deadline)
     }
 
@@ -2842,13 +2909,12 @@ impl MessageHub {
             return Response::error("presence requires ?room=<roomId>", 400);
         }
         let occupied = self.room_still_occupied(&room, None, None).await;
-        // 0.3.25 (bsv-low loop 13, survivorLooksOnly): a room that just EMPTIED is undecided until its departure
-        // debounce has run — the same window the `peerLeft` push waits (`PENDING_LEFT_PREFIX`, `PEER_LEFT_DEBOUNCE_MS`).
-        // A join-time snapshot read inside that window used to answer `present: false` for a peer mid-re-listen
-        // (a leave + rejoin within a second: the client's transport watchdog; bsv-low #491), and the OWNER's hub
-        // then wrote told=absent from that answer and deduped the real push behind it — so the one time the
-        // answer was true (a killed peer) the snapshot was the only delivery, and the one time it was false
-        // (a flap) it painted a departure. Undecided answers `null`: nothing learned, no told-state written.
+        // 0.3.25 (bsv-low loop 13) + LOW #85 (loop 29): a room that just EMPTIED is undecided until its
+        // departure debounce has CONFIRMED the close — the same window the `peerLeft` push waits
+        // (`PENDING_LEFT_PREFIX`, `PEER_LEFT_DEBOUNCE_MS`). A join-time snapshot read inside that window, OR on
+        // an overdue/stranded pending (a lost alarm), answers `null` — a peer mid-re-listen (leave + rejoin
+        // within a second: the client's transport watchdog; bsv-low #491/#258) is never painted absent. `false`
+        // is a CONFIRMED close only (`confirmed_gone=Absent`, below).
         let pending: Option<PendingPeerLeft> = if occupied {
             None
         } else {
@@ -2859,7 +2925,33 @@ impl MessageHub {
                 .ok()
                 .flatten()
         };
-        let present = presence_answer(occupied, pending.as_ref(), Date::now().as_millis());
+        // LOW #85: an empty room answers `false` ONLY when its OWN-room close was
+        // CONFIRMED (the debounce fired still-empty, `confirmed_gone=Absent`). An
+        // overdue pending or an unmarked empty room is `None` — no signal.
+        let confirmed_gone: Option<ToldPresence> = if occupied {
+            None
+        } else {
+            self.read_confirmed_gone(&room).await
+        };
+        // LOW #85 belt: an OVERDUE pending here is a lost alarm whose confirming
+        // re-check (push-or-suppress) has not run. `fetch` already runs the
+        // guarded (2 s) re-arm net on every hub event, but that guard can skip a
+        // presence GET landing just behind another event; pull this room's stranded
+        // check in directly — unguarded, cheap (the pending is already in hand), and
+        // only on the rare overdue case. The answer stays `None` until it runs.
+        if let Some(p) = pending.as_ref() {
+            if !occupied
+                && Date::now().as_millis() > p.due_at_ms.saturating_add(PEER_LEFT_DEBOUNCE_MS)
+            {
+                self.ensure_alarm_no_later_than(p.due_at_ms).await;
+            }
+        }
+        let present = presence_answer(
+            occupied,
+            pending.as_ref(),
+            confirmed_gone,
+            Date::now().as_millis(),
+        );
         // Advisory last-seen: read `lastseen:<room>` (u64 millis) and
         // thread it through ONLY when present. A missing/unreadable key
         // omits the field entirely — never 0/null, never a false claim.
@@ -2972,19 +3064,41 @@ fn presence_body_json(
     body
 }
 
-/// Pure core of the `/internal/presence` answer (0.3.25, bsv-low loop 13): a live session in the room is
-/// `Some(true)`; an EMPTY room whose departure debounce is still running (`pendingleft:<room>` stored, its
-/// trailing check not yet overdue by a whole window) is `None` — undecided, the flap window the `peerLeft`
-/// push itself waits, so a snapshot read during a peer's re-listen never claims an absence and never writes a
-/// told-state the real push would then dedupe against; an empty room past that (no pending entry, or one a
-/// whole window overdue — a lost alarm the fetch-time re-arm net is already pushing) is `Some(false)`.
-fn presence_answer(occupied: bool, pending: Option<&PendingPeerLeft>, now_ms: u64) -> Option<bool> {
+/// Pure core of the `/internal/presence` answer. A live session in the room is
+/// `Some(true)`. An EMPTY room is `Some(false)` ONLY when the relay has
+/// CONFIRMED a close (`confirmed_gone == Some(Absent)`: the departure debounce
+/// fired with the room STILL empty, the same bar the `peerLeft` push clears);
+/// every other empty state is `None` — no signal, never a fabricated absence:
+///   - a departure debounce still running (`pendingleft:<room>` stored, not yet
+///     overdue by a whole window) — the 0.3.25 flap window the `peerLeft` push
+///     itself waits, so a snapshot read during a peer's re-listen never claims
+///     an absence;
+///   - an OVERDUE/stranded pending (a lost alarm the re-arm net is pulling in) —
+///     its confirming re-check (push-or-suppress) has NOT run, so answering
+///     `false` would pre-empt the very check that may say "flap, suppress"
+///     (LOW #85, loop 29: the false-away on a live, re-joining peer);
+///   - an empty room with no pending and no confirmed-gone marker — nothing
+///     confirms a departure.
+///
+/// A genuinely killed peer is still caught: its debounce fires still-empty →
+/// `confirmed_gone = Absent` → a survivor joining later reads `false`.
+fn presence_answer(
+    occupied: bool,
+    pending: Option<&PendingPeerLeft>,
+    confirmed_gone: Option<ToldPresence>,
+    now_ms: u64,
+) -> Option<bool> {
     if occupied {
         return Some(true);
     }
-    match pending {
-        Some(p) if now_ms <= p.due_at_ms.saturating_add(PEER_LEFT_DEBOUNCE_MS) => None,
-        _ => Some(false),
+    if let Some(p) = pending {
+        if now_ms <= p.due_at_ms.saturating_add(PEER_LEFT_DEBOUNCE_MS) {
+            return None; // inside the flap window — undecided (0.3.25)
+        }
+    }
+    match confirmed_gone {
+        Some(ToldPresence::Absent) => Some(false), // a CONFIRMED close
+        _ => None,                                 // nothing confirms a departure
     }
 }
 
@@ -3362,41 +3476,91 @@ mod tests {
         assert!(net < teardown, "the net runs before the error's teardown");
     }
 
+    /// LOW #85 (loop 29, 2026-10-15), pin 4: the presence path pulls in the
+    /// confirming re-check for an OVERDUE (lost-alarm) pending directly, so a
+    /// stranded departure's push-or-suppress runs promptly instead of waiting
+    /// for the next unrelated hub event (the `fetch`-level re-arm net is 2 s
+    /// guarded and can skip a presence GET that lands just behind another
+    /// event). A source pin: the targeted re-arm call lives in `handle_presence`.
     #[test]
-    fn presence_answer_is_undecided_inside_the_departure_debounce_and_absent_past_it() {
-        // bsv-low loop 13 (2026-09-20): the join-time snapshot read 4 s after a kill said `false` while the
-        // debounced push was 50 ms away, the owner's hub wrote told=absent from it and deduped the push;
-        // loop 12 (#491) read `false` for a peer mid-re-listen. Both are the same missing window.
+    fn handle_presence_rearms_an_overdue_departure_for_this_room() {
+        let src = include_str!("message_hub.rs");
+        let h = src
+            .find("async fn handle_presence(")
+            .expect("the presence handler");
+        // Bound the body at `handle_presence`'s OWN close (the first 4-space
+        // `}` after it), not the impl close, so a method added after it can
+        // never false-green this pin.
+        let hbody = &src[h..h + src[h..].find("\n    }\n").expect("the fn close")];
+        assert!(
+            hbody.contains("self.ensure_alarm_no_later_than("),
+            "LOW #85: handle_presence must pull in an overdue pending's re-check"
+        );
+    }
+
+    /// LOW #85 (loop 29, 2026-10-15), pins 1/2/3 — the design's table line for
+    /// line. `false` is a CONFIRMED close only (`confirmed_gone=Absent`); every
+    /// unconfirmed empty state is `None`. RED on `419bf18`: the overdue-pending
+    /// and no-pending rows answered `Some(false)` (the false-away on a live,
+    /// re-joining peer); the prior loop-13 pin asserted that leak as correct.
+    #[test]
+    fn presence_answer_is_null_unless_the_departure_was_confirmed() {
+        use ToldPresence::*;
         let armed = arm_departure_debounce("02bb", 10_000); // trailing check due at 14_000
+        let overdue = 14_001 + PEER_LEFT_DEBOUNCE_MS;
+
+        // A live session wins regardless of any marker.
         assert_eq!(
-            presence_answer(true, Some(&armed), 10_500),
+            presence_answer(true, Some(&armed), None, 10_500),
+            Some(true)
+        );
+        assert_eq!(
+            presence_answer(true, None, Some(Absent), 10_500),
             Some(true),
-            "a live session wins"
+            "a live socket beats a stale confirmed-gone marker (a re-join)"
         );
+
+        // Inside the debounce window: undecided (0.3.25, unchanged).
+        assert_eq!(presence_answer(false, Some(&armed), None, 10_500), None);
+        assert_eq!(presence_answer(false, Some(&armed), None, 14_000), None);
         assert_eq!(
-            presence_answer(false, Some(&armed), 10_500),
-            None,
-            "inside the window: undecided"
-        );
-        assert_eq!(
-            presence_answer(false, Some(&armed), 14_000),
-            None,
-            "at the due time: the alarm is running"
-        );
-        assert_eq!(
-            presence_answer(false, Some(&armed), 14_000 + PEER_LEFT_DEBOUNCE_MS),
+            presence_answer(false, Some(&armed), None, 14_000 + PEER_LEFT_DEBOUNCE_MS),
             None,
             "a late alarm gets one more window"
         );
+
+        // PIN 3 — an OVERDUE/stranded pending (a lost alarm) is undecided, NOT a
+        // confirmed close (RED on 419bf18: Some(false)). This is the loop-29 churn.
         assert_eq!(
-            presence_answer(false, Some(&armed), 14_001 + PEER_LEFT_DEBOUNCE_MS),
-            Some(false),
-            "a stranded entry is a lost alarm: the absence is real and the re-arm net is pushing it"
+            presence_answer(false, Some(&armed), None, overdue),
+            None,
+            "overdue pending, no confirmed marker: the re-check has not run — undecided"
+        );
+        // PIN 1 — empty, no pending, no confirmed marker is undecided (RED on
+        // 419bf18: Some(false)). The live re-joining peer whose churn left no marker.
+        assert_eq!(
+            presence_answer(false, None, None, 10_500),
+            None,
+            "no pending, no confirmed marker: nothing confirms a departure — undecided"
         );
         assert_eq!(
-            presence_answer(false, None, 10_500),
+            presence_answer(false, None, Some(Present), 10_500),
+            None,
+            "a Present (cleared) marker is not a close — undecided"
+        );
+
+        // PIN 2 — a CONFIRMED close (the debounce fired still-empty → Absent) is
+        // the ONLY `false`; a killed peer is still caught. Also an overdue pending
+        // ATOP a prior confirmed marker stands as the confirmed close.
+        assert_eq!(
+            presence_answer(false, None, Some(Absent), 10_500),
             Some(false),
-            "no pending entry: a settled absence"
+            "a confirmed close: the killed-peer signal a survivor must learn"
+        );
+        assert_eq!(
+            presence_answer(false, Some(&armed), Some(Absent), overdue),
+            Some(false),
+            "overdue pending but a prior confirmed close stands"
         );
     }
 
@@ -3922,6 +4086,9 @@ mod tests {
         sessions: BTreeMap<String, u32>,
         /// Models the `pendingleft:<room>` storage entries.
         pending: BTreeMap<String, PendingPeerLeft>,
+        /// Models the `confirmed_gone:<room>` OWN-room marker (LOW #85): `Absent`
+        /// written by the confirm path, `Present` (cleared) on a join.
+        confirmed_gone: BTreeMap<String, ToldPresence>,
         /// Models the single DO alarm.
         alarm_at: Option<u64>,
         /// Cross-DO `/internal/peer-left` pushes: (room, leaver, at_ms).
@@ -3947,9 +4114,12 @@ mod tests {
         }
 
         fn join(&mut self, room: &str) {
-            // Mirrors ClientEvent::JoinRoom: membership + lastseen stamp.
+            // Mirrors ClientEvent::JoinRoom: membership + lastseen stamp + the
+            // LOW #85 confirmed-gone CLEAR (the owner is present in its own room).
             *self.sessions.entry(room.to_string()).or_insert(0) += 1;
             self.lastseen.insert(room.to_string(), self.now);
+            self.confirmed_gone
+                .insert(room.to_string(), ToldPresence::Present);
         }
 
         /// ONE session of `leaver` departs `room`. Mirrors
@@ -4019,12 +4189,48 @@ mod tests {
             for (room, entry) in due {
                 let still_occupied = self.occupied(&room);
                 if departure_push_due(still_occupied) {
+                    // LOW #85: the confirm path stamps the OWN-room marker Absent.
+                    self.confirmed_gone
+                        .insert(room.clone(), ToldPresence::Absent);
                     self.pushes.push((room, entry.leaver, self.now));
                 }
+                // A suppressed flap writes NO marker (the join that re-occupied the
+                // room already cleared it to Present).
             }
             if let Some(n) = next {
                 self.alarm_at = Some(n);
             }
+        }
+
+        fn read_confirmed_gone(&self, room: &str) -> Option<ToldPresence> {
+            self.confirmed_gone.get(room).copied()
+        }
+
+        /// Mirrors `handle_presence`: read occupancy and this room's pending, run
+        /// the LOW #85 re-arm belt for an OVERDUE pending (pull its confirming
+        /// re-check in exactly as `ensure_alarm_no_later_than` does — fire at
+        /// `now + max(1, due - now)`), then answer via the real `presence_answer`.
+        fn snapshot(&mut self, room: &str) -> Option<bool> {
+            let occupied = self.occupied(room);
+            let pending = if occupied {
+                None
+            } else {
+                self.pending.get(room).cloned()
+            };
+            if let Some(p) = pending.as_ref() {
+                if !occupied && self.now > p.due_at_ms.saturating_add(PEER_LEFT_DEBOUNCE_MS) {
+                    let fire_at = self.now + p.due_at_ms.saturating_sub(self.now).max(1);
+                    if self.alarm_at.is_none_or(|t| t > fire_at || t <= self.now) {
+                        self.alarm_at = Some(fire_at);
+                    }
+                }
+            }
+            let confirmed = if occupied {
+                None
+            } else {
+                self.read_confirmed_gone(room)
+            };
+            presence_answer(occupied, pending.as_ref(), confirmed, self.now)
         }
     }
 
@@ -4072,6 +4278,110 @@ mod tests {
         assert!(
             !departure_push_due(true),
             "reoccupied (flap rejoined) → silent"
+        );
+    }
+
+    /// LOW #85 (loop 29), pin 2 through the sim DO pipeline: a CONFIRMED close
+    /// (the debounce fires STILL empty) writes `confirmed_gone=Absent`, so a
+    /// peer's `/internal/presence` read returns `false` (a survivor must learn a
+    /// killed peer). A SUPPRESSED flap (the room re-occupied before the check)
+    /// writes no marker, so its read is `None` — never the false-away a live,
+    /// re-joining peer used to get (RED on 419bf18: an empty room answered
+    /// `Some(false)` with no confirmed close).
+    #[test]
+    fn a_confirmed_close_reads_false_but_a_suppressed_flap_reads_null() {
+        let room = sim_room_a();
+
+        // Killed peer: join, depart, no rejoin; the debounce fires still-empty.
+        let mut sim = PresenceSim {
+            now: 10_000,
+            ..Default::default()
+        };
+        sim.join(&room);
+        sim.now = 20_000;
+        sim.depart(&room, ID_A);
+        sim.advance_to(30_000); // past the trailing check
+        assert_eq!(sim.pushes.len(), 1, "a confirmed departure pushes once");
+        assert_eq!(
+            sim.read_confirmed_gone(&room),
+            Some(ToldPresence::Absent),
+            "the confirm path stamped the marker"
+        );
+        assert_eq!(
+            sim.snapshot(&room),
+            Some(false),
+            "a confirmed close: a survivor reads false"
+        );
+
+        // Flap: join, depart, REJOIN within the window; the check suppresses.
+        let mut sim = PresenceSim {
+            now: 10_000,
+            ..Default::default()
+        };
+        sim.join(&room);
+        sim.now = 20_000;
+        sim.depart(&room, ID_A); // arms, due 24_000
+        sim.now = 21_000;
+        sim.join(&room); // flap rejoin (clears the marker to Present), still seated at fire
+        sim.advance_to(30_000);
+        assert!(sim.pushes.is_empty(), "a suppressed flap pushes nothing");
+        assert_ne!(
+            sim.read_confirmed_gone(&room),
+            Some(ToldPresence::Absent),
+            "a suppressed flap writes NO confirmed-gone marker"
+        );
+        // The invariant that closes loop 29: with no confirmed-gone marker, an
+        // EMPTY read (the churn gap) is undecided, never a fabricated false.
+        let marker = sim.read_confirmed_gone(&room);
+        assert_eq!(
+            presence_answer(false, None, marker, sim.now),
+            None,
+            "a flap never leaves a fabricated false for a live, re-joining peer"
+        );
+    }
+
+    /// LOW #85 (loop 29), pin 4 (the belt's effect) through the sim: a departure
+    /// whose DO alarm was LOST (overdue pending, no alarm) is pulled in by a
+    /// presence read, so the confirming re-check runs promptly instead of
+    /// lingering. RED shape: without the belt the stranded pending never fires
+    /// (the alarm stays lost) and the room stays undecided forever.
+    #[test]
+    fn a_presence_read_rearms_a_lost_departure_alarm() {
+        let room = sim_room_a();
+        let mut sim = PresenceSim {
+            now: 10_000,
+            ..Default::default()
+        };
+        sim.join(&room);
+        sim.now = 20_000;
+        sim.depart(&room, ID_A); // arms pendingleft, due 24_000
+        assert!(sim.pending.contains_key(&room));
+        // Model the lost alarm: the wake vanishes, the pending strands.
+        sim.alarm_at = None;
+        // Well past the window: a stranded, OVERDUE pending.
+        sim.now = 24_000 + PEER_LEFT_DEBOUNCE_MS + 5_000;
+        // The read answers `None` (undecided — never a guessed false) AND arms the
+        // belt: the confirming re-check is now scheduled.
+        assert_eq!(
+            sim.snapshot(&room),
+            None,
+            "overdue stranded pending: undecided"
+        );
+        assert!(
+            sim.alarm_at.is_some(),
+            "the presence read pulled the lost alarm back in (the belt)"
+        );
+        // The re-check now fires: the room is still empty → a confirmed close.
+        sim.advance_to(sim.now + 10);
+        assert_eq!(
+            sim.pushes.len(),
+            1,
+            "the pulled-in re-check pushed the real departure"
+        );
+        assert_eq!(
+            sim.snapshot(&room),
+            Some(false),
+            "now a CONFIRMED close reads false"
         );
     }
 
