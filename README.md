@@ -1,3 +1,5 @@
+> **Public release mirror.** This repository receives tagged releases of a private canonical repository (every Cloudflare resource identifier is scrubbed; deployment configs are placeholders). Issues and PRs are welcome here; development happens upstream and lands as the next release.
+
 # bsv-messagebox-cloudflare
 
 A BSV messaging relay on Cloudflare Workers: BRC-31 authentication, delivery

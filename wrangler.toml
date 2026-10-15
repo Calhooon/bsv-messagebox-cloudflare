@@ -1,7 +1,7 @@
 name = "rust-message-box"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-04-07"
-account_id = "<your-account-id>"
+# account_id = "<your-cloudflare-account-id>"
 
 # TODO: Set custom domain after initial deploy
 # routes = [
@@ -81,7 +81,7 @@ database_id = "<your-d1-database-id>"
 
 [[kv_namespaces]]
 binding = "AUTH_SESSIONS"
-id = "<your-account-id>"
+id = "<your-kv-namespace-id>"
 
 # R2 bucket used by /beef/upload-url + sendMessage to handle BEEFs larger
 # than the 100 MB Workers body cap. Clients upload via presigned URL (S3 v4

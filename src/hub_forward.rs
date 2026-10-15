@@ -58,6 +58,19 @@ use std::future::Future;
 /// fallback fires.
 pub const FORWARD_OP_TIMEOUT_MS: u64 = 3_000;
 
+/// The substring every [`with_do_op_timeout`] timeout error carries, so a caller can tell a per-op
+/// TIMEOUT (the bound fired; the op was dropped, possibly having landed) from the op's OWN transport
+/// error. bsv-low #668 uses it to retry only the timed-out fan-out pushes. Compiled for the real
+/// Worker (wasm) where the fan-out classifies a timeout, and for the host classifier pin.
+#[cfg(any(target_arch = "wasm32", test))]
+pub const OP_TIMEOUT_MARKER: &str = "subrequest exceeded";
+
+/// True iff `e` is a [`with_do_op_timeout`] timeout (not the wrapped op's own error).
+#[cfg(any(target_arch = "wasm32", test))]
+pub fn is_op_timeout(e: &worker::Error) -> bool {
+    e.to_string().contains(OP_TIMEOUT_MARKER)
+}
+
 /// Total forward attempts (initial + retries). One retry: the observed failure
 /// is an *intermittent* cold/relocating-DO stall that a fresh subrequest clears;
 /// a second retry buys little and eats the client's fallback margin.
@@ -90,7 +103,7 @@ where
         }
         if timeout.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Err(worker::Error::RustError(format!(
-                "forward: MessageHub subrequest exceeded {timeout_ms}ms bound (transient; retrying)"
+                "forward: MessageHub {OP_TIMEOUT_MARKER} {timeout_ms}ms bound (transient; retrying)"
             ))));
         }
         Poll::Pending
@@ -186,6 +199,22 @@ mod tests {
             calls.get(),
             FORWARD_ATTEMPTS,
             "attempts are bounded to FORWARD_ATTEMPTS"
+        );
+    }
+
+    // bsv-low #668: the fan-out tells a per-op TIMEOUT (retry it) from the op's own transport error
+    // (do not) by the timeout error's marker. The marker must appear in the timeout message
+    // (`with_do_op_timeout`) and `is_op_timeout` must reject an unrelated error.
+    #[test]
+    fn op_timeout_is_recognised_by_its_marker() {
+        let timeout = worker::Error::RustError(format!(
+            "forward: MessageHub {OP_TIMEOUT_MARKER} 3000ms bound (transient; retrying)"
+        ));
+        assert!(is_op_timeout(&timeout), "a timeout carries the marker");
+        let other = worker::Error::RustError("network: connection reset".to_string());
+        assert!(
+            !is_op_timeout(&other),
+            "an ordinary transport error is not a timeout"
         );
     }
 
