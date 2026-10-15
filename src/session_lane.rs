@@ -33,11 +33,8 @@
 //! it. The MAC vectors are PRODUCED here (`emit_session_mac_vectors`) and
 //! pinned byte-for-byte by the client (`app/src/lib/relaySession.vectors.test.ts`):
 //! the artifact is shared, never the convention.
-use hmac::{Hmac, Mac};
+use bsv_rs::primitives::{sha256, sha256_hmac};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// The domain separator inside `K`'s derivation.
 pub const KEY_DERIVATION_LABEL: &[u8] = b"low-relay-session/v1";
@@ -183,35 +180,32 @@ pub fn derive_key(
     client_nonce: &str,
     server_nonce: &str,
 ) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(salt).expect("HMAC accepts any key length");
-    mac.update(KEY_DERIVATION_LABEL);
-    mac.update(id);
-    mac.update(client_nonce.as_bytes());
-    mac.update(server_nonce.as_bytes());
-    let out = mac.finalize().into_bytes();
-    let mut k = [0u8; 32];
-    k.copy_from_slice(&out);
-    k
+    // The message in one buffer: bsv-rs's HMAC takes the whole input.
+    let mut msg = Vec::with_capacity(
+        KEY_DERIVATION_LABEL.len() + id.len() + client_nonce.len() + server_nonce.len(),
+    );
+    msg.extend_from_slice(KEY_DERIVATION_LABEL);
+    msg.extend_from_slice(id);
+    msg.extend_from_slice(client_nonce.as_bytes());
+    msg.extend_from_slice(server_nonce.as_bytes());
+    sha256_hmac(salt, &msg)
 }
 
 /// `m = HMAC-SHA256(K, n as 8 bytes little-endian ‖ e ‖ 0x00 ‖ sha256(d))`.
 pub fn frame_mac(key: &[u8; 32], n: u64, e: &str, d: &str) -> [u8; 32] {
-    let digest: [u8; 32] = Sha256::digest(d.as_bytes()).into();
+    let digest = sha256(d.as_bytes());
     frame_mac_over_digest(key, n, e, &digest)
 }
 
 /// The same MAC with the data's digest already taken (the Worker hashes the
 /// request's raw body bytes once and ships the digest to the hub).
 pub fn frame_mac_over_digest(key: &[u8; 32], n: u64, e: &str, digest: &[u8; 32]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(&n.to_le_bytes());
-    mac.update(e.as_bytes());
-    mac.update(&[0u8]);
-    mac.update(digest);
-    let out = mac.finalize().into_bytes();
-    let mut m = [0u8; 32];
-    m.copy_from_slice(&out);
-    m
+    let mut msg = Vec::with_capacity(8 + e.len() + 1 + 32);
+    msg.extend_from_slice(&n.to_le_bytes());
+    msg.extend_from_slice(e.as_bytes());
+    msg.push(0);
+    msg.extend_from_slice(digest);
+    sha256_hmac(key, &msg)
 }
 
 /// The event name inside an HTTP request's MAC: `"METHOD path?query"`, the
@@ -804,7 +798,7 @@ mod tests {
     }
 
     fn digest(body: &str) -> [u8; 32] {
-        Sha256::digest(body.as_bytes()).into()
+        sha256(body.as_bytes())
     }
 
     #[test]
@@ -1045,7 +1039,7 @@ mod tests {
         m.expires_at_ms = last_ok;
         let body = "{}";
         let mac = http_mac(&m, 1, "GET", "/x", body);
-        let digest: [u8; 32] = Sha256::digest(body.as_bytes()).into();
+        let digest = sha256(body.as_bytes());
         assert!(m
             .verify_http(1, "GET", "/x", &digest, &mac, last_ok)
             .is_ok());
@@ -1104,7 +1098,7 @@ mod tests {
 
     #[test]
     fn session_mac_vectors_are_the_pinned_bytes_and_the_real_producer_re_derives_them() {
-        let digest = hex::encode(Sha256::digest(SESSION_MAC_VECTORS.as_bytes()));
+        let digest = hex::encode(sha256(SESSION_MAC_VECTORS.as_bytes()));
         assert_eq!(
             digest, SESSION_MAC_VECTORS_SHA256,
             "session_mac.vectors.json changed. It is a CROSS-REPO agreement: copy it to \
@@ -1293,7 +1287,7 @@ pub fn parse_attach_frame(v: &serde_json::Value) -> Option<AttachFrame> {
 
 /// The hub's verify body for an attach (the HTTP-lane verify body verbatim). PURE.
 pub fn attach_verify_body(f: &AttachFrame) -> serde_json::Value {
-    let digest = Sha256::digest(f.nonce.as_bytes());
+    let digest = sha256(f.nonce.as_bytes());
     serde_json::json!({
         "id": f.s,
         "identity": f.identity,
@@ -1308,11 +1302,11 @@ pub fn attach_verify_body(f: &AttachFrame) -> serde_json::Value {
 /// The one-shot ack MAC: `HMAC-SHA256(K_hub, "sessionAttached" ‖ 0x01 ‖ sha256(d))`, hex. PURE.
 pub fn attach_ack_mac(hub_key_hex: &str, d_text: &str) -> Option<String> {
     let key = hex::decode(hub_key_hex).ok()?;
-    let mut mac = HmacSha256::new_from_slice(&key).ok()?;
-    mac.update(ATTACHED_EVENT.as_bytes());
-    mac.update(&[ATTACH_ACK_DOMAIN]);
-    mac.update(&Sha256::digest(d_text.as_bytes()));
-    Some(hex::encode(mac.finalize().into_bytes()))
+    let mut msg = Vec::with_capacity(ATTACHED_EVENT.len() + 1 + 32);
+    msg.extend_from_slice(ATTACHED_EVENT.as_bytes());
+    msg.push(ATTACH_ACK_DOMAIN);
+    msg.extend_from_slice(&sha256(d_text.as_bytes()));
+    Some(hex::encode(sha256_hmac(&key, &msg)))
 }
 
 #[cfg(test)]
@@ -1333,7 +1327,7 @@ mod attach_tests {
         assert_eq!(body["h"], 5);
         assert_eq!(
             body["bodySha256"],
-            hex::encode(Sha256::digest("01".repeat(32).as_bytes()))
+            hex::encode(sha256("01".repeat(32).as_bytes()))
         );
         for k in ["s", "identity", "mac", "nonce"] {
             let mut bad = frame();

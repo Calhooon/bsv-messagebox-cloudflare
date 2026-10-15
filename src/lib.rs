@@ -654,10 +654,7 @@ async fn session_lane_auth(
             )));
         }
     };
-    let digest: [u8; 32] = {
-        use sha2::{Digest, Sha256};
-        Sha256::digest(&body).into()
-    };
+    let digest = bsv_rs::primitives::sha256(&body);
     let ask = json!({
         "id": id,
         "identity": identity,
@@ -1624,16 +1621,16 @@ fn split_push_body(raw: &[u8], now_ms: u64) -> std::result::Result<(String, Vec<
         if let Some(id) = obj.remove("messageId") {
             message.insert("messageId".into(), id);
         } else {
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(sender.as_bytes());
-            h.update(
+            // One buffer, sender then message then clock, the bytes the
+            // incremental hasher took in that order (bsv-rs hashes a slice).
+            let mut seed = sender.as_bytes().to_vec();
+            seed.extend(
                 serde_json::to_vec(&serde_json::Value::Object(message.clone())).unwrap_or_default(),
             );
-            h.update(now_ms.to_string().as_bytes());
+            seed.extend_from_slice(now_ms.to_string().as_bytes());
             message.insert(
                 "messageId".into(),
-                serde_json::Value::String(hex::encode(h.finalize())),
+                serde_json::Value::String(hex::encode(bsv_rs::primitives::sha256(&seed))),
             );
         }
         obj.insert("message".into(), serde_json::Value::Object(message));
@@ -1827,7 +1824,7 @@ mod push_route_tests {
 #[cfg(test)]
 mod presence_route_tests {
     use super::*;
-    use sha2::{Digest, Sha256};
+    use bsv_rs::primitives::sha256;
 
     fn answered(
         present: bool,
@@ -1944,7 +1941,7 @@ mod presence_route_tests {
 
     #[test]
     fn presence_wire_fixture_is_the_pinned_bytes() {
-        let digest = hex::encode(Sha256::digest(PRESENCE_WIRE_V1.as_bytes()));
+        let digest = hex::encode(sha256(PRESENCE_WIRE_V1.as_bytes()));
         assert_eq!(
             digest, PRESENCE_WIRE_V1_SHA256,
             "presence-wire-v1.json changed. This file is a CROSS-REPO agreement: \

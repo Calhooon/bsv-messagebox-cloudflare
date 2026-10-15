@@ -30,11 +30,11 @@
 
 use base64::Engine as _;
 use bsv_middleware_rs::{HeaderLookupError, HeaderService, PaymentVerdict, UnverifiableReason};
+use bsv_rs::primitives::sha256;
 use bsv_rs::primitives::PrivateKey;
 use bsv_rs::wallet::ProtoWallet;
 use rust_message_box::payments::{delivery_answer, delivery_verdict, WorkerHeaderService};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 
 const VECTORS: &str = include_str!("vectors/brc29-payment-vectors.json");
@@ -259,7 +259,7 @@ async fn run_case(case: &Value) -> Answer {
 #[test]
 fn the_vectors_are_the_pinned_bytes() {
     assert_eq!(
-        hex::encode(Sha256::digest(VECTORS.as_bytes())),
+        hex::encode(sha256(VECTORS.as_bytes())),
         VECTORS_SHA256,
         "tests/vectors/brc29-payment-vectors.json is stale or hand-edited: it is a copy of the \
          canonical file; copy that file again and update VECTORS_SHA256 in the same change"

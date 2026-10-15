@@ -18,10 +18,11 @@
 //!   a spend no script allows in one pass.
 
 use bsv_middleware_rs::{HeaderLookupError, HeaderService, PaymentVerdict};
+use bsv_rs::primitives::sha256d;
+use bsv_rs::primitives::to_var_int;
 use rust_message_box::beef_door::{
     verify_at_rest, AtRest, BeefStore, Chunks, Slice, Slices, Stamp, Terms,
 };
-use sha2::{Digest, Sha256};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -65,7 +66,7 @@ const PAID: &[u8] = &[0x51; 25];
 const KEY: &str = "02abc/upload.beef";
 
 fn hash(raw: &[u8]) -> [u8; 32] {
-    Sha256::digest(Sha256::digest(raw)).into()
+    sha256d(raw)
 }
 
 /// Where a link carries its megabyte.
@@ -79,13 +80,11 @@ enum Ballast {
     Unspent(usize),
 }
 
+/// The length in its canonical varint: bsv-rs 0.6.0 refuses a wider form
+/// than the value needs (`BadVarint`, the node's `ReadCompactSize`), so a
+/// length of `0xfd..=0xffff` is `0xfd` and two bytes, never `0xfe` and four.
 fn script_len(len: usize, t: &mut Vec<u8>) {
-    if len < 0xfd {
-        t.push(len as u8);
-    } else {
-        t.push(0xfe);
-        t.extend_from_slice(&(len as u32).to_le_bytes());
-    }
+    t.extend_from_slice(&to_var_int(len as u64));
 }
 
 /// One input spending `prev:0` with an empty unlock, output 0 of `satoshis`
@@ -181,8 +180,10 @@ impl Writer {
         b.extend_from_slice(&HEIGHT.to_le_bytes());
         b.extend_from_slice(&[1, 1, 0, 2]);
         b.extend_from_slice(&self.oldest);
-        b.push(0xfe);
-        b.extend_from_slice(&(self.links as u32).to_le_bytes());
+        // The transaction count, canonical (bsv-rs 0.6.0 refuses `0xfe` and
+        // four bytes for a count below `0x10000`; this was offset 82's
+        // `BadVarint` on the move).
+        b.extend_from_slice(&to_var_int(self.links as u64));
         b
     }
 
