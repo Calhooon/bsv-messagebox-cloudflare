@@ -1,10 +1,30 @@
 [package]
-name = "rust-message-box"
-version = "0.5.4"
+name = "bsv-messagebox-cloudflare"
+version = "0.5.5"
+description = "A BSV messaging relay on Cloudflare Workers: BRC-31 authentication, delivery permissions, paid delivery, D1 storage and hibernatable WebSockets."
 license = "MIT"
+repository = "https://github.com/Calhooon/bsv-messagebox-cloudflare"
+readme = "README.md"
+keywords = ["bitcoin", "bsv", "messagebox", "cloudflare", "wasm"]
+categories = ["cryptography::cryptocurrencies"]
 edition = "2021"
+# build.rs reads `[limits] work_units` from wrangler.toml, so the template ships.
+# The two small JSON fixtures are read by the library's own unit tests.
+include = [
+    "src/**/*.rs",
+    "build.rs",
+    "migrations/*.sql",
+    "wrangler.toml",
+    "tests/fixtures/*.json",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+]
 
 [lib]
+# The crate's name on crates.io is bsv-messagebox-cloudflare; the library keeps
+# its identifier so no `use` path moves.
+name = "rust_message_box"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

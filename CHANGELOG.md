@@ -4,6 +4,14 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## [0.5.5] - 2026-10-18
+
+### Publishable to crates.io from the tag (no change in the Worker)
+
+- **The crate is `bsv-messagebox-cloudflare`** on crates.io (was the unpublished `rust-message-box`); `[lib] name = "rust_message_box"` keeps the library's identifier, so no `use` path moves. The manifest gains `description`, `repository`, `readme`, keywords, categories and an `include` list: the sources, `build.rs`, the migrations, `wrangler.toml` (build.rs reads its `[limits] work_units`), the two JSON fixtures the library's unit tests read, the README, the licence and this changelog.
+- **`.github/workflows/release.yml`** publishes on a `v*` tag push through crates.io trusted publishing (no token stored): the tag must equal the manifest's version and sit on `main`, the `ci.yml` gate runs (now callable through `workflow_call`), then a host `cargo publish --dry-run` and `cargo publish`.
+- **The README is refreshed to the code at this tag**: the version and pins, the router's routes, the Socket.IO transport, the send budget, the gate, the names the code reads that the template does not set, and a "Releases" section.
+
 ## [0.5.4] - 2026-10-15
 
 ### Bounded, concurrent `/broadcast` fan-out (bsv-low #668)
