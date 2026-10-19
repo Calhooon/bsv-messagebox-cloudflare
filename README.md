@@ -13,7 +13,7 @@ canonical repository, and the maintainer cuts the mirror.
 
 The relay is **0.6.0**, published on crates.io as `bsv-messagebox-cloudflare`
 (the library keeps its identifier `rust_message_box`). The release of record is
-the tag `v0.5.6`. [Cargo.toml](Cargo.toml) pins **bsv-rs =0.7.0**,
+the tag `v0.6.0`. [Cargo.toml](Cargo.toml) pins **bsv-rs =0.7.0**,
 **bsv-middleware-cloudflare =0.7.0** and **bsv-middleware-core =0.4.0**; the
 bsv-middleware-rs dependency is the compatible `0.6.1` requirement, not an exact
 pin. [CHANGELOG.md](CHANGELOG.md) is the record of changes.
