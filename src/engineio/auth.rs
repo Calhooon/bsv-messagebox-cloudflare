@@ -951,3 +951,51 @@ mod round_bounds {
         assert_eq!(decoded.rounds.len(), 16);
     }
 }
+
+/// The digest this Worker signs with (bsv-rs 0.7.0 moved the transaction
+/// signing digest to the node's dispatcher; the Worker signs no transaction).
+/// Its one secp256k1 signature is BRC-103's `create_signature` with `data`:
+/// ECDSA over ONE SHA-256 of the signing data, by the BRC-42 child of the
+/// server key for the peer, as `@bsv/sdk`'s `ProtoWallet` signs it. The
+/// signature is RFC 6979 deterministic, so its bytes are pinned too.
+#[cfg(test)]
+mod signing_digest_tests {
+    use super::*;
+    use bsv_rs::primitives::{sha256, sha256d, Signature};
+    use bsv_rs::wallet::KeyDeriver;
+
+    const SERVER_KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const PEER_KEY: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const DATA: &[u8] = b"the signing data of a BRC-103 message";
+    const KEY_ID: &str = "nonce-a nonce-b";
+    const DIGEST: &str = "e99ecc41ae782c72f99fb19a8cd2c2b937223687223b57f5691cb623fa13fea8";
+    const SIGNATURE: &str = "304402200f512130ca285a6ad87f66e114cd8907b598695892fe17e67bda2cea600099aa0220630110ce47d114155c00e5c527ada607078e28fc12838f713c7045ffa0669ba1";
+
+    #[test]
+    fn the_worker_signs_one_sha256_of_the_data_with_the_derived_key() {
+        let wallet = make_wallet(SERVER_KEY).unwrap();
+        let peer = PrivateKey::from_hex(PEER_KEY).unwrap().public_key();
+        let protocol = Protocol::new(SecurityLevel::Counterparty, AUTH_PROTOCOL_ID);
+        let sig = wallet
+            .create_signature(CreateSignatureArgs {
+                data: Some(DATA.to_vec()),
+                hash_to_directly_sign: None,
+                protocol_id: protocol.clone(),
+                key_id: KEY_ID.to_string(),
+                counterparty: Some(Counterparty::Other(peer.clone())),
+            })
+            .unwrap()
+            .signature;
+        let digest = sha256(DATA);
+        assert_eq!(hex::encode(digest), DIGEST);
+        assert_eq!(hex::encode(&sig), SIGNATURE);
+
+        let child = KeyDeriver::new(Some(PrivateKey::from_hex(SERVER_KEY).unwrap()))
+            .derive_private_key(&protocol, KEY_ID, &Counterparty::Other(peer))
+            .unwrap()
+            .public_key();
+        let parsed = Signature::from_der(&sig).unwrap();
+        assert!(child.verify(&digest, &parsed), "one SHA-256 of the data");
+        assert!(!child.verify(&sha256d(DATA), &parsed), "never the double");
+    }
+}

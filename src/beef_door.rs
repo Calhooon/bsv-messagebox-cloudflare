@@ -69,6 +69,10 @@ use bsv_middleware_rs::{
     verify_payment_output_only, HeaderLookupError, HeaderService, PaymentToVerify, PaymentVerdict,
     UnverifiableReason,
 };
+// `inline_spool_key` hashes the decoded inline payment a chunk at a time with
+// bsv-rs 0.6.1's incremental `Sha256`; collecting the chunks would hold the
+// whole payment the door never holds (bsv-low #591 H1).
+use bsv_rs::primitives::hash::Sha256;
 use bsv_rs::primitives::sha256d;
 use bsv_rs::script::ScriptResource;
 use bsv_rs::transaction::beef_stream::{display_hex, Hash32, SpendRefusal, Step};
@@ -76,11 +80,6 @@ use bsv_rs::transaction::{
     BeefDecoder, Cursor, Element, Headers, Progress, StreamVerifier, Timed, Verdict,
 };
 use serde_json::Value;
-// The one hash bsv-rs 0.6.0 cannot serve: `inline_spool_key` hashes the
-// decoded inline payment a chunk at a time, and `bsv_rs::primitives` exposes
-// one-shot hashes only (`sha256(&[u8])`); collecting the chunks would hold the
-// whole payment the door never holds (bsv-low #591 H1).
-use sha2::{Digest, Sha256};
 
 /// The bytes the door decodes from an inline payment at a time.
 const CHUNK: usize = 64 * 1024;

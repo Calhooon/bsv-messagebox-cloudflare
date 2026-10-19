@@ -11,11 +11,11 @@ canonical repository, and the maintainer cuts the mirror.
 
 ## Version and dependencies
 
-The relay is **0.5.6**, published on crates.io as `bsv-messagebox-cloudflare`
+The relay is **0.6.0**, published on crates.io as `bsv-messagebox-cloudflare`
 (the library keeps its identifier `rust_message_box`). The release of record is
-the tag `v0.5.6`. [Cargo.toml](Cargo.toml) pins **bsv-rs =0.6.0**,
-**bsv-middleware-cloudflare =0.6.2** and **bsv-middleware-core =0.3.2**; the
-bsv-middleware-rs dependency is the compatible `0.5.0` requirement, not an exact
+the tag `v0.5.6`. [Cargo.toml](Cargo.toml) pins **bsv-rs =0.7.0**,
+**bsv-middleware-cloudflare =0.7.0** and **bsv-middleware-core =0.4.0**; the
+bsv-middleware-rs dependency is the compatible `0.6.1` requirement, not an exact
 pin. [CHANGELOG.md](CHANGELOG.md) is the record of changes.
 
 ## Routes

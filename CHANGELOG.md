@@ -4,6 +4,15 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## [0.6.0] - 2026-10-19
+
+### The middleware 0.7.0 and core 0.4.0 on bsv-rs 0.7.0 (#105's last red here)
+
+- **The pins.** bsv-rs `=0.7.0` (was `=0.6.0`), bsv-middleware-cloudflare `=0.7.0` (was `=0.6.2`), bsv-middleware-core `=0.4.0` (was `=0.3.2`), bsv-middleware-rs `0.6.1` (was `0.5.0`; 0.6.x asks bsv-rs ^0.7.0). One bsv-rs in the lock. bsv-rs types sit in the relay's public API, so the move is a minor release.
+- **No direct sha2.** `beef_door::inline_spool_key` hashes the inline payment a chunk at a time with bsv-rs 0.6.1's incremental `primitives::hash::Sha256` (the one hash 0.6.0 could not serve); `tests/lone_mined_subject.rs` checks its rows with `bsv_rs::primitives::{sha256, sha256d}`. The middleware 0.7.0 and core 0.4.0 hash and MAC through bsv-rs too, so `cargo tree -i sha2 --depth 1` names bsv-rs, k256 and p256, `-i hmac` names bsv-rs, pbkdf2 and rfc6979, and `cargo deny check` is green against the unchanged `deny.toml` (no wrapper added, no ignore).
+- **The signing digest (bsv-rs 0.7.0 moved `SigningContext::compute_sighash` to the node's dispatcher).** The Worker signs no transaction: its secp256k1 signatures are BRC-103's `create_signature` with `data`, ECDSA over one SHA-256 of the signing data by the BRC-42 child key, which 0.7.0 does not change. Pinned by `engineio::auth::signing_digest_tests::the_worker_signs_one_sha256_of_the_data_with_the_derived_key` (the digest, the RFC 6979 signature's bytes, verified by the derived public key over the single hash and refused over the double). The FCM RS256 signer is ring and unaffected.
+- **The middleware's M14 (a derivation prefix binds its first txid).** The relay's door does not call the middleware's `process_payment_with_storage` and keeps no `payment_claims` table, so `PAYMENT_CLAIMS_MIGRATION` does not apply to its D1 and no migration ships here. The adapter's migration line for the message box (claim the prefix through `D1PrefixStore` / `claim_payment_prefix` in `payments::process_payment`, after verification and before internalize) is not taken in this release: it adds a table and a migration, a lane of its own.
+
 ## [0.5.6] - 2026-10-18
 
 ### The output check is given the subject's BUMP (the six `lone` cells of NL-8, W19)
