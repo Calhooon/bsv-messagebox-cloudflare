@@ -29,11 +29,11 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use bsv_middleware_rs::{HeaderLookupError, HeaderService, PaymentVerdict};
+use bsv_rs::primitives::{sha256, sha256d};
 use rust_message_box::beef_door::{
     verify_at_rest, verify_inline, work_units_per_input, AtRest, BeefStore, Carrier, Chunks,
     DoorVerdict, Slice, Slices, Stamp, Terms,
 };
-use sha2::{Digest, Sha256};
 
 const LONE: &[u8] = include_bytes!("fixtures/lone.bin");
 const LONE_SHA256: &str = "38656f4c184e754b42b8a30cfc09c959b971a971744db34456d3da3a741fbb50";
@@ -124,12 +124,8 @@ fn block_on<T>(run: impl std::future::Future<Output = T>) -> T {
         .block_on(run)
 }
 
-fn row(bytes: &'static [u8], sha256: &str) -> &'static [u8] {
-    assert_eq!(
-        hex::encode(Sha256::digest(bytes)),
-        sha256,
-        "the row's bytes"
-    );
+fn row(bytes: &'static [u8], digest: &str) -> &'static [u8] {
+    assert_eq!(hex::encode(sha256(bytes)), digest, "the row's bytes");
     bytes
 }
 
@@ -190,7 +186,7 @@ fn accepted(verdict: &DoorVerdict, bytes: &[u8]) {
     // its BUMP index (V1: has-BUMP 01, index 00); a block of one transaction,
     // so its txid is the BUMP's root.
     let raw = &bytes[bytes.len() - 2 - 60..bytes.len() - 2];
-    let mut txid: [u8; 32] = Sha256::digest(Sha256::digest(raw)).into();
+    let mut txid: [u8; 32] = sha256d(raw);
     assert_eq!(verdict.subject, Some(txid));
     txid.reverse();
     assert_eq!(verdict.txid().as_deref(), Some(ROOT));

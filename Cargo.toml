@@ -1,6 +1,6 @@
 [package]
 name = "bsv-messagebox-cloudflare"
-version = "0.5.6"
+version = "0.6.0"
 description = "A BSV messaging relay on Cloudflare Workers: BRC-31 authentication, delivery permissions, paid delivery, D1 storage and hibernatable WebSockets."
 license = "MIT"
 repository = "https://github.com/Calhooon/bsv-messagebox-cloudflare"
@@ -48,20 +48,16 @@ uuid = { version = "1", features = ["v4", "js"] }
 # no advisory ignore. `wasm32_unknown_unknown_js` names ring's random source
 # on the Worker (getrandom's `js`, as the relay's own getrandom above).
 ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
-# The one hash bsv-rs 0.6.0 cannot serve: `beef_door::inline_spool_key` hashes
-# the inline payment a chunk at a time; bsv-rs exposes one-shot hashes only.
-sha2 = "0.10"
-
 # S3 v4 presigning for R2 uploads larger than the Workers 100 MB body cap
 # signs with `bsv_rs::primitives::sha256_hmac`; no direct hmac.
 
 # BSV
-# The BRC-31 layer (0.6.2: on bsv-middleware-core 0.3.2 and bsv-rs 0.6.0, the
-# middleware's releases on the stack's bsv-rs line). Pinned exactly, with the
-# core it is built on. Its session, wallet and auth message are the relay's
-# own bsv-rs 0.6.0 types.
-bsv-middleware-cloudflare = "=0.6.2"
-bsv-middleware-core = "=0.3.2"
+# The BRC-31 layer (0.7.0: on bsv-middleware-core 0.4.0 and bsv-rs 0.7.0, the
+# middleware's releases that hash and MAC through `bsv_rs::primitives::hash`,
+# no direct sha2 or hmac). Pinned exactly, with the core it is built on. Its
+# session, wallet and auth message are the relay's own bsv-rs 0.7.0 types.
+bsv-middleware-cloudflare = "=0.7.0"
+bsv-middleware-core = "=0.4.0"
 # The SDK and the streaming BEEF reader (0.4.0: `verify_stream`, `BeefDecoder`,
 # `StreamVerifier`, `Cursor`; 0.4.1: a transaction with no input is invalid
 # bytes, `Kind::NoInputs`; 0.4.3: a transaction with no output is invalid
@@ -71,15 +67,17 @@ bsv-middleware-core = "=0.3.2"
 # offset out of the cursor's bytes (`beef_door::tip_of`), a layout of this
 # release. 0.4.5 adds a local per-input work budget and a named resource decline.
 # 0.6.0: the stack's line (the chain primitives in one home, the hashes and
-# HMAC the relay takes from `bsv_rs::primitives`).
-bsv-rs = { version = "=0.6.0", features = ["auth", "wallet", "transaction", "wasm"] }
+# HMAC the relay takes from `bsv_rs::primitives`). 0.6.1: the incremental
+# `primitives::hash::Sha256` (the inline spool key, no direct sha2). 0.7.0: the
+# signing digest is the node's dispatcher (`SigningContext::compute_sighash`).
+bsv-rs = { version = "=0.7.0", features = ["auth", "wallet", "transaction", "wasm"] }
 # The shared payment check (P0-3): the six-word verdict, the BRC-29 script and
-# the header service as a trait. 0.5.0 asks bsv-rs ^0.6.0 (0.4.x asks ^0.4.1
-# and cannot share the relay's 0.6.0), so it is built on the relay's 0.6.0
+# the header service as a trait. 0.6.1 asks bsv-rs ^0.7.0 and refuses a reused
+# derivation prefix (M14), so it is built on the relay's 0.7.0
 # and the words take the relay's own wallet and reader types. The door keeps its own reading (the
 # cursor at rest) and asks the middleware the output check on the subject
 # alone (`verify_payment_output_only`).
-bsv-middleware-rs = "0.5.0"
+bsv-middleware-rs = "0.6.1"
 # The header service is a trait of bsv-middleware-rs (`HeaderService`),
 # declared with async-trait; the box implements it over the HEADER_SERVICE
 # service binding or the Worker fetch of a URL.
