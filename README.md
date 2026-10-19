@@ -11,9 +11,9 @@ canonical repository, and the maintainer cuts the mirror.
 
 ## Version and dependencies
 
-The relay is **0.5.5**, published on crates.io as `bsv-messagebox-cloudflare`
+The relay is **0.5.6**, published on crates.io as `bsv-messagebox-cloudflare`
 (the library keeps its identifier `rust_message_box`). The release of record is
-the tag `v0.5.5`. [Cargo.toml](Cargo.toml) pins **bsv-rs =0.6.0**,
+the tag `v0.5.6`. [Cargo.toml](Cargo.toml) pins **bsv-rs =0.6.0**,
 **bsv-middleware-cloudflare =0.6.2** and **bsv-middleware-core =0.3.2**; the
 bsv-middleware-rs dependency is the compatible `0.5.0` requirement, not an exact
 pin. [CHANGELOG.md](CHANGELOG.md) is the record of changes.
@@ -92,7 +92,7 @@ are in [src/beef_door.rs](src/beef_door.rs); integration suites are in
 
 ## Releases
 
-The tag is the release of record. From 0.5.5 on, the crate
+The tag is the release of record. From 0.5.6 on, the crate
 `bsv-messagebox-cloudflare` on crates.io carries the same version as the tag:
 [.github/workflows/release.yml](.github/workflows/release.yml) publishes it on a
 `v*` tag push through crates.io trusted publishing, after checking the tag
@@ -103,7 +103,7 @@ infra. No earlier version was published to crates.io under this name or as
 
 ## Deploy and operate a charging tenant
 
-Use the public release tag `v0.5.5`, provision the bindings described in
+Use the public release tag `v0.5.6`, provision the bindings described in
 [wrangler.toml](wrangler.toml), apply [migrations](migrations) in order, build the
 Worker and deploy with an operator-owned configuration. Carry the CPU limit
 into that configuration; the work limit comes from the build's source config.
