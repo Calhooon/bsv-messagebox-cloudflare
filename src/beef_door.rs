@@ -71,8 +71,10 @@ use bsv_middleware_rs::{
 };
 use bsv_rs::primitives::sha256d;
 use bsv_rs::script::ScriptResource;
-use bsv_rs::transaction::beef_stream::{display_hex, Hash32, SpendRefusal};
-use bsv_rs::transaction::{Cursor, Headers, Progress, StreamVerifier, Timed, Verdict};
+use bsv_rs::transaction::beef_stream::{display_hex, Hash32, SpendRefusal, Step};
+use bsv_rs::transaction::{
+    BeefDecoder, Cursor, Element, Headers, Progress, StreamVerifier, Timed, Verdict,
+};
 use serde_json::Value;
 // The one hash bsv-rs 0.6.0 cannot serve: `inline_spool_key` hashes the
 // decoded inline payment a chunk at a time, and `bsv_rs::primitives` exposes
@@ -629,68 +631,106 @@ fn malformed(what: impl Into<String>) -> PaymentVerdict {
     PaymentVerdict::Unverifiable(UnverifiableReason::MalformedTransaction(what.into()))
 }
 
-/// The last raw transaction a reading folded and the offset of its leading
-/// byte: the subject. bsv-rs 0.6.0's verifier does not hand out the element
-/// it stepped, so this is read from the cursor's own bytes
+/// The subject of a reading: the last raw transaction it folded, the offset
+/// of its leading byte, and, when it is mined, the place in the BEEF of the
+/// BUMP that proves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Tip {
+    txid: Hash32,
+    at: u64,
+    proof: Option<u64>,
+}
+
+/// The tip of a reading: the subject. bsv-rs 0.6.0's verifier does not hand
+/// out the element it stepped, so this is read from the cursor's own bytes
 /// (`Cursor::to_binary`, `beef_stream.rs:2639-2765` at 0.6.0: the magic
 /// `BSC2`, the frame, then the index's `last_raw`, the same fields in the same
 /// order as 0.4.4's `BSC1` up to `last_raw`; 0.5.0 renamed the magic when it
 /// added the coinbase heights after them; a paused cursor appends after them,
-/// and the door reads a tip only at a reading's end). The door holds the bytes it then
-/// fetches to this txid (`subject_raw`), so a cursor laid out otherwise is an
-/// error here and never a wrong answer.
-fn tip_of(cursor: &Cursor) -> Result<Option<(Hash32, u64)>, DoorError> {
+/// and the door reads a tip only at a reading's end). After `last_raw` come
+/// the index's BUMPs (height and root, by place) and its proven txids (each
+/// level-0 txid and the earliest BUMP that carries it, sorted by txid,
+/// `:2682-2694`): the subject's entry there is the BUMP that proves it
+/// (0.5.6, W19). The door holds the bytes it then fetches to this txid
+/// (`subject_raw`) and the BUMP it fetches to its place (`bump_bytes`), so a
+/// cursor laid out otherwise is an error here and never a wrong answer.
+fn tip_of(cursor: &Cursor) -> Result<Option<Tip>, DoorError> {
     let bin = cursor.to_binary();
     let short = || DoorError::Internal("the cursor's bytes are not the layout read".to_string());
     let mut at = 0usize;
     let mut take = |n: usize| {
-        let slice = bin.get(at..at + n).ok_or_else(short);
+        let slice = bin.get(at..at.checked_add(n)?);
         at += n;
         slice
     };
-    if take(4)? != b"BSC2" {
+    if take(4).ok_or_else(short)? != b"BSC2" {
         return Err(short());
     }
-    take(1)?; // spends checked
-    if take(1)?[0] == 1 {
-        take(32)?; // the subject the caller named
+    take(1).ok_or_else(short)?; // spends checked
+    if take(1).ok_or_else(short)?[0] == 1 {
+        take(32).ok_or_else(short)?; // the subject the caller named
     }
-    take(8 + 8 + 1 + 4)?; // the frame: offset, elements, phase, version
-    if take(1)?[0] == 1 {
-        take(32)?; // the prefix's subject
+    take(8 + 8 + 1 + 4).ok_or_else(short)?; // the frame: offset, elements, phase, version
+    if take(1).ok_or_else(short)?[0] == 1 {
+        take(32).ok_or_else(short)?; // the prefix's subject
     }
-    take(8 + 8 + 8 + 8)?; // BUMPs left, transactions left, steps, work
-    match take(1)?[0] {
-        0 => Ok(None),
+    take(8 + 8 + 8 + 8).ok_or_else(short)?; // BUMPs left, transactions left, steps, work
+    let (txid, subject_at) = match take(1).ok_or_else(short)?[0] {
+        0 => return Ok(None),
         1 => {
             let mut txid = [0u8; 32];
-            txid.copy_from_slice(take(32)?);
+            txid.copy_from_slice(take(32).ok_or_else(short)?);
             let mut le = [0u8; 8];
-            le.copy_from_slice(take(8)?);
-            Ok(Some((txid, u64::from_le_bytes(le))))
+            le.copy_from_slice(take(8).ok_or_else(short)?);
+            (txid, u64::from_le_bytes(le))
         }
-        _ => Err(short()),
-    }
+        _ => return Err(short()),
+    };
+    let bumps = varint(&bin, &mut at).ok_or_else(short)?;
+    let width = usize::try_from(bumps)
+        .ok()
+        .and_then(|n| n.checked_mul(8 + 32))
+        .ok_or_else(short)?;
+    at = at.checked_add(width).ok_or_else(short)?; // the BUMPs' heights and roots
+    let proven = varint(&bin, &mut at).ok_or_else(short)?;
+    let width = usize::try_from(proven)
+        .ok()
+        .and_then(|n| n.checked_mul(32 + 8))
+        .ok_or_else(short)?;
+    let entries = bin
+        .get(at..at.checked_add(width).ok_or_else(short)?)
+        .ok_or_else(short)?;
+    let proof = entries
+        .chunks_exact(32 + 8)
+        .find(|entry| entry[..32] == txid)
+        .map(|entry| u64::from_le_bytes(entry[32..].try_into().expect("eight bytes")));
+    Ok(Some(Tip {
+        txid,
+        at: subject_at,
+        proof,
+    }))
+}
+
+/// A CompactSize at `at`, `at` moved past it.
+fn varint(bytes: &[u8], at: &mut usize) -> Option<u64> {
+    let lead = *bytes.get(*at)?;
+    let n = match lead {
+        0xfd => 2,
+        0xfe => 4,
+        0xff => 8,
+        _ => {
+            *at += 1;
+            return Some(lead as u64);
+        }
+    };
+    let mut le = [0u8; 8];
+    le[..n].copy_from_slice(bytes.get(*at + 1..*at + 1 + n)?);
+    *at += 1 + n;
+    Some(u64::from_le_bytes(le))
 }
 
 /// The length of the raw transaction (BRC-12) `bytes` starts with.
 fn raw_tx_len(bytes: &[u8]) -> Option<usize> {
-    fn varint(bytes: &[u8], at: &mut usize) -> Option<u64> {
-        let lead = *bytes.get(*at)?;
-        let n = match lead {
-            0xfd => 2,
-            0xfe => 4,
-            0xff => 8,
-            _ => {
-                *at += 1;
-                return Some(lead as u64);
-            }
-        };
-        let mut le = [0u8; 8];
-        le[..n].copy_from_slice(bytes.get(*at + 1..*at + 1 + n)?);
-        *at += 1 + n;
-        Some(u64::from_le_bytes(le))
-    }
     fn skip(bytes: &[u8], at: &mut usize, n: u64) -> Option<()> {
         let end = at.checked_add(usize::try_from(n).ok()?)?;
         (end <= bytes.len()).then(|| *at = end)
@@ -725,12 +765,27 @@ fn subject_raw(mut tail: Vec<u8>, txid: &Hash32) -> Result<Vec<u8>, DoorError> {
 /// (`verify_payment_output_only`, bsv-middleware-rs 0.4.1
 /// `src/payment_core.rs:404-441`), over the subject's bytes as a byte source.
 /// The subject is handed over as a BEEF of that one transaction, so a
-/// transaction whose version word is a BEEF's is still read as a transaction.
-/// The bytes are in hand, so the source cannot fail; if it did, the word is
-/// the payer's: nothing was read.
-fn output_word(subject: &[u8], terms: &Terms<'_>) -> PaymentVerdict {
-    let mut beef = Vec::with_capacity(subject.len() + 7);
-    beef.extend_from_slice(&[0x02, 0x00, 0xBE, 0xEF, 0, 1, 0]);
+/// transaction whose version word is a BEEF's is still read as a transaction;
+/// a mined subject with the BUMP that proves it, at index 0 (0.5.6, W19), so
+/// the middleware's frame reads it as the payer sent it: through 0.5.5 it had
+/// no BUMP index, and a lone proven coinbase was refused `UnprovenCoinbase` at
+/// offset 7 of the wrapper, bytes the payer never sent. The bytes are in
+/// hand, so the source cannot fail; if it did, the word is the payer's:
+/// nothing was read.
+fn output_word(subject: &[u8], proof: Option<&[u8]>, terms: &Terms<'_>) -> PaymentVerdict {
+    let bump = proof.unwrap_or_default();
+    let mut beef = Vec::with_capacity(bump.len() + subject.len() + 8);
+    beef.extend_from_slice(&[0x02, 0x00, 0xBE, 0xEF]);
+    match proof {
+        // No BUMP; one transaction, format 0 (no BUMP index).
+        None => beef.extend_from_slice(&[0, 1, 0]),
+        // One BUMP; one transaction, format 1, BUMP index 0.
+        Some(bump) => {
+            beef.push(1);
+            beef.extend_from_slice(bump);
+            beef.extend_from_slice(&[1, 1, 0]);
+        }
+    }
     beef.extend_from_slice(subject);
     verify_payment_output_only(
         &PaymentToVerify {
@@ -741,6 +796,57 @@ fn output_word(subject: &[u8], terms: &Terms<'_>) -> PaymentVerdict {
         &beef[..],
     )
     .unwrap_or_else(|e| malformed(e.to_string()))
+}
+
+/// A source's bytes from where it was opened, to its end or to `max`.
+async fn gather(chunks: &mut dyn Chunks, max: u64) -> Result<Vec<u8>, DoorError> {
+    let mut out = Vec::new();
+    while (out.len() as u64) < max {
+        match chunks.next().await.map_err(DoorError::Source)? {
+            Some(chunk) => out.extend_from_slice(&chunk),
+            None => break,
+        }
+    }
+    out.truncate(usize::try_from(max).unwrap_or(usize::MAX));
+    Ok(out)
+}
+
+/// The bytes of the BUMP at `place` of the BEEF, as the payer sent them: the
+/// frame read again from the start (`BeefDecoder`, one BUMP in hand) to that
+/// BUMP, then its bytes fetched by its offset and its length on the wire. The
+/// reading already held the BUMP valid; one read back otherwise is the
+/// door's error, never a word.
+async fn bump_bytes<'o>(
+    open: &impl AsyncFn(u64) -> Result<Box<dyn Chunks + 'o>, DoorError>,
+    place: u64,
+) -> Result<Vec<u8>, DoorError> {
+    let wrong = || DoorError::Internal("the BUMP read back is not the one verified".to_string());
+    let mut chunks = open(0).await?;
+    let mut decoder = BeefDecoder::new();
+    let mut seen = 0u64;
+    let (offset, len) = 'found: loop {
+        let chunk = chunks
+            .next()
+            .await
+            .map_err(DoorError::Source)?
+            .ok_or_else(wrong)?;
+        let mut input = &chunk[..];
+        loop {
+            match decoder.next(&mut input).map_err(|_| wrong())? {
+                Step::Element(Element::Bump(bump)) if seen == place => {
+                    break 'found (bump.offset, bump.wire_len)
+                }
+                Step::Element(Element::Bump(_)) => seen += 1,
+                Step::NeedMore => break,
+                Step::Element(_) | Step::Done => return Err(wrong()),
+            }
+        }
+    };
+    drop(chunks);
+    let bytes = gather(open(offset).await?.as_mut(), len).await?;
+    (bytes.len() as u64 == len)
+        .then_some(bytes)
+        .ok_or_else(wrong)
 }
 
 /// The roots of a reading, each once, lowest height first.
@@ -836,21 +942,29 @@ async fn roots_word(
 }
 
 /// The output word on the subject of a reading: the satoshis paid, or the
-/// word that refuses the payment. `subject` fetches the stream's bytes from
-/// an offset to the end (the subject is the last element).
-async fn paid_by(
+/// word that refuses the payment. `open` opens the stream's bytes from an
+/// offset on: the subject is the last element, read from its leading byte to
+/// the end; a mined subject's BUMP is read again from the start (0.5.6, W19).
+async fn paid_by<'o>(
     cursor: &Cursor,
     terms: &Terms<'_>,
-    subject: impl AsyncFnOnce(u64) -> Result<Vec<u8>, DoorError>,
+    open: impl AsyncFn(u64) -> Result<Box<dyn Chunks + 'o>, DoorError>,
 ) -> Result<Result<(Hash32, u64), PaymentVerdict>, DoorError> {
-    let Some((txid, at)) = tip_of(cursor)? else {
+    let Some(tip) = tip_of(cursor)? else {
         return Ok(Err(PaymentVerdict::Unverifiable(
             UnverifiableReason::NoTransaction,
         )));
     };
-    let raw = subject_raw(subject(at).await?, &txid)?;
-    Ok(match output_word(&raw, terms) {
-        PaymentVerdict::Verified { satoshis } => Ok((txid, satoshis)),
+    let raw = subject_raw(
+        gather(open(tip.at).await?.as_mut(), u64::MAX).await?,
+        &tip.txid,
+    )?;
+    let proof = match tip.proof {
+        Some(place) => Some(bump_bytes(&open, place).await?),
+        None => None,
+    };
+    Ok(match output_word(&raw, proof.as_deref(), terms) {
+        PaymentVerdict::Verified { satoshis } => Ok((tip.txid, satoshis)),
         other => Err(other),
     })
 }
@@ -866,8 +980,8 @@ pub async fn judge_output_inline(
     Ok(structure_and_output(carrier, terms).await?.err())
 }
 
-async fn structure_and_output(
-    carrier: &Carrier<'_>,
+async fn structure_and_output<'c>(
+    carrier: &Carrier<'c>,
     terms: &Terms<'_>,
 ) -> Result<Result<(Hash32, u64), DoorVerdict>, DoorError> {
     let cursor = match read(None, Pass::Structure, &mut carrier.chunks(0), None)
@@ -882,11 +996,15 @@ async fn structure_and_output(
             ))
         }
     };
-    Ok(
-        paid_by(&cursor, terms, async |at| Ok(carrier.bytes(at, usize::MAX)))
-            .await?
-            .map_err(DoorVerdict::from),
+    Ok(paid_by(
+        &cursor,
+        terms,
+        async |at| -> Result<Box<dyn Chunks + 'c>, DoorError> {
+            Ok(Box::new(carrier.chunks(at)) as Box<dyn Chunks + 'c>)
+        },
     )
+    .await?
+    .map_err(DoorVerdict::from))
 }
 
 /// The structure of an inline payment alone (0.4.4, bsv-low #591 M3): what a
@@ -1194,14 +1312,10 @@ async fn door_at_rest(
         Some(rest) => (rest.phase, Some(rest.cursor), rest.roots_asked as usize),
         None => (Phase::Structure, None, 0),
     };
-    let subject = async |at: u64| -> Result<Vec<u8>, DoorError> {
-        // The subject alone is read again: one element.
-        let mut tail = Vec::new();
-        let mut chunks = store.open(key, at, &stamp).await.map_err(source)?;
-        while let Some(chunk) = chunks.next().await.map_err(source)? {
-            tail.extend_from_slice(&chunk);
-        }
-        Ok(tail)
+    // The subject alone is read again, one element; a mined subject's BUMP,
+    // one BUMP in hand.
+    let subject = async |at: u64| -> Result<Box<dyn Chunks>, DoorError> {
+        store.open(key, at, &stamp).await.map_err(source)
     };
     let pause = async |phase: Phase, cursor: Cursor, roots_asked: u64, roots: u64| {
         let pending = Pending {
@@ -1246,7 +1360,7 @@ async fn door_at_rest(
             Reading::Paused(cursor) => return pause(phase, cursor, 0, 0).await,
             Reading::Valid(cursor) if phase == Phase::Structure => {
                 // The output, before a script runs.
-                match paid_by(&cursor, terms, subject).await? {
+                match paid_by(&cursor, terms, &subject).await? {
                     Ok(paid) => known = Some(paid),
                     Err(word) => return done(word.into()).await,
                 }
@@ -1262,7 +1376,7 @@ async fn door_at_rest(
     let cursor = from.ok_or_else(|| DoorError::Internal("the roots with no reading".into()))?;
     let (txid, satoshis) = match known {
         Some(paid) => paid,
-        None => match paid_by(&cursor, terms, subject).await? {
+        None => match paid_by(&cursor, terms, &subject).await? {
             Ok(paid) => paid,
             Err(word) => return done(word.into()).await,
         },
@@ -1523,7 +1637,12 @@ pub(crate) mod tests {
         else {
             panic!("a valid chain");
         };
-        let (subject, at) = tip_of(&cursor).unwrap().expect("a tip");
+        let Tip {
+            txid: subject,
+            at,
+            proof,
+        } = tip_of(&cursor).unwrap().expect("a tip");
+        assert_eq!(proof, None, "the subject is unproven");
         let raw = raw_tx(&[0; 32], FEE, PAID).len();
         assert_eq!(at as usize, bytes.len() - raw);
         assert_eq!(subject, txid(&bytes[at as usize..]));
