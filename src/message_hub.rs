@@ -65,7 +65,7 @@ use serde_json::{json, Value};
 use worker::*;
 
 use crate::first_party_box_reason;
-use crate::routes::send_message::{process_send, SendOutcome};
+use crate::routes::send_message::{process_send, AfterAnswer, SendOutcome, Sent};
 use crate::session_lane::{HubMirror, MirrorUpdate, Refusal as LaneRefusal};
 use crate::storage::Storage;
 use crate::validation::{is_valid_pubkey, ValidatedSendMessage};
@@ -1167,6 +1167,13 @@ impl MessageHub {
     /// `sender_key` is the verified identity from `SocketAttachment` —
     /// it is the BRC-31 mutual-auth output from the upgrade and not
     /// derivable from the frame.
+    ///
+    /// Order (0.6.1, bsv-low #787): the `sendMessageAck` goes to the sender's
+    /// socket once the row is durable, and only then is the push to the
+    /// recipient's hub started (`emit_then_defer`). The ack means DURABLE, not
+    /// delivered: delivery is the recipient's socket push or its next
+    /// `listMessages`. This is the reference's order (message-box-server emits
+    /// `sendMessageAck-<room>` and then emits to the recipient's sockets).
     async fn handle_send_message_event(
         &self,
         ws: &WebSocket,
@@ -1188,7 +1195,7 @@ impl MessageHub {
         );
         // Advisory heartbeat: a send is the highest-signal room touch.
         self.stamp_last_seen(&room_id).await;
-        let outbound = self
+        let (outbound, after) = self
             .process_send_message(sender_key, room_id.clone(), message, payment)
             .await;
         let t_processed = Date::now().as_millis();
@@ -1199,123 +1206,61 @@ impl MessageHub {
             t_processed,
             t_processed.saturating_sub(t_in)
         );
-        for ev in outbound {
-            let _ = emit_event_to_ws(ws, &ev);
+        emit_then_defer(
+            outbound,
+            after,
+            |ev| {
+                let _ = emit_event_to_ws(ws, ev);
+            },
+            |after| self.defer_fan_out(after),
+        );
+        console_log!(
+            "TRACE_LAT send.answered ms={} leg=ws msgId={}",
+            Date::now().as_millis().saturating_sub(t_in),
+            msg_id
+        );
+    }
+
+    /// Run a send's hub pushes after its answer, off the event's await path.
+    /// The 2 s race and the `broadcast.fanout.*` lines are `AfterAnswer::run`'s.
+    fn defer_fan_out(&self, after: AfterAnswer) {
+        if !after.is_empty() {
+            self.state.wait_until(after.run(self.env.clone()));
         }
     }
 
     /// Transport-agnostic send-path. Used by both the raw WS handler
     /// (`handle_send_message_event`) and the socket.io bridge handler
-    /// (`handle_socketio_event`). Returns the list of events the caller
-    /// must emit to the client.
+    /// (`handle_socketio_event`). Returns the events the caller must emit to
+    /// the client and the hub pushes the caller runs after emitting them.
     async fn process_send_message(
         &self,
         sender_key: &str,
         room_id: String,
         message: ClientSendMessage,
         payment: Option<Value>,
-    ) -> Vec<OutboundEvent> {
-        // 1. Basic roomId validity.
-        if room_id.trim().is_empty() {
-            return vec![OutboundEvent::new(
-                "messageFailed",
-                json!({ "reason": "Invalid room ID" }),
-            )];
-        }
-
-        // 2. Validate the recipient identity up front (the room belongs to
-        //    either it or the sender — see below).
-        if !is_valid_pubkey(&message.recipient) {
-            return vec![OutboundEvent::new(
-                "messageFailed",
-                json!({ "reason": format!("Invalid recipient key: {}", message.recipient) }),
-            )];
-        }
-
-        // 3. Derive the message_box from whichever room the client addressed:
-        //    the RECIPIENT's room (`<recipient>-<box>` — the official
-        //    `@bsv/message-box-client` + the canonical message-box-server,
-        //    which ack + broadcast on the client-sent roomId) OR the sender's
-        //    OWN room (`<sender>-<box>` — the legacy raw-WS convention).
-        //    Crucially we ack on the SAME room_id below (`outcome_to_outbound`),
-        //    so each client's ack listener matches its own convention; the
-        //    message itself is always routed to `message.recipient`. Previously
-        //    this accepted ONLY the sender's room, so the official client —
-        //    which sends to and awaits `sendMessageAck-<recipient>-<box>` —
-        //    never got its ack: every WS send burned the 10s ack timeout and
-        //    fell back to HTTP, and the live push was lost (poll only). Read-
-        //    side ownership (joinRoom / listMessages) is still enforced, so a
-        //    sender can DEPOSIT into the recipient's box but never READ it.
-        let recipient_prefix = format!("{}-", message.recipient);
-        let sender_prefix = format!("{sender_key}-");
-        let message_box = match room_id
-            .strip_prefix(&recipient_prefix)
-            .or_else(|| room_id.strip_prefix(&sender_prefix))
-            .filter(|s| !s.is_empty())
-        {
-            Some(s) => s.to_string(),
-            None => {
-                return vec![OutboundEvent::new(
-                    "messageFailed",
-                    json!({ "reason": "Room ID must be the sender's or recipient's room (\"<id>-<box>\")" }),
-                )];
-            }
-        };
-        // 0.3.20 (bsv-low loop-10 promotion, the delta-verify's M-A, 2026-09-09):
-        // the FIRST-PARTY boxes are refused on the live path too — the HTTP
-        // gate alone left `sendLiveMessage` able to store + bridge a forged
-        // tower `case` row into a seat's `low_events` (and a frame into a
-        // `broadcast-*` room). Same predicate as the HTTP door, one site for
-        // raw WS and socket.io; a `messageFailed` with the same code.
-        if let Some(reason) = first_party_box_reason(&message_box) {
-            return vec![OutboundEvent::new(
-                "messageFailed",
-                json!({ "reason": reason, "code": "ERR_FIRST_PARTY_BOX" }),
-            )];
-        }
-
-        // 4. Remaining per-field validation. Mirrors the HTTP validator's
-        // checks (validation::validate_send_message) — same error codes.
-        if message.message_id.is_empty() {
-            return vec![OutboundEvent::new(
-                "messageFailed",
-                json!({ "reason": "Each messageId must be a non-empty string." }),
-            )];
-        }
-        if message.body.is_null()
-            || (message.body.is_string()
-                && message.body.as_str().map(str::is_empty).unwrap_or(false))
-        {
-            return vec![OutboundEvent::new(
-                "messageFailed",
-                json!({ "reason": "Invalid message body." }),
-            )];
-        }
-
-        // 4. Construct the same `ValidatedSendMessage` shape the HTTP
-        // path produces, then call into the shared core. One source of
-        // truth for fee resolution → payment internalization → D1
-        // insert → FCM fan-out.
-        let validated = ValidatedSendMessage {
-            recipients: vec![(message.recipient.clone(), message.message_id.clone())],
-            message_box,
-            body: message.body,
-            payment,
+    ) -> (Vec<OutboundEvent>, AfterAnswer) {
+        let validated = match validate_ws_send(sender_key, &room_id, message, payment) {
+            Ok(v) => v,
+            Err(refused) => return (vec![refused], AfterAnswer::default()),
         };
 
         let db = match self.env.d1("DB") {
             Ok(d) => d,
             Err(e) => {
-                return vec![OutboundEvent::new(
-                    "messageFailed",
-                    json!({ "reason": format!("internal: D1 binding: {e}") }),
-                )];
+                return (
+                    vec![OutboundEvent::new(
+                        "messageFailed",
+                        json!({ "reason": format!("internal: D1 binding: {e}") }),
+                    )],
+                    AfterAnswer::default(),
+                );
             }
         };
         let store = Storage::new(&db);
 
         let t_send_start = worker::Date::now().as_millis();
-        let outcome = process_send(validated, sender_key, &self.env, &store).await;
+        let Sent { outcome, after } = process_send(validated, sender_key, &self.env, &store).await;
         // bsv-low#249 diagnostic: record the WS send outcome + duration. The
         // measured ~10.4s `relay.send fail` events are NOT this stage — they are
         // the CLIENT's `sendLiveMessage` waiting 10s for a `sendMessageAck` that
@@ -1336,7 +1281,7 @@ impl MessageHub {
             },
             worker::Date::now().as_millis().saturating_sub(t_send_start)
         );
-        outcome_to_outbound(&room_id, outcome)
+        (outcome_to_outbound(&room_id, outcome), after)
     }
 
     /// `/internal/socketio-event` (Phase C). Dispatch one inbound
@@ -1526,8 +1471,13 @@ impl MessageHub {
                         format!("{identity_key}-{message_box}")
                     }
                 };
-                self.process_send_message(&identity_key, room_id, parsed, payment)
-                    .await
+                // The outbound events are this request's answer to the
+                // EngineIoSession; the hub pushes run after it (0.6.1).
+                let (outbound, after) = self
+                    .process_send_message(&identity_key, room_id, parsed, payment)
+                    .await;
+                self.defer_fan_out(after);
+                outbound
             }
             "authenticated" => {
                 // Mirror raw WS: idempotent, just acknowledge for TS-shaped clients.
@@ -3343,6 +3293,120 @@ fn emit_message_failed(ws: &WebSocket, reason: &str) -> Result<()> {
     emit(ws, "messageFailed", &json!({ "reason": reason }))
 }
 
+/// The live send's checks, before any D1 work (the HTTP validator's codes):
+/// the room, the recipient key, the box derived from the room, the FIRST-PARTY
+/// box refusal (D9), the messageId and the body. A refusal is the one event
+/// to emit; nothing is stored and no push is owed.
+fn validate_ws_send(
+    sender_key: &str,
+    room_id: &str,
+    message: ClientSendMessage,
+    payment: Option<Value>,
+) -> std::result::Result<ValidatedSendMessage, OutboundEvent> {
+    // 1. Basic roomId validity.
+    if room_id.trim().is_empty() {
+        return Err(OutboundEvent::new(
+            "messageFailed",
+            json!({ "reason": "Invalid room ID" }),
+        ));
+    }
+
+    // 2. Validate the recipient identity up front (the room belongs to
+    //    either it or the sender — see below).
+    if !is_valid_pubkey(&message.recipient) {
+        return Err(OutboundEvent::new(
+            "messageFailed",
+            json!({ "reason": format!("Invalid recipient key: {}", message.recipient) }),
+        ));
+    }
+
+    // 3. Derive the message_box from whichever room the client addressed:
+    //    the RECIPIENT's room (`<recipient>-<box>` — the official
+    //    `@bsv/message-box-client` + the canonical message-box-server,
+    //    which ack + broadcast on the client-sent roomId) OR the sender's
+    //    OWN room (`<sender>-<box>` — the legacy raw-WS convention).
+    //    Crucially we ack on the SAME room_id below (`outcome_to_outbound`),
+    //    so each client's ack listener matches its own convention; the
+    //    message itself is always routed to `message.recipient`. Previously
+    //    this accepted ONLY the sender's room, so the official client —
+    //    which sends to and awaits `sendMessageAck-<recipient>-<box>` —
+    //    never got its ack: every WS send burned the 10s ack timeout and
+    //    fell back to HTTP, and the live push was lost (poll only). Read-
+    //    side ownership (joinRoom / listMessages) is still enforced, so a
+    //    sender can DEPOSIT into the recipient's box but never READ it.
+    let recipient_prefix = format!("{}-", message.recipient);
+    let sender_prefix = format!("{sender_key}-");
+    let message_box = match room_id
+        .strip_prefix(&recipient_prefix)
+        .or_else(|| room_id.strip_prefix(&sender_prefix))
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(OutboundEvent::new(
+                "messageFailed",
+                json!({ "reason": "Room ID must be the sender's or recipient's room (\"<id>-<box>\")" }),
+            ));
+        }
+    };
+    // 0.3.20 (bsv-low loop-10 promotion, the delta-verify's M-A, 2026-09-09):
+    // the FIRST-PARTY boxes are refused on the live path too — the HTTP
+    // gate alone left `sendLiveMessage` able to store + bridge a forged
+    // tower `case` row into a seat's `low_events` (and a frame into a
+    // `broadcast-*` room). Same predicate as the HTTP door, one site for
+    // raw WS and socket.io; a `messageFailed` with the same code.
+    if let Some(reason) = first_party_box_reason(&message_box) {
+        return Err(OutboundEvent::new(
+            "messageFailed",
+            json!({ "reason": reason, "code": "ERR_FIRST_PARTY_BOX" }),
+        ));
+    }
+
+    // 4. Remaining per-field validation. Mirrors the HTTP validator's
+    // checks (validation::validate_send_message) — same error codes.
+    if message.message_id.is_empty() {
+        return Err(OutboundEvent::new(
+            "messageFailed",
+            json!({ "reason": "Each messageId must be a non-empty string." }),
+        ));
+    }
+    if message.body.is_null()
+        || (message.body.is_string() && message.body.as_str().map(str::is_empty).unwrap_or(false))
+    {
+        return Err(OutboundEvent::new(
+            "messageFailed",
+            json!({ "reason": "Invalid message body." }),
+        ));
+    }
+
+    // 4. Construct the same `ValidatedSendMessage` shape the HTTP
+    // path produces, then call into the shared core. One source of
+    // truth for fee resolution → payment internalization → D1
+    // insert → FCM fan-out.
+    Ok(ValidatedSendMessage {
+        recipients: vec![(message.recipient.clone(), message.message_id.clone())],
+        message_box,
+        body: message.body,
+        payment,
+    })
+}
+
+/// The live leg's order: every outbound event (the `sendMessageAck` first) is
+/// emitted to the sender, and only then are the hub pushes handed to `defer`
+/// (`MessageHub::defer_fan_out`). The ack is not held behind the recipient's
+/// hub; it means durable, and delivery follows (or `listMessages` backfills).
+fn emit_then_defer(
+    events: Vec<OutboundEvent>,
+    after: AfterAnswer,
+    mut emit: impl FnMut(&OutboundEvent),
+    defer: impl FnOnce(AfterAnswer),
+) {
+    for ev in &events {
+        emit(ev);
+    }
+    defer(after);
+}
+
 /// Transport-agnostic translation of a `SendOutcome` into outbound
 /// events. Identical fan-out shape as the legacy `emit_send_outcome`,
 /// just structured so the same logic can drive both raw WS and the
@@ -5022,5 +5086,116 @@ mod departure_signals_tests {
         assert!(departure_signals(&lobby, true));
         assert!(!departure_signals(&game, false));
         assert!(departure_signals(&game, true));
+    }
+}
+
+/// bsv-low #787 (0.6.1): the live leg acks once durable; the push follows.
+#[cfg(test)]
+mod decouple_787_tests {
+    use super::*;
+    use crate::routes::send_message::test_hub::*;
+    use crate::routes::send_message::RecipientResult;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const SENDER: &str = "02d09d2feb33d5a17f426fd3d0c5c1a45c87961ece4c095fd111d37c7b2b0b4090";
+    const RECIPIENT: &str = "03b327e37ae081cd7954341bd4ac22cb2ada6db1f39c2560f741bfc88e8ad1d6d2";
+
+    /// A method's body (closed at its 4-space brace) or, for a free `fn` at
+    /// column 0, the free function's body.
+    fn body_of<'a>(src: &'a str, sig: &str) -> &'a str {
+        let a = src.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
+        let rest = &src[a..];
+        let free = src[..a].ends_with('\n');
+        let close = if free { "\n}\n" } else { "\n    }\n" };
+        &rest[..rest.find(close).unwrap()]
+    }
+
+    // Pin (b), behaviour: a slow recipient hub. The sender's `sendMessageAck`
+    // is emitted before the hub is touched and before the recipient's
+    // `sendMessage` delivery; the slow push still completes inside its bound.
+    #[test]
+    fn pin_b_the_ack_precedes_the_recipients_delivery_when_the_push_is_slow() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let hub = StubHub::new(log.clone(), Answer::After(50));
+        let room = format!("{RECIPIENT}-low_game_x");
+        let events = outcome_to_outbound(
+            &room,
+            SendOutcome::Success {
+                results: vec![RecipientResult {
+                    recipient: RECIPIENT.into(),
+                    message_id: "m1".into(),
+                }],
+            },
+        );
+        let mut deferred = None;
+        emit_then_defer(
+            events,
+            AfterAnswer::of(vec![job(RECIPIENT, "m1")]),
+            |ev| {
+                assert_eq!(hub.calls.get(), 0, "the ack is emitted before any push");
+                log.borrow_mut().push(format!("emit {}", ev.event_name));
+            },
+            |a| deferred = Some(a),
+        );
+        block_on(deferred.expect("the push is deferred").run_on(&hub));
+        let log = log.borrow();
+        let ack = at(&log, "emit sendMessageAck");
+        let delivered = at(&log, "hub delivered sendMessage");
+        assert!(ack < delivered, "{log:#?}");
+        assert!(at(&log, "broadcast.fanout.ok") > delivered);
+    }
+
+    // Pin (b), source: the raw WS leg and the socket.io bridge both emit the
+    // events first and defer the pushes; the ack no longer waits on them.
+    #[test]
+    fn pin_b_source_both_live_legs_emit_then_defer() {
+        let src = include_str!("message_hub.rs");
+        let ws = body_of(src, "async fn handle_send_message_event(");
+        assert!(
+            ws.contains("emit_then_defer("),
+            "the WS leg must emit the ack before it starts the push"
+        );
+        let order = body_of(src, "fn emit_then_defer(");
+        assert!(order.find("emit(ev)").unwrap() < order.find("defer(after)").unwrap());
+        let sio = body_of(src, "async fn dispatch_socketio_event(");
+        assert!(sio.contains("self.defer_fan_out(after)"));
+    }
+
+    // Pin (d), behaviour: the first-party boxes (D9) are refused on the live
+    // leg with ERR_FIRST_PARTY_BOX before any D1 work, so nothing is stored and
+    // no push is owed; any other box passes.
+    #[test]
+    fn pin_d_the_live_leg_refuses_the_first_party_boxes_before_any_write() {
+        let msg = || ClientSendMessage {
+            message_id: "m1".into(),
+            recipient: RECIPIENT.into(),
+            body: json!("hi"),
+        };
+        for first_party in ["low_events", "broadcast-low-pots"] {
+            for owner in [RECIPIENT, SENDER] {
+                let room = format!("{owner}-{first_party}");
+                let refused = validate_ws_send(SENDER, &room, msg(), None)
+                    .expect_err("a first-party box is refused");
+                assert_eq!(refused.event_name, "messageFailed");
+                assert_eq!(refused.data["code"], "ERR_FIRST_PARTY_BOX");
+            }
+        }
+        let ok = validate_ws_send(SENDER, &format!("{RECIPIENT}-low_game_x"), msg(), None)
+            .expect("an ordinary box passes");
+        assert_eq!(ok.message_box, "low_game_x");
+    }
+
+    // Pin (d), source: the refusal runs before the write path on both doors.
+    #[test]
+    fn pin_d_source_the_refusal_precedes_the_write_on_both_doors() {
+        let src = include_str!("message_hub.rs");
+        let leg = body_of(src, "async fn process_send_message(");
+        let refuse = leg.find("validate_ws_send(").expect("the live refusal");
+        assert!(refuse < leg.find("process_send(").unwrap());
+        assert!(body_of(src, "fn validate_ws_send(").contains("first_party_box_reason("));
+        let lib = include_str!("lib.rs");
+        let door = lib.find("first_party_box_refusal(&body)").unwrap();
+        assert!(door < lib[door..].find("handle_send_body(").unwrap() + door);
     }
 }

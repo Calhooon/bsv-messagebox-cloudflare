@@ -4,6 +4,17 @@ All notable changes to the relay. Public releases are cut from this repository w
 `scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
 `Calhooon/bsv-messagebox-cloudflare`.
 
+## [0.6.1] - 2026-10-20
+
+### A send is answered once durable; the push follows (bsv-low #787, #786)
+
+- **The fact (loop 38, beta, 2026-10-20 19:15Z to 19:25Z, unsampled).** `/sendMessage` route_ms median 2,034 ms, of which the D1 steps are about 130 ms (`send.read_ctx` 47, `send.insert_message` 79); the rest was the live push to the recipient's hub (`broadcast.fanout.ok` rtt median 1,481 ms, 36 percent of fan-outs at the 2,000 ms `PUSH_FANOUT_TIMEOUT_MS`), a hub flooded by `broadcast-low-pots` pushes. The sender's answer waited on a queue it has no business in.
+- **The order now, the reference's.** `process_send` returns a `Sent { outcome, after }`: the rows are stored (and the send budget charged) as before, and each stored row's push to its recipient's hub is recorded in `AfterAnswer` instead of awaited in the insert loop. HTTP `/sendMessage` and `/push` form the answer and hand the pushes to `ctx.wait_until` (`answer_then_defer`); the WS leg emits the `sendMessageAck` to the sender and then hands them to the hub's `state.wait_until` (`emit_then_defer`, raw `/ws` and the socket.io bridge alike). message-box-server stores, answers (`sendMessageAck-<room>`), and then emits to the recipient's sockets without awaiting a delivery ack.
+- **What the answer means.** Durable, not delivered: the row is in D1; delivery is the recipient's socket push or its next `listMessages`. The answer body is unchanged.
+- **Every bound kept.** Each push is still raced against the 2 s `PUSH_FANOUT_TIMEOUT_MS` (`push_one`, the same `broadcast.fanout.start/ok/err/timeout` lines), per recipient, in insert order; a push that times out after the answer is logged and backfilled by `listMessages`. A send that stops part way (a duplicate, a D1 fault) still runs the pushes of the rows stored before it, as before. The duplicate rule (#249: `Duplicate->sendMessageAck`), the first-party box refusal (D9, now `validate_ws_send` on the live leg, before any write), the session lane (D10) and the send budget are unchanged. FCM for the `notifications` box is unchanged (still in the request).
+- **Trace.** `TRACE_LAT send.answered ms=<from request start>` (`path=/sendMessage`, `path=/push`, `leg=ws`) beside `TRACE_LAT req`, so the next loop's window shows the answer time apart from the push time.
+- **Pins** (`decouple_787_tests` in `routes/send_message.rs` and `message_hub.rs`; RED on `origin/main` 6607978 at the source pins' named assertions, the behaviour pins' seams absent there): (a) a hub that never answers: the HTTP answer is formed before the hub is touched, the `broadcast.fanout.timeout ... after_ms=2000` line follows it; (b) a slow hub: the `sendMessageAck` is emitted before the recipient's `sendMessage` delivery; (c) a duplicate still answers `ERR_DUPLICATE_MESSAGE` / acks, and the owed pushes still run; (d) the first-party boxes are refused on the live leg before any write. No publish, tag, mirror cut or deploy in this lane.
+
 ## [0.6.0] - 2026-10-19
 
 ### The middleware 0.7.0 and core 0.4.0 on bsv-rs 0.7.0 (#105's last red here)

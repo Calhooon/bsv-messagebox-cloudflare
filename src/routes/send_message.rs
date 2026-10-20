@@ -22,6 +22,14 @@
 //! `internalizeAction` via `payments.rs`), R2-backed BEEF resolution,
 //! D1 insertion, and FCM fan-out logic live here once. The wrappers
 //! contain only outcome → wire-format translation.
+//!
+//! The live push to each recipient's hub (M9 #45) is NOT part of the answer
+//! (0.6.1, bsv-low #787): `process_send` returns it as an `AfterAnswer`, and
+//! each caller runs it once the answer is out (`answer_then_defer` on HTTP,
+//! `emit_then_defer` in the hub). A send is answered once its rows are
+//! durable; delivery is the recipient's socket push or its next
+//! `listMessages`. That is the reference's order: message-box-server stores,
+//! answers, and emits to the room without waiting on a delivery.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -31,9 +39,11 @@ use serde_json::{json, Value};
 use worker::{console_log, Date, Delay, Env, Headers, Method, Request, RequestInit};
 
 /// Hard cap on the best-effort WS live-push fan-out to a recipient's Durable
-/// Object (`push_to_recipient_sockets`). The push MUST NOT block `POST
-/// /sendMessage`: the message is already durable in D1 and offline / slow-DO
-/// clients receive it via `listMessages` backfill. Without this cap an
+/// Object (`push_one`). The push MUST NOT block `POST /sendMessage`: the
+/// message is already durable in D1 and offline / slow-DO clients receive it
+/// via `listMessages` backfill. Since 0.6.1 the push runs after the answer
+/// (`AfterAnswer`); this bound still caps how long the deferred work holds the
+/// Worker (or the hub) open. Without this cap an
 /// unresponsive `/internal/push` DO fetch hangs the whole send for the client's
 /// full request timeout (~30s) — which wedged every authed send under load
 /// (the relay's `/sendMessage` "canceled" 30s hang, 0 CPU). 2s is far above a
@@ -107,6 +117,87 @@ pub enum SendOutcome {
     TransientError { detail: String },
 }
 
+/// The result of the shared write path: the outcome the caller answers with,
+/// and the pushes the stored rows owe their recipients' hubs, which the caller
+/// runs only after the answer is out.
+#[must_use]
+pub struct Sent {
+    pub outcome: SendOutcome,
+    pub after: AfterAnswer,
+}
+
+/// One live push a durable row owes its recipient's hub (M9 #45).
+#[derive(Debug, Clone)]
+pub struct HubPush {
+    pub recipient: String,
+    pub message_box: String,
+    pub sender: String,
+    pub message_id: String,
+    pub body: Value,
+}
+
+/// What a send leaves for after its answer: one `HubPush` per row that
+/// landed, in insert order. A send that stops part way (a duplicate, a D1
+/// fault) still owes the pushes of the rows stored before it, as before.
+#[derive(Debug, Default)]
+#[must_use]
+pub struct AfterAnswer {
+    pushes: Vec<HubPush>,
+}
+
+impl AfterAnswer {
+    #[cfg(test)]
+    pub(crate) fn of(pushes: Vec<HubPush>) -> Self {
+        Self { pushes }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pushes(&self) -> &[HubPush] {
+        &self.pushes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pushes.is_empty()
+    }
+
+    /// Run the pushes against the real `MESSAGE_HUB`, each one raced against
+    /// `PUSH_FANOUT_TIMEOUT_MS`. For `ctx.wait_until` / `state.wait_until`.
+    pub async fn run(self, env: Env) {
+        self.run_on(&WorkerHub { env }).await
+    }
+
+    /// The same over any hub (the pins drive a stub).
+    pub(crate) async fn run_on<H: PushHub>(self, hub: &H) {
+        for job in &self.pushes {
+            push_one(hub, job).await;
+        }
+    }
+}
+
+/// The HTTP leg's order: the answer is formed from the outcome, the fan-out is
+/// handed to `defer` (the Worker's `ctx.wait_until`), and the answer returns
+/// without waiting on it. The answer means DURABLE, not delivered: the rows are
+/// in D1; delivery is the recipient's socket push or its next `listMessages`.
+/// This is the reference's order (message-box-server stores, answers, and
+/// emits to the room without awaiting a delivery ack).
+pub fn answer_then_defer(sent: Sent, defer: impl FnOnce(AfterAnswer)) -> (Value, u16) {
+    let answer = outcome_to_http(sent.outcome);
+    if !sent.after.is_empty() {
+        defer(sent.after);
+    }
+    answer
+}
+
+/// The hub a push goes to: the real one is `WorkerHub`; the pins use stubs.
+pub(crate) trait PushHub {
+    /// Deliver one push; `Err` carries the transport or setup failure.
+    fn push(&self, job: &HubPush) -> impl Future<Output = Result<(), String>>;
+    /// A future that resolves after `ms`.
+    fn timer(&self, ms: u64) -> impl Future<Output = ()>;
+    fn now_ms(&self) -> u64;
+    fn log(&self, line: String);
+}
+
 /// Map a `worker::Error` bubbled out of the D1 read/write helpers onto the right
 /// send outcome: the bounded retry loops only ever propagate a TRANSIENT error
 /// after exhausting their attempts (a genuine error short-circuits without
@@ -133,11 +224,27 @@ fn classify_store_error(e: worker::Error) -> SendOutcome {
 ///
 /// The function MUST stay pure of transport concerns — no `Response`,
 /// no `WebSocket`. That is the parity contract.
+///
+/// The returned `Sent` carries the hub pushes apart from the outcome: no push
+/// runs here, so the caller answers once the rows are durable (0.6.1).
 pub async fn process_send(
     validated: ValidatedSendMessage,
     sender_key: &str,
     env: &Env,
     store: &Storage<'_>,
+) -> Sent {
+    let mut after = AfterAnswer::default();
+    let outcome = store_send(validated, sender_key, env, store, &mut after).await;
+    Sent { outcome, after }
+}
+
+/// `process_send`'s body: every row it stores leaves its push in `after`.
+async fn store_send(
+    validated: ValidatedSendMessage,
+    sender_key: &str,
+    env: &Env,
+    store: &Storage<'_>,
+    after: &mut AfterAnswer,
 ) -> SendOutcome {
     // -- 1. Resolve per-recipient context (recipient fee + server delivery fee + the
     //       recipient's message-box id) in ONE D1 `batch()` round-trip each — #9: this is
@@ -351,21 +458,18 @@ pub async fn process_send(
             message_id: message_id.clone(),
         });
 
-        // -- M9 #45: HTTP→WS push bridge. Fan out the freshly stored
-        //    message to any of the recipient's currently-connected
-        //    sockets that have joined the matching room. Best-effort:
-        //    push failure (DO unreachable, no subscribers, JSON marshal
-        //    error) MUST NOT fail the HTTP send. The message is already
-        //    in D1; offline clients get it on their next listMessages.
-        push_to_recipient_sockets(
-            env,
-            recipient,
-            &validated.message_box,
-            sender_key,
-            message_id,
-            &validated.body,
-        )
-        .await;
+        // -- M9 #45: HTTP→WS push bridge. The freshly stored message is
+        //    owed to any of the recipient's connected sockets that joined
+        //    the matching room. Recorded here, run by the caller AFTER the
+        //    answer (0.6.1): the row is the source of truth, a push that
+        //    fails or times out is backfilled by the next listMessages.
+        after.pushes.push(HubPush {
+            recipient: recipient.clone(),
+            message_box: validated.message_box.clone(),
+            sender: sender_key.to_string(),
+            message_id: message_id.clone(),
+            body: validated.body.clone(),
+        });
 
         // Fire-and-forget FCM push — only for the notifications box.
         if fcm::should_use_fcm_delivery(&validated.message_box) {
@@ -449,87 +553,87 @@ pub fn outcome_to_http(outcome: SendOutcome) -> (Value, u16) {
 /// identity's sockets that have joined `<recipient>-<message_box>`
 /// receive the `sendMessage` envelope in real time.
 ///
-/// Best-effort: every failure path here logs via `console_log!` and
-/// returns. The HTTP `sendMessage` caller MUST NOT see this fail —
-/// the durable D1 row is the source of truth, and offline clients
-/// pick the message up on their next `listMessages`.
+/// Best-effort: every failure path here is logged and returns. The
+/// sender MUST NOT see this fail, and since 0.6.1 never waits on it
+/// either (it runs after the answer, `AfterAnswer`) — the durable D1
+/// row is the source of truth, and offline clients pick the message up
+/// on their next `listMessages`.
 ///
 /// Why no auth on the internal endpoint: DOs are not addressable
 /// from the public internet. The only way a request reaches
 /// `MessageHub::handle_internal_push` is via this Worker's stub, and
 /// this Worker has already done BRC-31 mutual auth on the originating
 /// `POST /sendMessage`. Adding a second auth layer would be theatre.
-async fn push_to_recipient_sockets(
-    env: &Env,
-    recipient: &str,
-    message_box: &str,
-    sender: &str,
-    message_id: &str,
-    body: &Value,
-) {
-    let payload = json!({
-        "roomId": format!("{recipient}-{message_box}"),
-        "sender": sender,
-        "messageId": message_id,
-        "body": body,
-    })
-    .to_string();
+struct WorkerHub {
+    env: Env,
+}
 
-    let namespace = match env.durable_object("MESSAGE_HUB") {
-        Ok(n) => n,
-        Err(e) => {
-            console_log!("WS push: MESSAGE_HUB binding lookup failed: {}", e);
-            return;
-        }
-    };
+impl PushHub for WorkerHub {
+    async fn push(&self, job: &HubPush) -> Result<(), String> {
+        let payload = json!({
+            "roomId": format!("{}-{}", job.recipient, job.message_box),
+            "sender": job.sender,
+            "messageId": job.message_id,
+            "body": job.body,
+        })
+        .to_string();
 
-    let stub = match namespace
-        .id_from_name(recipient)
-        .and_then(|id| id.get_stub())
-    {
-        Ok(s) => s,
-        Err(e) => {
-            console_log!("WS push: stub lookup for {} failed: {}", recipient, e);
-            return;
-        }
-    };
+        let namespace = self
+            .env
+            .durable_object("MESSAGE_HUB")
+            .map_err(|e| format!("MESSAGE_HUB binding lookup failed: {e}"))?;
+        let stub = namespace
+            .id_from_name(&job.recipient)
+            .and_then(|id| id.get_stub())
+            .map_err(|e| format!("stub lookup for {} failed: {e}", job.recipient))?;
 
-    let headers = Headers::new();
-    if let Err(e) = headers.set("content-type", "application/json") {
-        console_log!("WS push: header setup failed: {}", e);
-        return;
+        let headers = Headers::new();
+        headers
+            .set("content-type", "application/json")
+            .map_err(|e| format!("header setup failed: {e}"))?;
+
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(payload.into()));
+
+        // The URL host is irrelevant for DO stub fetches — the runtime
+        // routes purely on the Worker→DO stub. The path IS read by
+        // `handle_internal_push` (matches `/internal/push`), so use a
+        // synthetic origin and the literal path.
+        let req = Request::new_with_init("https://do.local/internal/push", &init)
+            .map_err(|e| format!("request construction failed: {e}"))?;
+        stub.fetch_with_request(req)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post)
-        .with_headers(headers)
-        .with_body(Some(payload.into()));
+    fn timer(&self, ms: u64) -> impl Future<Output = ()> {
+        Delay::from(Duration::from_millis(ms))
+    }
 
-    // The URL host is irrelevant for DO stub fetches — the runtime
-    // routes purely on the Worker→DO stub. The path IS read by
-    // `handle_internal_push` (matches `/internal/push`), so use a
-    // synthetic origin and the literal path.
-    let req = match Request::new_with_init("https://do.local/internal/push", &init) {
-        Ok(r) => r,
-        Err(e) => {
-            console_log!("WS push: request construction failed: {}", e);
-            return;
-        }
-    };
+    fn now_ms(&self) -> u64 {
+        Date::now().as_millis()
+    }
 
-    let t_fanout_start = Date::now().as_millis();
-    console_log!(
-        "TRACE_PHD broadcast.fanout.start recipient={} msgId={} t={}",
-        recipient,
-        message_id,
-        t_fanout_start
-    );
-    // Bound the DO push: race the subrequest against a `PUSH_FANOUT_TIMEOUT_MS`
-    // `Delay`. On timeout we ABANDON the push (dropping the fetch future cancels
-    // the subrequest) and return — best-effort, exactly as this function's
-    // contract documents — so a wedged/slow recipient DO can never hang the send.
-    let mut fetch = Box::pin(stub.fetch_with_request(req));
-    let mut push_timeout = Box::pin(Delay::from(Duration::from_millis(PUSH_FANOUT_TIMEOUT_MS)));
+    fn log(&self, line: String) {
+        console_log!("{}", line);
+    }
+}
+
+/// One bounded push: race the hub's answer against `PUSH_FANOUT_TIMEOUT_MS`.
+/// On timeout the push is ABANDONED (dropping the fetch future cancels the
+/// subrequest) and logged, best-effort, so a wedged/slow recipient DO never
+/// holds the deferred work past the bound.
+async fn push_one<H: PushHub>(hub: &H, job: &HubPush) {
+    let (recipient, message_id, message_box) = (&job.recipient, &job.message_id, &job.message_box);
+    let t_fanout_start = hub.now_ms();
+    hub.log(format!(
+        "TRACE_PHD broadcast.fanout.start recipient={recipient} msgId={message_id} t={t_fanout_start}"
+    ));
+    let mut fetch = Box::pin(hub.push(job));
+    let mut push_timeout = Box::pin(hub.timer(PUSH_FANOUT_TIMEOUT_MS));
     let push_result = std::future::poll_fn(|cx| {
         if let std::task::Poll::Ready(r) = fetch.as_mut().poll(cx) {
             return std::task::Poll::Ready(Some(r));
@@ -540,53 +644,31 @@ async fn push_to_recipient_sockets(
         std::task::Poll::Pending
     })
     .await;
-    let t_done = Date::now().as_millis();
+    let t_done = hub.now_ms();
+    let rtt = t_done.saturating_sub(t_fanout_start);
     match push_result {
-        Some(Ok(_)) => {
-            console_log!(
-                "TRACE_PHD broadcast.fanout.ok recipient={} msgId={} t={} rtt_ms={}",
-                recipient,
-                message_id,
-                t_done,
-                t_done.saturating_sub(t_fanout_start)
-            );
-        }
+        Some(Ok(())) => hub.log(format!(
+            "TRACE_PHD broadcast.fanout.ok recipient={recipient} msgId={message_id} t={t_done} rtt_ms={rtt}"
+        )),
         Some(Err(e)) => {
-            console_log!(
-                "TRACE_PHD broadcast.fanout.err recipient={} msgId={} t={} rtt_ms={} err={}",
-                recipient,
-                message_id,
-                t_done,
-                t_done.saturating_sub(t_fanout_start),
-                e
-            );
-            console_log!(
-                "WS push: fan-out to recipient={} room={}-{} failed: {}",
-                recipient,
-                recipient,
-                message_box,
-                e
-            );
+            hub.log(format!(
+                "TRACE_PHD broadcast.fanout.err recipient={recipient} msgId={message_id} t={t_done} rtt_ms={rtt} err={e}"
+            ));
+            hub.log(format!(
+                "WS push: fan-out to recipient={recipient} room={recipient}-{message_box} failed: {e}"
+            ));
         }
         None => {
             // Timed out — best-effort push abandoned. The D1 row is the source of
             // truth; the recipient gets the message on its next `listMessages`
             // (the MPC ceremonies' reliability-drain backfill covers this).
-            console_log!(
-                "TRACE_PHD broadcast.fanout.timeout recipient={} msgId={} t={} after_ms={}",
-                recipient,
-                message_id,
-                t_done,
-                PUSH_FANOUT_TIMEOUT_MS
-            );
-            console_log!(
-                "WS push: fan-out to recipient={} room={}-{} TIMED OUT after {}ms (best-effort; \
-                 message already durable in D1, delivered via listMessages backfill)",
-                recipient,
-                recipient,
-                message_box,
-                PUSH_FANOUT_TIMEOUT_MS
-            );
+            hub.log(format!(
+                "TRACE_PHD broadcast.fanout.timeout recipient={recipient} msgId={message_id} t={t_done} after_ms={PUSH_FANOUT_TIMEOUT_MS}"
+            ));
+            hub.log(format!(
+                "WS push: fan-out to recipient={recipient} room={recipient}-{message_box} TIMED OUT after {PUSH_FANOUT_TIMEOUT_MS}ms (best-effort; \
+                 message already durable in D1, delivered via listMessages backfill)"
+            ));
         }
     }
 }
@@ -688,5 +770,252 @@ mod tests {
         let (got, status) = outcome_to_http(outcome);
         assert_eq!(status, 400);
         assert_eq!(got, body);
+    }
+}
+
+/// Host-drivable hub stubs for the 0.6.1 order pins (bsv-low #787): the real
+/// hub fetch and `Delay` are wasm-only, so the pins drive `AfterAnswer::run_on`.
+#[cfg(test)]
+pub(crate) mod test_hub {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+
+    pub(crate) type Log = Rc<RefCell<Vec<String>>>;
+
+    /// How the stub hub answers a push.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Answer {
+        /// Never answers (a wedged or flooded recipient hub); the timer fires.
+        Never,
+        /// Answers after this many polls (a slow hub); the timer never fires.
+        After(usize),
+    }
+
+    pub(crate) struct StubHub {
+        pub(crate) log: Log,
+        pub(crate) answer: Answer,
+        pub(crate) calls: Cell<usize>,
+    }
+
+    impl StubHub {
+        pub(crate) fn new(log: Log, answer: Answer) -> Self {
+            Self {
+                log,
+                answer,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    /// Ready after `n` polls, waking itself in between.
+    struct Polls(usize);
+
+    impl Future for Polls {
+        type Output = ();
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 == 0 {
+                return Poll::Ready(());
+            }
+            self.0 -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    impl PushHub for StubHub {
+        async fn push(&self, job: &HubPush) -> Result<(), String> {
+            self.calls.set(self.calls.get() + 1);
+            match self.answer {
+                Answer::Never => std::future::pending::<()>().await,
+                Answer::After(n) => Polls(n).await,
+            }
+            self.log.borrow_mut().push(format!(
+                "hub delivered sendMessage room={}-{} msgId={}",
+                job.recipient, job.message_box, job.message_id
+            ));
+            Ok(())
+        }
+
+        async fn timer(&self, _ms: u64) {
+            match self.answer {
+                Answer::Never => {}
+                Answer::After(_) => std::future::pending::<()>().await,
+            }
+        }
+
+        fn now_ms(&self) -> u64 {
+            0
+        }
+
+        fn log(&self, line: String) {
+            self.log.borrow_mut().push(line);
+        }
+    }
+
+    pub(crate) fn job(recipient: &str, message_id: &str) -> HubPush {
+        HubPush {
+            recipient: recipient.to_string(),
+            message_box: "low_game_x".to_string(),
+            sender: "S".to_string(),
+            message_id: message_id.to_string(),
+            body: json!("hi"),
+        }
+    }
+
+    pub(crate) fn block_on<F: Future>(f: F) -> F::Output {
+        let mut f = std::pin::pin!(f);
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..100_000 {
+            if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+        panic!("the future did not resolve");
+    }
+
+    pub(crate) fn at(log: &[String], needle: &str) -> usize {
+        log.iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no log line contains {needle:?}: {log:#?}"))
+    }
+}
+
+/// bsv-low #787 (0.6.1): a send is answered once durable; the push follows.
+#[cfg(test)]
+mod decouple_787_tests {
+    use super::test_hub::*;
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn write_path_src() -> &'static str {
+        let src = include_str!("send_message.rs");
+        let a = src
+            .find("pub async fn process_send(")
+            .expect("process_send");
+        let b = src
+            .find("pub fn outcome_to_http(")
+            .expect("outcome_to_http");
+        &src[a..b]
+    }
+
+    fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let a = src.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
+        let rest = &src[a..];
+        let end = rest
+            .find("\n}\n")
+            .or_else(|| rest.find("\n    }\n"))
+            .unwrap();
+        &rest[..end]
+    }
+
+    // Pin (a), behaviour: a hub that never answers. The HTTP answer is formed
+    // before the hub is touched, and the push's timeout is logged after it.
+    #[test]
+    fn pin_a_a_send_answers_before_its_push_and_the_timeout_is_logged_after() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let hub = StubHub::new(log.clone(), Answer::Never);
+        let sent = Sent {
+            outcome: SendOutcome::Success {
+                results: vec![RecipientResult {
+                    recipient: "R1".into(),
+                    message_id: "m1".into(),
+                }],
+            },
+            after: AfterAnswer::of(vec![job("R1", "m1")]),
+        };
+        let mut deferred = None;
+        let (body, status) = answer_then_defer(sent, |a| deferred = Some(a));
+        log.borrow_mut().push("send.answered".into());
+        assert_eq!(status, 200);
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["results"][0]["messageId"], "m1");
+        assert_eq!(
+            hub.calls.get(),
+            0,
+            "the hub is not touched before the answer"
+        );
+
+        let after = deferred.expect("the push is deferred, not dropped");
+        assert_eq!(after.pushes().len(), 1);
+        block_on(after.run_on(&hub));
+        let log = log.borrow();
+        let answered = at(&log, "send.answered");
+        let timeout = at(
+            &log,
+            "TRACE_PHD broadcast.fanout.timeout recipient=R1 msgId=m1",
+        );
+        assert!(answered < timeout, "{log:#?}");
+        assert!(
+            log[timeout].contains("after_ms=2000"),
+            "the 2 s bound holds"
+        );
+        assert!(!log.iter().any(|l| l.contains("hub delivered")));
+    }
+
+    // Pin (a), source: the write path holds no push await; the HTTP leg hands
+    // the fan-out to `ctx.wait_until` after forming the answer.
+    #[test]
+    fn pin_a_source_the_write_path_awaits_no_push() {
+        let path = write_path_src();
+        assert!(
+            !path.contains("push_to_recipient_sockets(") && !path.contains("push_one("),
+            "process_send must not await the hub push before it answers"
+        );
+        let lib = include_str!("../lib.rs");
+        let tail = fn_body(lib, "async fn handle_send_body(");
+        assert!(
+            tail.contains("ctx.wait_until("),
+            "the HTTP leg must run the fan-out under ctx.wait_until"
+        );
+        assert!(lib.contains("TRACE_LAT send.answered ms="));
+    }
+
+    // Pin (c), behaviour: a duplicate still answers ERR_DUPLICATE_MESSAGE on
+    // HTTP; the pushes owed by the rows stored before it still run.
+    #[test]
+    fn pin_c_a_duplicate_answers_unchanged_and_the_owed_pushes_still_run() {
+        let sent = Sent {
+            outcome: SendOutcome::DuplicateMessage {
+                recipient: "R2".into(),
+                message_id: "m2".into(),
+            },
+            after: AfterAnswer::of(vec![job("R1", "m1")]),
+        };
+        let mut deferred = None;
+        let (body, status) = answer_then_defer(sent, |a| deferred = Some(a));
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], "ERR_DUPLICATE_MESSAGE");
+        let after = deferred.expect("the stored row's push still runs");
+        assert_eq!(after.pushes()[0].message_id, "m1");
+
+        let lone = Sent {
+            outcome: SendOutcome::DuplicateMessage {
+                recipient: "R1".into(),
+                message_id: "m1".into(),
+            },
+            after: AfterAnswer::default(),
+        };
+        let mut called = false;
+        let (_, status) = answer_then_defer(lone, |_| called = true);
+        assert_eq!(status, 400);
+        assert!(!called, "a duplicate stored nothing and owes no push");
+    }
+
+    // Pin (c), source: the duplicate return no longer waits on the earlier
+    // rows' pushes (they were awaited in the insert loop), and the WS trace
+    // still names the duplicate an ack (#249).
+    #[test]
+    fn pin_c_source_the_duplicate_return_waits_on_no_push() {
+        let path = write_path_src();
+        assert!(path.contains("Ok(false) =>") && path.contains("DuplicateMessage {"));
+        assert!(
+            !path.contains("push_to_recipient_sockets("),
+            "the duplicate return must not wait on the pushes of the rows before it"
+        );
+        let hub = include_str!("../message_hub.rs");
+        assert!(hub.contains("\"Duplicate->sendMessageAck"));
     }
 }

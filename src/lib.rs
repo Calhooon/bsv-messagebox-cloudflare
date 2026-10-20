@@ -204,6 +204,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         if !crate::session_lane::bearer_matches(&got, &expected) {
             return Response::error("unauthorized", 401);
         }
+        let t_push_start = Date::now().as_millis();
         let mut req = req;
         let raw = req.bytes().await?;
         let (sender, send_body) = match split_push_body(&raw, Date::now().as_millis()) {
@@ -212,7 +213,12 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         };
         let db = env.d1("DB")?;
         let store = storage::Storage::new(&db);
-        let (body, status) = handle_send_message(&send_body, &sender, &env, &store).await;
+        let (body, status) = handle_send_message(&send_body, &sender, &env, &store, &ctx).await;
+        console_log!(
+            "TRACE_LAT send.answered ms={} path=/push status={}",
+            Date::now().as_millis().saturating_sub(t_push_start),
+            status
+        );
         return Response::from_json(&body).map(|r| r.with_status(status));
     }
     // bsv-low #443 step 4 (2026-09-14): `POST /session/attest` — a first-party
@@ -471,7 +477,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
                         json!({ "status": "error", "code": code, "description": description }),
                         status,
                     ),
-                    None => handle_send_body(body, identity_key, &env, &store).await,
+                    None => handle_send_body(body, identity_key, &env, &store, &ctx).await,
                 },
             }
         }
@@ -558,7 +564,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // nLockTime refund), or gets overridden by the tower deadline (tier 1).
         (Method::Post, "/rejoin-deadline") => {
             let url = req.url().map_err(|e| Error::from(e.to_string()))?;
-            handle_rejoin_deadline_route(&url, &request_body, &env).await
+            handle_rejoin_deadline_route(&url, &request_body, &env, &ctx).await
         }
 
         _ => (
@@ -585,6 +591,15 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
             "brc104"
         }
     );
+    // 0.6.1 (bsv-low #787): the send's answer time, apart from its hub push,
+    // which now runs after the answer (`broadcast.fanout.*` under wait_until).
+    if req_path_dbg == "/sendMessage" {
+        console_log!(
+            "TRACE_LAT send.answered ms={} path=/sendMessage status={}",
+            t_route_done.saturating_sub(t_req_start),
+            status
+        );
+    }
 
     // The answer: signed under BRC-104 when the middleware authenticated;
     // sealed under the session lane's K when the lane did; plain CORS
@@ -838,15 +853,22 @@ fn with_session_lane_cors(resp: Response) -> Response {
 /// function and translate the structured `SendOutcome` into their
 /// respective wire formats. The HTTP `(json, status)` shape produced
 /// here is byte-identical to the pre-#44 implementation.
+///
+/// The answer means DURABLE, not delivered (0.6.1): it is formed once the rows
+/// are in D1, and the push to each recipient's hub runs after it under
+/// `ctx.wait_until`; delivery is that push or the recipient's next
+/// `listMessages`. This is the reference's order (message-box-server stores,
+/// answers, and emits to the room without awaiting a delivery ack).
 async fn handle_send_message(
     raw_body: &[u8],
     sender_key: &str,
     env: &Env,
     store: &storage::Storage<'_>,
+    ctx: &Context,
 ) -> (serde_json::Value, u16) {
     match validation::read_send_body(raw_body) {
         Err(refused) => refused,
-        Ok(body) => handle_send_body(body, sender_key, env, store).await,
+        Ok(body) => handle_send_body(body, sender_key, env, store, ctx).await,
     }
 }
 
@@ -856,6 +878,7 @@ async fn handle_send_body(
     sender_key: &str,
     env: &Env,
     store: &storage::Storage<'_>,
+    ctx: &Context,
 ) -> (serde_json::Value, u16) {
     let validated = match validation::validate_send_value(body) {
         Ok(v) => v,
@@ -865,8 +888,8 @@ async fn handle_send_body(
             );
         }
     };
-    let outcome = routes::send_message::process_send(validated, sender_key, env, store).await;
-    routes::send_message::outcome_to_http(outcome)
+    let sent = routes::send_message::process_send(validated, sender_key, env, store).await;
+    routes::send_message::answer_then_defer(sent, |after| ctx.wait_until(after.run(env.clone())))
 }
 
 async fn handle_list_messages(
@@ -1125,6 +1148,7 @@ async fn handle_rejoin_deadline_route(
     url: &Url,
     raw_body: &[u8],
     env: &Env,
+    ctx: &Context,
 ) -> (serde_json::Value, u16) {
     let room = url
         .query_pairs()
@@ -1197,7 +1221,7 @@ async fn handle_rejoin_deadline_route(
                     if let Ok(db) = env.d1("DB") {
                         let store = storage::Storage::new(&db);
                         let (_, status) =
-                            handle_send_message(&send_body, &sender, env, &store).await;
+                            handle_send_message(&send_body, &sender, env, &store, ctx).await;
                         ladder = if (200..300).contains(&status) {
                             "filed"
                         } else {
