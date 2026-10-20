@@ -36,7 +36,7 @@
 //! ## Why the retry is money-safe (idempotent, at-least-once, ordered)
 //!
 //! The forwarded write is `insert_message`, an `INSERT OR IGNORE` on a UNIQUE
-//! content-addressed `messageId` (see `storage::insert_changes_mean_stored`). A
+//! content-addressed `messageId` (see `storage::insert_count_verdict`). A
 //! first attempt whose response timed out may still have LANDED on the platform;
 //! the retry then sees the row already present and `MessageHub` returns a
 //! `DuplicateMessage` → mapped to `sendMessageAck { duplicate: true }`

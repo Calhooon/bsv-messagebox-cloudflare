@@ -122,6 +122,10 @@ fn cors_error_500() -> Response {
 }
 
 async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    // The request's start: every `TRACE_LAT` line of an HTTP route measures
+    // from here (`req`, `send.answered` on `/sendMessage` and `/push` alike;
+    // 0.6.1, R1 L4).
+    let t_req_start = Date::now().as_millis();
     // CORS preflight — must respond before auth
     if req.method() == Method::Options {
         // bsv-low W-B (D10): the browser's preflight must allow the HTTP
@@ -204,7 +208,6 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         if !crate::session_lane::bearer_matches(&got, &expected) {
             return Response::error("unauthorized", 401);
         }
-        let t_push_start = Date::now().as_millis();
         let mut req = req;
         let raw = req.bytes().await?;
         let (sender, send_body) = match split_push_body(&raw, Date::now().as_millis()) {
@@ -215,8 +218,8 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         let store = storage::Storage::new(&db);
         let (body, status) = handle_send_message(&send_body, &sender, &env, &store, &ctx).await;
         console_log!(
-            "TRACE_LAT send.answered ms={} path=/push status={}",
-            Date::now().as_millis().saturating_sub(t_push_start),
+            "TRACE_LAT send.answered ms={} path=/push from=req status={}",
+            Date::now().as_millis().saturating_sub(t_req_start),
             status
         );
         return Response::from_json(&body).map(|r| r.with_status(status));
@@ -387,7 +390,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // measured cause of the ~10.4s `relay.send fail` events in the
     // twoHandRematch-2026-07-23_16-47-30 bundle). Cheap: two `Date::now()` reads
     // + one log line; no allocation on the hot path beyond the format.
-    let t_req_start = Date::now().as_millis();
+    // (`t_req_start` is taken at `handle`'s entry, before any route.)
     let req_method_dbg = req.method();
     let req_path_dbg = req.path();
 
@@ -595,7 +598,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // which now runs after the answer (`broadcast.fanout.*` under wait_until).
     if req_path_dbg == "/sendMessage" {
         console_log!(
-            "TRACE_LAT send.answered ms={} path=/sendMessage status={}",
+            "TRACE_LAT send.answered ms={} path=/sendMessage from=req status={}",
             t_route_done.saturating_sub(t_req_start),
             status
         );

@@ -639,11 +639,13 @@ impl<'a> Storage<'a> {
     /// triggered ONLY after a previous attempt errored or timed out. On a CF
     /// Worker a timed-out (dropped) write subrequest may still LAND on the
     /// platform, so the re-attempt's `INSERT OR IGNORE` can see the row already
-    /// present and report `changes == 0`. After a retry that `0` means "our own
-    /// earlier attempt of THIS send already stored it" (same message_id + body) —
-    /// a SUCCESS, not a spurious duplicate. Only a CLEAN first-attempt `0`
-    /// (`retried == false`) is a genuine duplicate `messageId`, preserving the
-    /// existing duplicate-detection behaviour exactly.
+    /// present and report `changes == 0`. After a retry that `0` is read back
+    /// (0.6.1, R1 L5): the row holding the message id is this send's own (same
+    /// sender, recipient and body) ⇒ STORED; another's, or none ⇒ a duplicate.
+    /// Before 0.6.1 a retried `0` was taken as stored unseen, so a send racing
+    /// a genuine duplicate across a retry was answered durable on a row that
+    /// was not its own. A CLEAN first-attempt `0` (`retried == false`) is a
+    /// genuine duplicate `messageId`, unchanged.
     ///
     /// `beef_key` is the R2 key the body's payment names, when it names one:
     /// the row's reference to the object (migration 0004).
@@ -664,7 +666,21 @@ impl<'a> Storage<'a> {
             .bind(body)
             .bind(beef_key);
         let (meta, retried) = with_d1_write_retry(|| insert.execute(self.db)).await?;
-        Ok(insert_changes_mean_stored(meta.changes, retried))
+        match insert_count_verdict(meta.changes, retried) {
+            InsertCount::Stored => Ok(true),
+            InsertCount::Duplicate => Ok(false),
+            InsertCount::ReadBack => {
+                let found = self.message_identity(message_id).await?;
+                Ok(retried_row_is_ours(found.as_ref(), sender, recipient, body))
+            }
+        }
+    }
+
+    /// Who a stored row by this message id is from and to, and its body.
+    async fn message_identity(&self, message_id: &str) -> worker::Result<Option<StoredIdentity>> {
+        let q = Query::new("SELECT sender, recipient, body FROM messages WHERE message_id = ?")
+            .bind(message_id);
+        with_d1_read_retry(|| q.fetch_optional(self.db)).await
     }
 
     /// The body of one of a recipient's rows, by its message id.
@@ -1328,19 +1344,49 @@ where
     }
 }
 
-/// Interpret an `INSERT OR IGNORE` change count into "the row is stored" for
-/// `insert_message`, honouring idempotency under retry.
-///
-/// * `changes > 0` ⇒ inserted now ⇒ stored (`true`).
-/// * `changes == 0 && retried` ⇒ the row exists because our OWN earlier
-///   (timed-out, dropped-but-landed) attempt of this same send stored it ⇒
-///   stored (`true`), NOT a spurious duplicate.
-/// * `changes == 0 && !retried` ⇒ a clean first-attempt collision ⇒ a genuine
-///   duplicate `messageId` (`false`) — unchanged behaviour.
-///
-/// Pure fn so the idempotency rule is unit-testable without a live D1.
-fn insert_changes_mean_stored(changes: usize, retried: bool) -> bool {
-    changes > 0 || retried
+/// What an `INSERT OR IGNORE` change count says, for `insert_message`.
+#[derive(Debug, PartialEq, Eq)]
+enum InsertCount {
+    /// `changes > 0`: inserted now.
+    Stored,
+    /// `changes == 0` on a clean first attempt: a genuine duplicate `messageId`.
+    Duplicate,
+    /// `changes == 0` after a retry: our own earlier (timed-out,
+    /// dropped-but-landed) attempt, or another send's row; read it back.
+    ReadBack,
+}
+
+/// Pure so the idempotency rule is unit-testable without a live D1.
+fn insert_count_verdict(changes: usize, retried: bool) -> InsertCount {
+    match (changes > 0, retried) {
+        (true, _) => InsertCount::Stored,
+        (false, false) => InsertCount::Duplicate,
+        (false, true) => InsertCount::ReadBack,
+    }
+}
+
+/// The columns that say whose a stored row is.
+#[derive(Debug, Deserialize)]
+struct StoredIdentity {
+    sender: Option<String>,
+    recipient: Option<String>,
+    body: Option<String>,
+}
+
+/// A retried `0`'s read-back (0.6.1, R1 L5): the row is this send's own iff
+/// its sender, recipient and body are this insert's. No row (acknowledged
+/// and deleted between the attempts) cannot be shown to be ours: a duplicate.
+fn retried_row_is_ours(
+    found: Option<&StoredIdentity>,
+    sender: &str,
+    recipient: &str,
+    body: &str,
+) -> bool {
+    found.is_some_and(|row| {
+        row.sender.as_deref() == Some(sender)
+            && row.recipient.as_deref() == Some(recipient)
+            && row.body.as_deref() == Some(body)
+    })
 }
 
 /// Back off between retries. On the Worker (wasm) this is a real `setTimeout`-
@@ -1642,27 +1688,59 @@ mod retry_tests {
     }
 
     // Idempotency under retry: a dropped-but-landed write makes the successful
-    // re-attempt report 0 changes. After a retry that MUST read as "stored"
-    // (success), never as a spurious duplicate.
+    // re-attempt report 0 changes. After a retry that is read back, never taken
+    // unseen (0.6.1, R1 L5).
     #[test]
     fn insert_idempotency_under_retry() {
-        // Clean first attempt inserted the row.
-        assert!(
-            insert_changes_mean_stored(1, false),
-            "fresh insert = stored"
-        );
-        // Clean first-attempt collision = genuine duplicate messageId.
-        assert!(
-            !insert_changes_mean_stored(0, false),
+        assert_eq!(insert_count_verdict(1, false), InsertCount::Stored);
+        assert_eq!(
+            insert_count_verdict(0, false),
+            InsertCount::Duplicate,
             "first-attempt 0 changes = genuine duplicate (unchanged)"
         );
-        // Retry that finally inserted.
-        assert!(insert_changes_mean_stored(1, true));
-        // Retry that saw the row already present (our own earlier attempt landed).
-        assert!(
-            insert_changes_mean_stored(0, true),
-            "0 changes AFTER a retry = our own prior attempt stored it → success, not duplicate"
+        assert_eq!(insert_count_verdict(1, true), InsertCount::Stored);
+        assert_eq!(
+            insert_count_verdict(0, true),
+            InsertCount::ReadBack,
+            "0 changes AFTER a retry is read back, not taken as stored unseen"
         );
+    }
+
+    // R1 L5: the read-back of a retried 0. Our own landed row is stored; a row
+    // by the same id from another sender, to another recipient or with another
+    // body is a duplicate; no row is a duplicate.
+    #[test]
+    fn l5_a_retried_zero_is_stored_only_on_our_own_row() {
+        let row = |s: &str, r: &str, b: &str| StoredIdentity {
+            sender: Some(s.into()),
+            recipient: Some(r.into()),
+            body: Some(b.into()),
+        };
+        assert!(retried_row_is_ours(
+            Some(&row("S", "R", "B")),
+            "S",
+            "R",
+            "B"
+        ));
+        assert!(!retried_row_is_ours(
+            Some(&row("X", "R", "B")),
+            "S",
+            "R",
+            "B"
+        ));
+        assert!(!retried_row_is_ours(
+            Some(&row("S", "X", "B")),
+            "S",
+            "R",
+            "B"
+        ));
+        assert!(!retried_row_is_ours(
+            Some(&row("S", "R", "X")),
+            "S",
+            "R",
+            "B"
+        ));
+        assert!(!retried_row_is_ours(None, "S", "R", "B"));
     }
 
     // Full producer-path simulation for insert_message's core: attempt 1 stalls
@@ -1684,9 +1762,19 @@ mod retry_tests {
         })
         .await
         .expect("recovers");
+        assert_eq!(
+            insert_count_verdict(m.changes, retried),
+            InsertCount::ReadBack,
+            "dropped-but-landed insert is read back, not ERR_DUPLICATE_MESSAGE unseen"
+        );
+        let ours = StoredIdentity {
+            sender: Some("S".into()),
+            recipient: Some("R".into()),
+            body: Some("B".into()),
+        };
         assert!(
-            insert_changes_mean_stored(m.changes, retried),
-            "dropped-but-landed insert must resolve to STORED, not ERR_DUPLICATE_MESSAGE"
+            retried_row_is_ours(Some(&ours), "S", "R", "B"),
+            "our own landed row resolves to STORED"
         );
     }
 }

@@ -301,8 +301,8 @@ Five tables in `migrations/0001_initial.sql`, plus `fee_internalize` (`0003`: on
   per-recipient outputs merged into the stored body beside the payment's R2 key, never its BEEF.
 - **Timestamps**: stored as SQLite `datetime('now')` strings; normalized to ISO 8601
   via `storage::to_iso8601` for response parity with the TS server.
-- **FCM**: `send_fcm_notification` is fire-and-forget on successful `/sendMessage` for
-  the `notifications` box only.
+- **FCM**: `send_fcm_notification` runs after the answer (`AfterAnswer`, beside the hub
+  pushes, 10 s bound) for the `notifications` box only.
 
 ## Quality Gates (YOU enforce these — no CI)
 

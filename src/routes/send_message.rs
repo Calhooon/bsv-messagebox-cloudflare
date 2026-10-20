@@ -52,8 +52,9 @@ const PUSH_FANOUT_TIMEOUT_MS: u64 = 2_000;
 
 use crate::beef_upload;
 use crate::fcm;
+use crate::handoff::HandedOff;
 use crate::payments;
-use crate::storage::Storage;
+use crate::storage::{SendContext, Storage};
 use crate::validation::ValidatedSendMessage;
 
 /// Per-recipient success record (matches the HTTP response `results[]`
@@ -136,19 +137,32 @@ pub struct HubPush {
     pub body: Value,
 }
 
+/// One FCM notification a durable row in the `notifications` box owes its
+/// recipient's devices (0.6.1, R1 M3): run after the answer like `HubPush`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FcmPush {
+    pub recipient: String,
+    pub message_id: String,
+}
+
 /// What a send leaves for after its answer: one `HubPush` per row that
-/// landed, in insert order. A send that stops part way (a duplicate, a D1
-/// fault) still owes the pushes of the rows stored before it, as before.
+/// landed, in insert order, and one `FcmPush` per landed row of the
+/// `notifications` box. A send that stops part way (a duplicate, a D1 fault)
+/// still owes the pushes of the rows stored before it, as before.
 #[derive(Debug, Default)]
 #[must_use]
 pub struct AfterAnswer {
     pushes: Vec<HubPush>,
+    fcm: Vec<FcmPush>,
 }
 
 impl AfterAnswer {
     #[cfg(test)]
     pub(crate) fn of(pushes: Vec<HubPush>) -> Self {
-        Self { pushes }
+        Self {
+            pushes,
+            fcm: Vec::new(),
+        }
     }
 
     #[cfg(test)]
@@ -156,22 +170,126 @@ impl AfterAnswer {
         &self.pushes
     }
 
+    #[cfg(test)]
+    pub(crate) fn fcm(&self) -> &[FcmPush] {
+        &self.fcm
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.pushes.is_empty()
+        self.pushes.is_empty() && self.fcm.is_empty()
     }
 
-    /// Run the pushes against the real `MESSAGE_HUB`, each one raced against
-    /// `PUSH_FANOUT_TIMEOUT_MS`. For `ctx.wait_until` / `state.wait_until`.
+    /// Run the pushes against the real `MESSAGE_HUB` (each raced against
+    /// `PUSH_FANOUT_TIMEOUT_MS`) beside the FCM notifications (each raced
+    /// against `FCM_DEFERRED_TIMEOUT_MS`). For `ctx.wait_until` /
+    /// `state.wait_until`.
     pub async fn run(self, env: Env) {
-        self.run_on(&WorkerHub { env }).await
+        let Self { pushes, fcm } = self;
+        let hub = WorkerHub { env: env.clone() };
+        futures_util::future::join(fan_out(&hub, &pushes), notify_fcm(&env, &fcm)).await;
     }
 
-    /// The same over any hub (the pins drive a stub).
+    /// The hub pushes over any hub (the pins drive a stub).
+    #[cfg(test)]
     pub(crate) async fn run_on<H: PushHub>(self, hub: &H) {
-        for job in &self.pushes {
-            push_one(hub, job).await;
+        fan_out(hub, &self.pushes).await
+    }
+}
+
+/// The pushes of one send, concurrently (0.6.1, R1 M2): one chain per
+/// recipient hub, the chains joined, so N wedged hubs hold the deferred work
+/// one `PUSH_FANOUT_TIMEOUT_MS`, not N of them. Within a chain the pushes keep
+/// insert order, so two rows to one recipient reach its hub in the order they
+/// were stored (R1 L2). `broadcast.fanout.deferred n=<N>` opens the run and
+/// `broadcast.fanout.done n=<N>` closes it: a run the Worker's post-response
+/// budget cuts leaves the first line without the second (and each push it cut
+/// a `broadcast.fanout.start` without its ok/err/timeout).
+async fn fan_out<H: PushHub>(hub: &H, pushes: &[HubPush]) {
+    if pushes.is_empty() {
+        return;
+    }
+    let mut chains: Vec<Vec<&HubPush>> = Vec::new();
+    for job in pushes {
+        match chains.iter_mut().find(|c| c[0].recipient == job.recipient) {
+            Some(chain) => chain.push(job),
+            None => chains.push(vec![job]),
         }
     }
+    let (n, hubs, sender) = (pushes.len(), chains.len(), &pushes[0].sender);
+    let t_start = hub.now_ms();
+    hub.log(format!(
+        "TRACE_PHD broadcast.fanout.deferred n={n} hubs={hubs} sender={sender} t={t_start}"
+    ));
+    futures_util::future::join_all(chains.into_iter().map(|chain| async move {
+        for job in chain {
+            push_one(hub, job).await;
+        }
+    }))
+    .await;
+    let t_done = hub.now_ms();
+    hub.log(format!(
+        "TRACE_PHD broadcast.fanout.done n={n} hubs={hubs} sender={sender} t={t_done} ms={}",
+        t_done.saturating_sub(t_start)
+    ));
+}
+
+/// Bound on one FCM notification after the answer (0.6.1, R1 M3). In the
+/// request it had none of its own (the client's timeout was its bound); after
+/// the answer nothing would end it inside the Worker's post-response budget.
+const FCM_DEFERRED_TIMEOUT_MS: u64 = 10_000;
+
+/// The FCM notifications of one send, after its answer, each raced against
+/// `FCM_DEFERRED_TIMEOUT_MS`; a failure or a timeout is logged
+/// (`fcm.deferred.err` / `fcm.deferred.timeout`), never surfaced.
+async fn notify_fcm(env: &Env, fcm: &[FcmPush]) {
+    if fcm.is_empty() {
+        return;
+    }
+    let db = match env.d1("DB") {
+        Ok(db) => db,
+        Err(e) => {
+            console_log!("fcm.deferred.err n={} err=D1 binding: {}", fcm.len(), e);
+            return;
+        }
+    };
+    let store = Storage::new(&db);
+    for job in fcm {
+        let sent =
+            fcm::send_fcm_notification(&job.recipient, &job.message_id, "New Message", env, &store);
+        let timer = Delay::from(Duration::from_millis(FCM_DEFERRED_TIMEOUT_MS));
+        match race(sent, timer).await {
+            Some(Ok(())) => {}
+            Some(Err(e)) => console_log!(
+                "fcm.deferred.err recipient={} msgId={} err={}",
+                job.recipient,
+                job.message_id,
+                e
+            ),
+            None => console_log!(
+                "fcm.deferred.timeout recipient={} msgId={} after_ms={}",
+                job.recipient,
+                job.message_id,
+                FCM_DEFERRED_TIMEOUT_MS
+            ),
+        }
+    }
+}
+
+/// `Some(work's output)` if `work` ends first, `None` if `timer` does (the
+/// work is then dropped, which cancels a subrequest).
+async fn race<T>(work: impl Future<Output = T>, timer: impl Future<Output = ()>) -> Option<T> {
+    let mut work = std::pin::pin!(work);
+    let mut timer = std::pin::pin!(timer);
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(r) = work.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(r));
+        }
+        if timer.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(None);
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 /// The HTTP leg's order: the answer is formed from the outcome, the fan-out is
@@ -190,12 +308,147 @@ pub fn answer_then_defer(sent: Sent, defer: impl FnOnce(AfterAnswer)) -> (Value,
 
 /// The hub a push goes to: the real one is `WorkerHub`; the pins use stubs.
 pub(crate) trait PushHub {
-    /// Deliver one push; `Err` carries the transport or setup failure.
+    /// Deliver one push; `Err` carries the transport or setup failure, or a
+    /// hub that answered other than 2xx.
     fn push(&self, job: &HubPush) -> impl Future<Output = Result<(), String>>;
-    /// A future that resolves after `ms`.
+    /// A future that resolves `ms` after this call.
     fn timer(&self, ms: u64) -> impl Future<Output = ()>;
     fn now_ms(&self) -> u64;
     fn log(&self, line: String);
+}
+
+/// The store the write path stores through (0.6.1, R1 M1): D1, the send
+/// budget, the payment's settlement and the release of bytes nothing names.
+/// The real one is `WorkerStore`; the pins drive `store_send` over a stub, so
+/// "every stored row leaves its push, a partial send keeps the earlier rows'
+/// pushes, no push runs before the answer" is pinned on the write path itself.
+pub(crate) trait SendStore {
+    async fn read_send_context(
+        &self,
+        recipient: &str,
+        sender: &str,
+        message_box: &str,
+    ) -> worker::Result<SendContext>;
+    /// The sender's budget for the window; `Err` is the refusal's answer.
+    async fn charge(&self, sender: &str, unjudged: u64) -> Result<(), (Value, u16)>;
+    async fn settle(
+        &self,
+        payment: &Value,
+        r2_key: Option<&str>,
+        fee_map: &[(String, String, i32)],
+        delivery_fee: i32,
+        sender: &str,
+    ) -> Result<payments::Settled, (Value, u16)>;
+    async fn get_or_create_message_box(
+        &self,
+        recipient: &str,
+        message_box: &str,
+    ) -> worker::Result<i64>;
+    /// `Ok(false)` is a duplicate `messageId`.
+    async fn insert_message(
+        &self,
+        message_id: &str,
+        box_id: i64,
+        sender: &str,
+        recipient: &str,
+        body: &str,
+        beef_key: Option<&str>,
+    ) -> worker::Result<bool>;
+    async fn forget_unnamed(
+        &self,
+        rows_naming: usize,
+        handed: &Option<HandedOff>,
+        r2_key: Option<&str>,
+        failed: bool,
+    );
+    fn now_ms(&self) -> u64;
+    fn log(&self, line: String);
+}
+
+/// The Worker's `SendStore`: D1 through `Storage`, the rest through `Env`.
+struct WorkerStore<'a, 'db> {
+    env: &'a Env,
+    store: &'a Storage<'db>,
+}
+
+impl SendStore for WorkerStore<'_, '_> {
+    async fn read_send_context(
+        &self,
+        recipient: &str,
+        sender: &str,
+        message_box: &str,
+    ) -> worker::Result<SendContext> {
+        self.store
+            .read_send_context(recipient, sender, message_box)
+            .await
+    }
+
+    async fn charge(&self, sender: &str, unjudged: u64) -> Result<(), (Value, u16)> {
+        let Ok(db) = self.env.d1("DB") else {
+            return Ok(());
+        };
+        crate::send_budget::charge(
+            &crate::send_budget::D1Windows { db: &db },
+            &crate::send_budget::Budget::from_env(self.env),
+            sender,
+            Date::now().as_millis() / 1000,
+            unjudged,
+        )
+        .await
+    }
+
+    async fn settle(
+        &self,
+        payment: &Value,
+        r2_key: Option<&str>,
+        fee_map: &[(String, String, i32)],
+        delivery_fee: i32,
+        sender: &str,
+    ) -> Result<payments::Settled, (Value, u16)> {
+        payments::process_payment(payment, r2_key, fee_map, delivery_fee, sender, self.env).await
+    }
+
+    async fn get_or_create_message_box(
+        &self,
+        recipient: &str,
+        message_box: &str,
+    ) -> worker::Result<i64> {
+        self.store
+            .get_or_create_message_box(recipient, message_box)
+            .await
+    }
+
+    async fn insert_message(
+        &self,
+        message_id: &str,
+        box_id: i64,
+        sender: &str,
+        recipient: &str,
+        body: &str,
+        beef_key: Option<&str>,
+    ) -> worker::Result<bool> {
+        self.store
+            .insert_message(message_id, box_id, sender, recipient, body, beef_key)
+            .await
+    }
+
+    async fn forget_unnamed(
+        &self,
+        rows_naming: usize,
+        handed: &Option<HandedOff>,
+        r2_key: Option<&str>,
+        failed: bool,
+    ) {
+        payments::forget_unnamed(self.env, rows_naming, handed, r2_key, failed).await
+    }
+
+    fn now_ms(&self) -> u64 {
+        Date::now().as_millis()
+    }
+
+    fn log(&self, line: String) {
+        console_log!("{}", line);
+    }
 }
 
 /// Map a `worker::Error` bubbled out of the D1 read/write helpers onto the right
@@ -233,17 +486,26 @@ pub async fn process_send(
     env: &Env,
     store: &Storage<'_>,
 ) -> Sent {
+    store_send(validated, sender_key, &WorkerStore { env, store }).await
+}
+
+/// `process_send`'s body over any `SendStore`: every row it stores leaves its
+/// push (and, in the `notifications` box, its FCM notification) in `after`,
+/// and none of them runs here.
+pub(crate) async fn store_send<S: SendStore>(
+    validated: ValidatedSendMessage,
+    sender_key: &str,
+    store: &S,
+) -> Sent {
     let mut after = AfterAnswer::default();
-    let outcome = store_send(validated, sender_key, env, store, &mut after).await;
+    let outcome = store_rows(validated, sender_key, store, &mut after).await;
     Sent { outcome, after }
 }
 
-/// `process_send`'s body: every row it stores leaves its push in `after`.
-async fn store_send(
+async fn store_rows<S: SendStore>(
     validated: ValidatedSendMessage,
     sender_key: &str,
-    env: &Env,
-    store: &Storage<'_>,
+    store: &S,
     after: &mut AfterAnswer,
 ) -> SendOutcome {
     // -- 1. Resolve per-recipient context (recipient fee + server delivery fee + the
@@ -262,7 +524,7 @@ async fn store_send(
         // read stall would surface here). Paired with the box/insert timers below
         // and the TRACE_LAT route_ms in lib.rs, the next run pins any relay-side
         // stall to an exact D1 op.
-        let t_ctx_start = Date::now().as_millis();
+        let t_ctx_start = store.now_ms();
         let ctx = match store
             .read_send_context(recipient, sender_key, &validated.message_box)
             .await
@@ -270,11 +532,11 @@ async fn store_send(
             Ok(c) => c,
             Err(e) => return classify_store_error(e),
         };
-        console_log!(
+        store.log(format!(
             "TRACE_LAT send.read_ctx recipient={} ms={}",
             recipient,
-            Date::now().as_millis().saturating_sub(t_ctx_start)
-        );
+            store.now_ms().saturating_sub(t_ctx_start)
+        ));
         // server delivery fee is per-message_box — identical for every recipient.
         delivery_fee = ctx.server_fee;
 
@@ -298,23 +560,13 @@ async fn store_send(
     //       NOTE-3): one send, and the bytes of text no delivery fee judges
     //       (the message, and the payment when the box owes no delivery fee).
     //       A paid payment's bytes are not counted: it is paid for. --
-    if let Ok(db) = env.d1("DB") {
-        let payment_text = match (&validated.payment, delivery_fee > 0) {
-            (Some(payment), false) => payment.to_string().len(),
-            _ => 0,
-        };
-        let unjudged = (validated.body.to_string().len() + payment_text) as u64;
-        if let Err((body, status)) = crate::send_budget::charge(
-            &crate::send_budget::D1Windows { db: &db },
-            &crate::send_budget::Budget::from_env(env),
-            sender_key,
-            Date::now().as_millis() / 1000,
-            unjudged,
-        )
-        .await
-        {
-            return SendOutcome::ValidationError { body, status };
-        }
+    let payment_text = match (&validated.payment, delivery_fee > 0) {
+        (Some(payment), false) => payment.to_string().len(),
+        _ => 0,
+    };
+    let unjudged = (validated.body.to_string().len() + payment_text) as u64;
+    if let Err((body, status)) = store.charge(sender_key, unjudged).await {
+        return SendOutcome::ValidationError { body, status };
     }
 
     // -- 2. Decide whether payment is required. --
@@ -350,15 +602,15 @@ async fn store_send(
                     Err((body, status)) => return SendOutcome::PaymentFailed { body, status },
                 };
 
-                match payments::process_payment(
-                    payment,
-                    r2_key.as_deref(),
-                    &fee_map,
-                    delivery_fee,
-                    sender_key,
-                    env,
-                )
-                .await
+                match store
+                    .settle(
+                        payment,
+                        r2_key.as_deref(),
+                        &fee_map,
+                        delivery_fee,
+                        sender_key,
+                    )
+                    .await
                 {
                     Ok(settled) => (settled.outputs, r2_key, Some(settled.handed)),
                     Err((body, status)) => return SendOutcome::PaymentFailed { body, status },
@@ -380,26 +632,21 @@ async fn store_send(
         let box_id = match box_id_opt {
             Some(id) => *id,
             None => {
-                let t_box_start = Date::now().as_millis();
+                let t_box_start = store.now_ms();
                 let r = store
                     .get_or_create_message_box(recipient, &validated.message_box)
                     .await;
-                console_log!(
+                store.log(format!(
                     "TRACE_LAT send.get_or_create_box recipient={} ms={}",
                     recipient,
-                    Date::now().as_millis().saturating_sub(t_box_start)
-                );
+                    store.now_ms().saturating_sub(t_box_start)
+                ));
                 match r {
                     Ok(id) => id,
                     Err(e) => {
-                        payments::forget_unnamed(
-                            env,
-                            rows_naming,
-                            &handed,
-                            r2_key.as_deref(),
-                            true,
-                        )
-                        .await;
+                        store
+                            .forget_unnamed(rows_naming, &handed, r2_key.as_deref(), true)
+                            .await;
                         return classify_store_error(e);
                     }
                 }
@@ -419,7 +666,7 @@ async fn store_send(
         let beef_key = paid.and_then(|(payment, _)| payment.get("beefR2Key")?.as_str());
         let stored_body = crate::handoff::stored_body(&validated.body, paid);
 
-        let t_ins_start = Date::now().as_millis();
+        let t_ins_start = store.now_ms();
         let ins = store
             .insert_message(
                 message_id,
@@ -430,24 +677,28 @@ async fn store_send(
                 beef_key,
             )
             .await;
-        console_log!(
+        store.log(format!(
             "TRACE_LAT send.insert_message recipient={} msgId={} ms={} dup={}",
             recipient,
             message_id,
-            Date::now().as_millis().saturating_sub(t_ins_start),
+            store.now_ms().saturating_sub(t_ins_start),
             matches!(&ins, Ok(false))
-        );
+        ));
         match ins {
             Ok(true) => {}
             Ok(false) => {
-                payments::forget_unnamed(env, rows_naming, &handed, r2_key.as_deref(), true).await;
+                store
+                    .forget_unnamed(rows_naming, &handed, r2_key.as_deref(), true)
+                    .await;
                 return SendOutcome::DuplicateMessage {
                     recipient: recipient.clone(),
                     message_id: message_id.clone(),
                 };
             }
             Err(e) => {
-                payments::forget_unnamed(env, rows_naming, &handed, r2_key.as_deref(), true).await;
+                store
+                    .forget_unnamed(rows_naming, &handed, r2_key.as_deref(), true)
+                    .await;
                 return classify_store_error(e);
             }
         }
@@ -471,16 +722,21 @@ async fn store_send(
             body: validated.body.clone(),
         });
 
-        // Fire-and-forget FCM push — only for the notifications box.
+        // FCM — only for the notifications box. Recorded here, run after the
+        // answer beside the hub pushes (0.6.1, R1 M3), its own bound kept.
         if fcm::should_use_fcm_delivery(&validated.message_box) {
-            let _ =
-                fcm::send_fcm_notification(recipient, message_id, "New Message", env, store).await;
+            after.fcm.push(FcmPush {
+                recipient: recipient.clone(),
+                message_id: message_id.clone(),
+            });
         }
     }
 
     // -- 5. The bytes stay at rest while a row or a deferred fee names them
     //       (`HandedOff::kept`). An object nothing names goes, best-effort. --
-    payments::forget_unnamed(env, rows_naming, &handed, r2_key.as_deref(), false).await;
+    store
+        .forget_unnamed(rows_naming, &handed, r2_key.as_deref(), false)
+        .await;
 
     SendOutcome::Success { results }
 }
@@ -603,10 +859,11 @@ impl PushHub for WorkerHub {
         // synthetic origin and the literal path.
         let req = Request::new_with_init("https://do.local/internal/push", &init)
             .map_err(|e| format!("request construction failed: {e}"))?;
-        stub.fetch_with_request(req)
+        let resp = stub
+            .fetch_with_request(req)
             .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        hub_reply(resp.status_code())
     }
 
     fn timer(&self, ms: u64) -> impl Future<Output = ()> {
@@ -622,6 +879,16 @@ impl PushHub for WorkerHub {
     }
 }
 
+/// A hub's reply to `/internal/push`: 2xx delivered, anything else (the hub's
+/// 400 on bad JSON, a 5xx) is a `broadcast.fanout.err`, not an ok (R1 L1).
+fn hub_reply(status: u16) -> Result<(), String> {
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(format!("hub answered {status}"))
+    }
+}
+
 /// One bounded push: race the hub's answer against `PUSH_FANOUT_TIMEOUT_MS`.
 /// On timeout the push is ABANDONED (dropping the fetch future cancels the
 /// subrequest) and logged, best-effort, so a wedged/slow recipient DO never
@@ -632,18 +899,7 @@ async fn push_one<H: PushHub>(hub: &H, job: &HubPush) {
     hub.log(format!(
         "TRACE_PHD broadcast.fanout.start recipient={recipient} msgId={message_id} t={t_fanout_start}"
     ));
-    let mut fetch = Box::pin(hub.push(job));
-    let mut push_timeout = Box::pin(hub.timer(PUSH_FANOUT_TIMEOUT_MS));
-    let push_result = std::future::poll_fn(|cx| {
-        if let std::task::Poll::Ready(r) = fetch.as_mut().poll(cx) {
-            return std::task::Poll::Ready(Some(r));
-        }
-        if push_timeout.as_mut().poll(cx).is_ready() {
-            return std::task::Poll::Ready(None);
-        }
-        std::task::Poll::Pending
-    })
-    .await;
+    let push_result = race(hub.push(job), hub.timer(PUSH_FANOUT_TIMEOUT_MS)).await;
     let t_done = hub.now_ms();
     let rtt = t_done.saturating_sub(t_fanout_start);
     match push_result {
@@ -793,10 +1049,16 @@ pub(crate) mod test_hub {
         After(usize),
     }
 
+    /// A stub hub on a virtual clock: a timer asked for `ms` at virtual time
+    /// `t` moves the clock to `t + ms` when it fires (R1 L3), so a timeout
+    /// line's `t=` is the virtual time elapsed, and pushes raced together end
+    /// at one bound, pushes chained end at the sum (R1 M2).
     pub(crate) struct StubHub {
         pub(crate) log: Log,
         pub(crate) answer: Answer,
         pub(crate) calls: Cell<usize>,
+        pub(crate) clock: Rc<Cell<u64>>,
+        pub(crate) timers_ms: RefCell<Vec<u64>>,
     }
 
     impl StubHub {
@@ -805,7 +1067,31 @@ pub(crate) mod test_hub {
                 log,
                 answer,
                 calls: Cell::new(0),
+                clock: Rc::new(Cell::new(0)),
+                timers_ms: RefCell::new(Vec::new()),
             }
+        }
+    }
+
+    /// `Answer::Never`'s timer: pending on its first poll (so every push of a
+    /// joined run has started before any timer fires), then fires and moves
+    /// the clock to its deadline.
+    struct VirtualTimer {
+        clock: Rc<Cell<u64>>,
+        deadline: u64,
+        polled: bool,
+    }
+
+    impl Future for VirtualTimer {
+        type Output = ();
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if !self.polled {
+                self.polled = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.clock.set(self.clock.get().max(self.deadline));
+            Poll::Ready(())
         }
     }
 
@@ -838,15 +1124,25 @@ pub(crate) mod test_hub {
             Ok(())
         }
 
-        async fn timer(&self, _ms: u64) {
-            match self.answer {
-                Answer::Never => {}
-                Answer::After(_) => std::future::pending::<()>().await,
+        fn timer(&self, ms: u64) -> impl Future<Output = ()> {
+            self.timers_ms.borrow_mut().push(ms);
+            let fires = matches!(self.answer, Answer::Never);
+            let timer = VirtualTimer {
+                clock: self.clock.clone(),
+                deadline: self.clock.get() + ms,
+                polled: false,
+            };
+            async move {
+                if fires {
+                    timer.await
+                } else {
+                    std::future::pending::<()>().await
+                }
             }
         }
 
         fn now_ms(&self) -> u64 {
-            0
+            self.clock.get()
         }
 
         fn log(&self, line: String) {
@@ -912,7 +1208,8 @@ mod decouple_787_tests {
     }
 
     // Pin (a), behaviour: a hub that never answers. The HTTP answer is formed
-    // before the hub is touched, and the push's timeout is logged after it.
+    // before the hub is touched, and the push's timeout is logged after it,
+    // at the virtual bound (an ordering pin over a stub clock, R1 L3).
     #[test]
     fn pin_a_a_send_answers_before_its_push_and_the_timeout_is_logged_after() {
         let log: Log = Rc::new(RefCell::new(Vec::new()));
@@ -948,10 +1245,10 @@ mod decouple_787_tests {
             "TRACE_PHD broadcast.fanout.timeout recipient=R1 msgId=m1",
         );
         assert!(answered < timeout, "{log:#?}");
-        assert!(
-            log[timeout].contains("after_ms=2000"),
-            "the 2 s bound holds"
-        );
+        // R1 L3: the race asked for PUSH_FANOUT_TIMEOUT_MS and took the timer
+        // arm at the virtual 2,000 ms; a stub cannot show wall time elapse.
+        assert_eq!(*hub.timers_ms.borrow(), vec![PUSH_FANOUT_TIMEOUT_MS]);
+        assert!(log[timeout].contains("t=2000 "), "{}", log[timeout]);
         assert!(!log.iter().any(|l| l.contains("hub delivered")));
     }
 
@@ -1017,5 +1314,285 @@ mod decouple_787_tests {
         );
         let hub = include_str!("../message_hub.rs");
         assert!(hub.contains("\"Duplicate->sendMessageAck"));
+    }
+}
+
+/// R1 (M28A-DECOUPLE-R1-2026-10-20): the write path driven for real through a
+/// `SendStore` stub (M1), the concurrent fan-out (M2), FCM after the answer
+/// (M3) and a non-2xx hub reply (L1).
+#[cfg(test)]
+mod decouple_r1_tests {
+    use super::test_hub::*;
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A store whose every row lands but the one named a duplicate (or the
+    /// one named a D1 fault); the send owes no fee.
+    struct StubStore {
+        log: Log,
+        dup: Option<&'static str>,
+        fault: Option<&'static str>,
+    }
+
+    impl StubStore {
+        fn new(log: Log) -> Self {
+            Self {
+                log,
+                dup: None,
+                fault: None,
+            }
+        }
+    }
+
+    impl SendStore for StubStore {
+        async fn read_send_context(
+            &self,
+            _recipient: &str,
+            _sender: &str,
+            _message_box: &str,
+        ) -> worker::Result<SendContext> {
+            Ok(SendContext {
+                recipient_fee: 0,
+                server_fee: 0,
+                box_id: Some(1),
+            })
+        }
+
+        async fn charge(&self, _sender: &str, _unjudged: u64) -> Result<(), (Value, u16)> {
+            Ok(())
+        }
+
+        async fn settle(
+            &self,
+            _payment: &Value,
+            _r2_key: Option<&str>,
+            _fee_map: &[(String, String, i32)],
+            _delivery_fee: i32,
+            _sender: &str,
+        ) -> Result<payments::Settled, (Value, u16)> {
+            panic!("a send that owes no fee settles nothing")
+        }
+
+        async fn get_or_create_message_box(
+            &self,
+            _recipient: &str,
+            _message_box: &str,
+        ) -> worker::Result<i64> {
+            Ok(1)
+        }
+
+        async fn insert_message(
+            &self,
+            message_id: &str,
+            _box_id: i64,
+            _sender: &str,
+            _recipient: &str,
+            _body: &str,
+            _beef_key: Option<&str>,
+        ) -> worker::Result<bool> {
+            if self.fault == Some(message_id) {
+                return Err(worker::Error::RustError("D1 write failed".into()));
+            }
+            let stored = self.dup != Some(message_id);
+            self.log
+                .borrow_mut()
+                .push(format!("insert {message_id} stored={stored}"));
+            Ok(stored)
+        }
+
+        async fn forget_unnamed(
+            &self,
+            _rows_naming: usize,
+            _handed: &Option<HandedOff>,
+            _r2_key: Option<&str>,
+            _failed: bool,
+        ) {
+        }
+
+        fn now_ms(&self) -> u64 {
+            0
+        }
+
+        fn log(&self, _line: String) {}
+    }
+
+    fn send(message_box: &str, rows: &[(&str, &str)]) -> ValidatedSendMessage {
+        ValidatedSendMessage {
+            recipients: rows
+                .iter()
+                .map(|(r, m)| (r.to_string(), m.to_string()))
+                .collect(),
+            message_box: message_box.into(),
+            body: json!("hi"),
+            payment: None,
+        }
+    }
+
+    fn ids(after: &AfterAnswer) -> Vec<&str> {
+        after
+            .pushes()
+            .iter()
+            .map(|p| p.message_id.as_str())
+            .collect()
+    }
+
+    // M1: a real send through the write path, two recipients, the second a
+    // duplicate. The answer is ERR_DUPLICATE_MESSAGE, `after` holds exactly
+    // the first row's push, and with a hub that never answers the answer is
+    // formed before the hub is touched and the push's timeout follows it.
+    #[test]
+    fn m1_a_partial_send_answers_first_and_keeps_the_earlier_rows_push() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let mut store = StubStore::new(log.clone());
+        store.dup = Some("m2");
+        let hub = StubHub::new(log.clone(), Answer::Never);
+        let sent = block_on(store_send(
+            send("low_game_x", &[("R1", "m1"), ("R2", "m2")]),
+            "S",
+            &store,
+        ));
+        assert!(matches!(
+            sent.outcome,
+            SendOutcome::DuplicateMessage { ref message_id, .. } if message_id == "m2"
+        ));
+        assert_eq!(ids(&sent.after), vec!["m1"]);
+        assert_eq!(sent.after.pushes()[0].recipient, "R1");
+
+        let mut deferred = None;
+        let (body, status) = answer_then_defer(sent, |a| deferred = Some(a));
+        log.borrow_mut().push("send.answered".into());
+        assert_eq!(
+            (status, &body["code"]),
+            (400, &json!("ERR_DUPLICATE_MESSAGE"))
+        );
+        assert_eq!(hub.calls.get(), 0, "no push runs inside the write path");
+
+        block_on(
+            deferred
+                .expect("the stored row's push is owed")
+                .run_on(&hub),
+        );
+        let log = log.borrow();
+        assert!(at(&log, "insert m2 stored=false") < at(&log, "send.answered"));
+        assert!(
+            at(&log, "send.answered") < at(&log, "broadcast.fanout.timeout recipient=R1 msgId=m1"),
+            "{log:#?}"
+        );
+        assert!(!log
+            .iter()
+            .any(|l| l.contains("msgId=m2") && l.contains("fanout")));
+    }
+
+    // M1: a D1 fault part way keeps the earlier rows' pushes too; a full
+    // send owes one push per row, in insert order; a lone duplicate none.
+    #[test]
+    fn m1_every_stored_row_leaves_its_push_and_nothing_else_does() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let mut store = StubStore::new(log.clone());
+        store.fault = Some("m3");
+        let sent = block_on(store_send(
+            send("low_game_x", &[("R1", "m1"), ("R2", "m2"), ("R3", "m3")]),
+            "S",
+            &store,
+        ));
+        assert!(matches!(sent.outcome, SendOutcome::InternalError { .. }));
+        assert_eq!(ids(&sent.after), vec!["m1", "m2"]);
+
+        let store = StubStore::new(log.clone());
+        let sent = block_on(store_send(
+            send("low_game_x", &[("R1", "m1"), ("R2", "m2")]),
+            "S",
+            &store,
+        ));
+        assert!(matches!(sent.outcome, SendOutcome::Success { ref results } if results.len() == 2));
+        assert_eq!(ids(&sent.after), vec!["m1", "m2"]);
+        assert!(sent.after.fcm().is_empty(), "no FCM outside notifications");
+
+        let mut store = StubStore::new(log);
+        store.dup = Some("m1");
+        let sent = block_on(store_send(send("low_game_x", &[("R1", "m1")]), "S", &store));
+        assert!(sent.after.is_empty(), "a lone duplicate owes nothing");
+    }
+
+    // M2: the pushes of one send run concurrently under the one deferral: two
+    // wedged hubs end at one bound (virtual t=2000), not two (t=4000); the
+    // run opens with `broadcast.fanout.deferred n=2` and closes with
+    // `broadcast.fanout.done n=2`. L2: two rows to one recipient stay chained
+    // in insert order.
+    #[test]
+    fn m2_the_pushes_of_one_send_are_joined_and_bracketed() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let hub = StubHub::new(log.clone(), Answer::Never);
+        block_on(AfterAnswer::of(vec![job("R1", "m1"), job("R2", "m2")]).run_on(&hub));
+        {
+            let log = log.borrow();
+            let opened = at(&log, "broadcast.fanout.deferred n=2 hubs=2");
+            let s1 = at(&log, "broadcast.fanout.start recipient=R1");
+            let s2 = at(&log, "broadcast.fanout.start recipient=R2");
+            let t1 = at(&log, "broadcast.fanout.timeout recipient=R1");
+            assert!(
+                opened < s1 && s2 < t1,
+                "both start before either times out: {log:#?}"
+            );
+            for r in ["R1", "R2"] {
+                let line = &log[at(&log, &format!("broadcast.fanout.timeout recipient={r}"))];
+                assert!(line.contains("t=2000 "), "{line}");
+            }
+            let done = at(&log, "broadcast.fanout.done n=2 hubs=2");
+            assert!(log[done].contains("ms=2000"), "{}", log[done]);
+        }
+
+        log.borrow_mut().clear();
+        let hub = StubHub::new(log.clone(), Answer::Never);
+        block_on(AfterAnswer::of(vec![job("R1", "m1"), job("R1", "m2")]).run_on(&hub));
+        let log = log.borrow();
+        assert!(at(&log, "broadcast.fanout.deferred n=2 hubs=1") == 0);
+        let first = at(&log, "broadcast.fanout.timeout recipient=R1 msgId=m1");
+        let second = at(&log, "broadcast.fanout.start recipient=R1 msgId=m2");
+        assert!(first < second, "one recipient's pushes keep insert order");
+        assert!(
+            log[at(&log, "broadcast.fanout.timeout recipient=R1 msgId=m2")].contains("t=4000 ")
+        );
+    }
+
+    // M3: a notifications-box send owes its FCM after the answer; the write
+    // path records it beside the hub push and calls no FCM itself.
+    #[test]
+    fn m3_the_notifications_box_fcm_is_owed_after_the_answer() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let mut store = StubStore::new(log);
+        store.dup = Some("m2");
+        let sent = block_on(store_send(
+            send("notifications", &[("R1", "m1"), ("R2", "m2")]),
+            "S",
+            &store,
+        ));
+        assert_eq!(
+            sent.after.fcm(),
+            &[FcmPush {
+                recipient: "R1".into(),
+                message_id: "m1".into(),
+            }]
+        );
+        assert_eq!(ids(&sent.after), vec!["m1"]);
+        let mut deferred = None;
+        let (_, status) = answer_then_defer(sent, |a| deferred = Some(a));
+        assert_eq!(status, 400);
+        assert_eq!(deferred.expect("the FCM is deferred").fcm().len(), 1);
+        let path = include_str!("send_message.rs");
+        let rows = &path[path.find("async fn store_rows<").unwrap()
+            ..path.find("pub fn outcome_to_http(").unwrap()];
+        assert!(!rows.contains("send_fcm_notification("));
+    }
+
+    // L1: only a 2xx from the hub is a delivery; its 400 (bad JSON) or a 5xx
+    // is a `broadcast.fanout.err`.
+    #[test]
+    fn l1_a_non_2xx_hub_reply_is_an_error() {
+        assert_eq!(hub_reply(200), Ok(()));
+        assert_eq!(hub_reply(204), Ok(()));
+        assert_eq!(hub_reply(400), Err("hub answered 400".into()));
+        assert_eq!(hub_reply(500), Err("hub answered 500".into()));
     }
 }
