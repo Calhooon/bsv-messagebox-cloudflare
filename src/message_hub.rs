@@ -1214,8 +1214,11 @@ impl MessageHub {
             },
             |after| self.defer_fan_out(after),
         );
+        // A frame has no request: the live leg measures from the frame's
+        // arrival (`from=frame`), the HTTP routes from the request's
+        // (`from=req`); comparable within a path, not across (R1 L4).
         console_log!(
-            "TRACE_LAT send.answered ms={} leg=ws msgId={}",
+            "TRACE_LAT send.answered ms={} leg=ws from=frame msgId={}",
             Date::now().as_millis().saturating_sub(t_in),
             msg_id
         );

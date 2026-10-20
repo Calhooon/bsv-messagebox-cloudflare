@@ -83,7 +83,8 @@ bsv-middleware-rs = "0.6.1"
 # service binding or the Worker fetch of a URL.
 async-trait = "0.1"
 # `StreamExt::next` on the R2 object's body stream (`worker::ByteStream`).
-futures-util = { version = "0.3", default-features = false }
+# `alloc`: `future::join_all`, the deferred pushes of one send run concurrently.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
