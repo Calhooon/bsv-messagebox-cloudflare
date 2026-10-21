@@ -33,13 +33,15 @@ RE_KEY="AKIA[0-9A-Z]{16}|xox[bp]-[0-9A-Za-z-]+|$PEM|[0-9a-f]{64}:[0-9a-f]{64}|ap
 H=$(git grep -n -I -E -- "$RE_KEY" -- . "$SELF" 2>/dev/null | grep -v 'notpem' | grep -v -E 'AKIA[0-9A-Z]{9}EXAMPLE' | cut -d: -f1,2 || true)
 [ -z "$H" ] || hit "a key-shaped string" "$H"
 
-# 4. a token-shaped assignment: a name ending in TOKEN set to thirty or more characters that are not a placeholder.
+# 4. a token-shaped assignment: a name ending in TOKEN set to thirty or more characters that are not a placeholder
+#    and not a reference to the environment (process.env, os.environ, a shell variable).
 RE_TOKEN='TOKEN[A-Za-z_]*[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9_.-]{30,}'
-H=$(git grep -n -I -E -- "$RE_TOKEN" -- . "$SELF" 2>/dev/null | grep -v -E 'TOKEN[A-Za-z_]*[[:space:]]*[:=][[:space:]]*["'"'"']?(your-|<|\$)' | cut -d: -f1,2 || true)
+H=$(git grep -n -I -E -- "$RE_TOKEN" -- . "$SELF" 2>/dev/null | grep -v -E 'TOKEN[A-Za-z_]*[[:space:]]*[:=][[:space:]]*["'"'"']?(your-|<|\$|process\.env|os\.environ)' | cut -d: -f1,2 || true)
 [ -z "$H" ] || hit "a token-shaped assignment" "$H"
 
-# 5. a private deployment file: a second wrangler config, a secrets file, a dotenv.
-H=$(git ls-files | grep -i -E '(^|/)wrangler\.[a-z0-9-]+\.toml$|(^|/)secrets[^/]*\.md$|(^|/)\.dev\.vars$|(^|/)\.env$' || true)
+# 5. a private deployment file: a secrets file or a dotenv. A second wrangler config (another Worker of the
+#    same tree, a staging copy) is allowed by name and judged by its content under 1 and 2.
+H=$(git ls-files | grep -i -E '(^|/)secrets[^/]*\.md$|(^|/)\.dev\.vars$|(^|/)\.env$' || true)
 [ -z "$H" ] || hit "a private deployment file in the tree" "$H"
 
 # 6. the two private programs are never named here (the stack's rule 5).
