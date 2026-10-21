@@ -172,7 +172,7 @@ fn parse_address(address: &str) -> Option<IpAddr> {
     a.parse().ok()
 }
 
-/// The first `groups` 16-bit groups of `v6` in lowercase hex without leading
+/// The leading `groups` 16-bit groups of `v6` in lowercase hex without leading
 /// zeros, then `::/<bits>`: `ip.ts`'s spelling (`2001:db8:0:1::/64`).
 fn prefix(v6: &Ipv6Addr, groups: usize, bits: &str) -> String {
     let head: Vec<String> = v6.segments()[..groups]
@@ -274,7 +274,7 @@ pub fn take_binds(window_start: u64, charges: &[Charge]) -> Vec<crate::d1::QVal>
     v
 }
 
-/// The first budget, in `charges`' order, that `held` (key, count) shows
+/// The earliest budget, in `charges`' order, that `held` (key, count) shows
 /// spent; `None` when none is.
 pub fn first_spent(charges: &[Charge], held: &[(String, u64)]) -> Option<usize> {
     charges
@@ -299,7 +299,7 @@ pub const FORGET_EXPIRED_SQL: &str = "DELETE FROM turn_credentials WHERE expires
 #[async_trait::async_trait(?Send)]
 pub trait Store {
     /// Charge one to every budget in the window, all or none, and answer
-    /// `None` when charged, or the index of the first budget spent.
+    /// `None` when charged, or the index of the earliest budget spent.
     async fn charge(&self, window_start: u64, charges: &[Charge]) -> Result<Option<usize>, String>;
     /// Record that `username` is `identity`'s until `expires_at` (ms).
     async fn record(

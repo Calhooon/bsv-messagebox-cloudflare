@@ -522,7 +522,7 @@ async fn the_order_names_the_identity_before_the_source_when_both_are_spent() {
 
 #[tokio::test]
 async fn every_budget_one_below_its_bound_is_taken_whole() {
-    // The guard reads the window as it stood: the first row reaching its
+    // The guard reads the window as it stood: a row reaching its
     // bound does not stop the rest of the same take.
     let clock = Cell::new(0);
     let mut h = Harness::new(&clock);

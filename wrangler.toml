@@ -48,7 +48,7 @@ ENABLE_FIREBASE = "false"
 # Each mint is charged, before Cloudflare is asked and all or none, to four
 # hourly budgets: the authenticated identity's, the source group's (an IPv4
 # address or an IPv6 /64, from CF-Connecting-IP), the IPv6 /48's and the
-# Worker's; the first spent is refused 429 ERR_TURN_BUDGET naming it.
+# Worker's; the earliest spent in that order is refused 429 ERR_TURN_BUDGET naming it.
 TURN_CREDENTIALS = "off"
 TURN_KEY_ID = "<your-turn-key-id>"
 TURN_TTL_SECONDS = "3600"
