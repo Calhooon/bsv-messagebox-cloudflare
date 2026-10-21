@@ -400,6 +400,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // The edge's client address, read before the door: the TURN budget's
     // source group (`/turn-credentials`).
     let client_address = req.headers().get("CF-Connecting-IP").ok().flatten();
+
     // bsv-low W-B (D10): THE HTTP SESSION LANE. A request carrying
     // `x-low-session` is verified through the identity's hub (the mirror of
     // the socket's lane: the counter and a MAC over the method, the path and
@@ -578,8 +579,9 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
 
         // The ICE servers of a WebRTC hand, TURN credentials included,
         // minted for the authenticated identity from the Worker's TURN key,
-        // within the budgets charged before the provider is asked. 403 unless
-        // TURN_CREDENTIALS = "on".
+        // within the budgets charged before the provider is asked; and the
+        // hand's close, revoking a username this identity minted. Both 403
+        // unless TURN_CREDENTIALS = "on".
         (Method::Post, "/turn-credentials") => {
             turn_credentials::handle_mint(
                 &request_body,
@@ -589,6 +591,9 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
                 &db,
             )
             .await
+        }
+        (Method::Post, "/turn-credentials/revoke") => {
+            turn_credentials::revoke::handle_revoke(&request_body, identity_key, &env, &db).await
         }
 
         _ => (

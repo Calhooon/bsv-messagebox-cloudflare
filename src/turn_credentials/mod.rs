@@ -25,6 +25,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::{IpAddr, Ipv6Addr};
 
+pub mod revoke;
+
 type RouteResult = (Value, u16);
 
 /// The longest lifetime Cloudflare gives TURN credentials: 48 hours, in
