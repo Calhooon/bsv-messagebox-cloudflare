@@ -39,6 +39,23 @@ WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
 # SEND_BUDGET_SENDS = "100"
 # Flip to "true" after setting the FIREBASE_SERVICE_ACCOUNT_JSON secret.
 ENABLE_FIREBASE = "false"
+# The ICE credentials of a WebRTC hand (POST /turn-credentials and its revoke,
+# migration 0010). TURN_CREDENTIALS is the one switch: "on" enables the two
+# routes, anything else answers 403 and charges nothing. TURN_KEY_ID is the
+# Cloudflare Realtime TURN key's id (an identifier: the operator's own config
+# names it, never this file); its API token is the TURN_KEY_API_TOKEN secret.
+# The ttl asked of Cloudflare is TURN_TTL_SECONDS, at most 172800 (48 hours).
+# Each mint is charged, before Cloudflare is asked and all or none, to four
+# hourly budgets: the authenticated identity's, the source group's (an IPv4
+# address or an IPv6 /64, from CF-Connecting-IP), the IPv6 /48's and the
+# Worker's; the first spent is refused 429 ERR_TURN_BUDGET naming it.
+TURN_CREDENTIALS = "off"
+TURN_KEY_ID = "<your-turn-key-id>"
+TURN_TTL_SECONDS = "3600"
+TURN_BUDGET_IDENTITY_HOUR = "6"
+TURN_BUDGET_SOURCE_HOUR = "6"
+TURN_BUDGET_PREFIX48_HOUR = "24"
+TURN_BUDGET_TOTAL_HOUR = "600"
 
 # The header service over a service binding (0.3.30). `rust-chaintracks` is the
 # one deployment of the header service; it is production, and there is no beta
@@ -49,6 +66,9 @@ ENABLE_FIREBASE = "false"
 
 # Secrets (set via `wrangler secret put`):
 #   SERVER_PRIVATE_KEY            — 64-char hex BRC-31 server identity key.
+#   TURN_KEY_API_TOKEN: the Cloudflare TURN key's API token; only required
+#                       when TURN_CREDENTIALS = "on". Read with env.secret,
+#                       sent to Cloudflare alone, never logged or answered.
 #   FIREBASE_SERVICE_ACCOUNT_JSON — Full Google service-account JSON (for FCM).
 #                                   Only required when ENABLE_FIREBASE = "true".
 #   R2_ACCESS_KEY_ID              — R2 S3 access key for presigning BEEF uploads.
