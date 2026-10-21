@@ -474,6 +474,10 @@ struct SocketIoRegistration {
     /// its HTTP mirror is revoked in the same call.
     #[serde(default)]
     session_id: Option<String>,
+    /// 0.6.2: on register, renew this sid's lease only
+    /// (`SOCKETIO_SUB_LEASE_MS`); sent by the session DO's heartbeat.
+    #[serde(default)]
+    lease: bool,
 }
 
 /// `/internal/session-verify` (bsv-low W-B, D10): the Worker asks this
@@ -498,14 +502,344 @@ struct SessionVerifyBody {
 /// the raw-WS `SocketAttachment.joined_rooms` so `handle_internal_push`
 /// can filter the fan-out by room (only deliver to subscribers that
 /// have explicitly joined the matching `<recipient>-<box>` room).
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct SocketIoRegistryEntry {
+pub(crate) struct SocketIoRegistryEntry {
     sid: String,
     // bounded: a millisecond stamp
     registered_at_ms: u64,
     #[serde(default)]
     joined_rooms: Vec<String>,
+    /// 0.6.2: the entry's lease (epoch ms): written at register and join
+    /// (now plus `SOCKETIO_SUB_LEASE_MS`), renewed by the session's heartbeat
+    /// and by a delivered broadcast; the list deletes an entry past it.
+    /// Absent on an entry written before 0.6.2 (`lease_verdict`).
+    // bounded: a millisecond stamp
+    #[serde(default)]
+    expires_at_ms: Option<u64>,
+}
+
+/// 0.6.2: the bound on one session's answer in the hub's socket.io leg
+/// (`fan_out_socketio`). The relay races the whole `/internal/push` against
+/// `PUSH_FANOUT_TIMEOUT_MS` (2 s), and this leg runs after the hub's own work
+/// ahead of it (`remember_room_peer`, `stamp_last_seen`, the raw-WS leg, the
+/// registry list). A bound equal to the relay's would let one slow wake turn
+/// the relay's line into a timeout though every other session was delivered;
+/// 1.5 s leaves the hub half a second for the rest and keeps its answer inside
+/// the relay's bound.
+const HUB_SESSION_PUSH_TIMEOUT_MS: u64 = 1_500;
+const _: () =
+    assert!(HUB_SESSION_PUSH_TIMEOUT_MS < crate::routes::send_message::PUSH_FANOUT_TIMEOUT_MS);
+
+/// 0.6.2: the lease on a socket.io registry entry: 24 of the session DO's
+/// server heartbeats (`PING_INTERVAL_MS`, 25 s), ten minutes. A live upgraded
+/// session renews it from its heartbeat every `SOCKETIO_SUB_LEASE_REFRESH_MS`
+/// (and the hub renews it when the session answers a broadcast), so three
+/// renewals can be lost before a live entry lapses; a socket whose heartbeat
+/// stops is judged dead by the client at `pingInterval + pingTimeout` (45 s)
+/// and reconnects under a new sid, so an entry nothing renews for ten minutes
+/// names a session that is gone.
+pub(crate) const SOCKETIO_SUB_LEASE_MS: u64 = 24 * crate::engineio::session::PING_INTERVAL_MS;
+/// 0.6.2: how often a live session renews its lease: once in every window of
+/// six heartbeats (150 s), a quarter of the lease.
+pub(crate) const SOCKETIO_SUB_LEASE_REFRESH_MS: u64 =
+    6 * crate::engineio::session::PING_INTERVAL_MS;
+const _: () = assert!(SOCKETIO_SUB_LEASE_MS >= 4 * SOCKETIO_SUB_LEASE_REFRESH_MS);
+
+/// What the registry list does with one entry's lease (0.6.2).
+#[derive(Debug, PartialEq, Eq)]
+enum LeaseVerdict {
+    Live,
+    /// An entry written before 0.6.2 (no `expires_at_ms`): unexpired for one
+    /// lease from the time it is seen, stamped with that expiry.
+    Stamp(u64),
+    Expired,
+}
+
+fn lease_verdict(expires_at_ms: Option<u64>, now_ms: u64) -> LeaseVerdict {
+    match expires_at_ms {
+        None => LeaseVerdict::Stamp(now_ms + SOCKETIO_SUB_LEASE_MS),
+        Some(t) if now_ms >= t => LeaseVerdict::Expired,
+        Some(_) => LeaseVerdict::Live,
+    }
+}
+
+/// A delivered answer renews the lease once it was last renewed at least one
+/// `SOCKETIO_SUB_LEASE_REFRESH_MS` ago (one write in a refresh window, not
+/// one a push).
+fn lease_renewal_due(expires_at_ms: Option<u64>, now_ms: u64) -> bool {
+    expires_at_ms.is_none_or(|t| t < now_ms + SOCKETIO_SUB_LEASE_MS - SOCKETIO_SUB_LEASE_REFRESH_MS)
+}
+
+/// The session's answer to `/internal/socketio-broadcast` names a session
+/// that no longer exists: 200 `{"delivered": 0, "reason": "no session"}`
+/// (`EngineIoSession::handle_socketio_broadcast`). `unauthenticated` is a
+/// session mid-handshake, not a tombstone.
+fn is_tombstone(status: u16, body: &Value) -> bool {
+    status == 200
+        && body.get("delivered").and_then(Value::as_u64) == Some(0)
+        && body.get("reason").and_then(Value::as_str) == Some("no session")
+}
+
+/// The hub's socket.io leg behind a seam (0.6.2): the registry (this hub's
+/// `socketio_sub:` storage), one session's broadcast, the clock and the log.
+/// The real one is `WorkerSocketIoLeg`; the pins drive a stub on a virtual
+/// clock.
+pub(crate) trait SocketIoLeg {
+    fn entries(&self) -> impl std::future::Future<Output = Vec<SocketIoRegistryEntry>>;
+    fn get(&self, sid: &str) -> impl std::future::Future<Output = Option<SocketIoRegistryEntry>>;
+    fn put(&self, entry: &SocketIoRegistryEntry) -> impl std::future::Future<Output = ()>;
+    fn delete(&self, sid: &str) -> impl std::future::Future<Output = ()>;
+    /// POST `payload` to the session's `/internal/socketio-broadcast`: its
+    /// status and its JSON body (`Value::Null` when it has none), or the
+    /// transport or setup failure.
+    fn broadcast(
+        &self,
+        sid: &str,
+        payload: &str,
+    ) -> impl std::future::Future<Output = std::result::Result<(u16, Value), String>>;
+    /// A future that resolves `ms` after this call.
+    fn timer(&self, ms: u64) -> impl std::future::Future<Output = ()>;
+    fn now_ms(&self) -> u64;
+    fn log(&self, line: String);
+}
+
+struct WorkerSocketIoLeg {
+    storage: worker::Storage,
+    sessions: Option<ObjectNamespace>,
+}
+
+impl SocketIoLeg for WorkerSocketIoLeg {
+    async fn entries(&self) -> Vec<SocketIoRegistryEntry> {
+        let opts = ListOptions::new().prefix(SOCKETIO_SUB_PREFIX);
+        let map = match self.storage.list_with_options(opts).await {
+            Ok(m) => m,
+            Err(e) => {
+                console_log!("MessageHub: socketio sub list failed: {e}");
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        // js_sys::Map iteration: each entry is [key, value].
+        let entries = map.entries();
+        let iter = js_sys::try_iter(&entries).ok().flatten();
+        if let Some(iter) = iter {
+            for e in iter.flatten() {
+                let arr: js_sys::Array = e.into();
+                let v = arr.get(1);
+                if let Ok(entry) = serde_wasm_bindgen::from_value::<SocketIoRegistryEntry>(v) {
+                    if !entry.sid.is_empty() {
+                        out.push(entry);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    async fn get(&self, sid: &str) -> Option<SocketIoRegistryEntry> {
+        let key = format!("{SOCKETIO_SUB_PREFIX}{sid}");
+        self.storage.get(&key).await.ok().flatten()
+    }
+
+    async fn put(&self, entry: &SocketIoRegistryEntry) {
+        let key = format!("{SOCKETIO_SUB_PREFIX}{}", entry.sid);
+        if let Err(e) = self.storage.put(&key, entry).await {
+            console_log!(
+                "MessageHub: socketio registry put failed for sid={}: {e}",
+                entry.sid
+            );
+        }
+    }
+
+    async fn delete(&self, sid: &str) {
+        let key = format!("{SOCKETIO_SUB_PREFIX}{sid}");
+        let _ = self.storage.delete(&key).await;
+    }
+
+    async fn broadcast(
+        &self,
+        sid: &str,
+        payload: &str,
+    ) -> std::result::Result<(u16, Value), String> {
+        let ns = self
+            .sessions
+            .as_ref()
+            .ok_or_else(|| "ENGINEIO_SESSION binding missing".to_string())?;
+        let stub = ns
+            .id_from_name(sid)
+            .and_then(|id| id.get_stub())
+            .map_err(|e| format!("stub failed: {e}"))?;
+        let headers = Headers::new();
+        headers
+            .set("content-type", "application/json")
+            .map_err(|e| format!("header setup failed: {e}"))?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(payload.into()));
+        let req = Request::new_with_init("https://do.local/internal/socketio-broadcast", &init)
+            .map_err(|e| format!("request build failed: {e}"))?;
+        let mut resp = stub
+            .fetch_with_request(req)
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status_code();
+        let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+        Ok((status, body))
+    }
+
+    fn timer(&self, ms: u64) -> impl std::future::Future<Output = ()> {
+        Delay::from(std::time::Duration::from_millis(ms))
+    }
+
+    fn now_ms(&self) -> u64 {
+        Date::now().as_millis()
+    }
+
+    fn log(&self, line: String) {
+        console_log!("{}", line);
+    }
+}
+
+/// The registry's live entries (0.6.2): an expired entry is deleted and
+/// skipped (`broadcast.hub.socketio_expired`), so an evicted session's entry
+/// costs at most one list, never a wake; an entry written before 0.6.2 is
+/// stamped with one lease from now.
+async fn list_live_subscribers<L: SocketIoLeg>(leg: &L) -> Vec<SocketIoRegistryEntry> {
+    let now = leg.now_ms();
+    let mut out = Vec::new();
+    for mut entry in leg.entries().await {
+        match lease_verdict(entry.expires_at_ms, now) {
+            LeaseVerdict::Live => out.push(entry),
+            LeaseVerdict::Stamp(t) => {
+                entry.expires_at_ms = Some(t);
+                leg.put(&entry).await;
+                out.push(entry);
+            }
+            LeaseVerdict::Expired => {
+                leg.log(format!(
+                    "TRACE_PHD broadcast.hub.socketio_expired sid={} t={now}",
+                    entry.sid
+                ));
+                leg.delete(&entry.sid).await;
+            }
+        }
+    }
+    out
+}
+
+/// A live session renews its entry's lease (0.6.2): the register route with
+/// `lease: true`, from the session DO's heartbeat. One read and one write;
+/// an entry that is gone (unregistered, buried, expired) is not recreated.
+async fn renew_lease<L: SocketIoLeg>(leg: &L, sid: &str) -> bool {
+    let Some(mut entry) = leg.get(sid).await else {
+        return false;
+    };
+    entry.expires_at_ms = Some(leg.now_ms() + SOCKETIO_SUB_LEASE_MS);
+    leg.put(&entry).await;
+    true
+}
+
+/// One session's outcome in the socket.io leg.
+enum SessionOutcome {
+    Answered(u16, Value),
+    Failed,
+    TimedOut,
+}
+
+/// The socket.io leg of one push (0.6.2): every registry entry's broadcast
+/// concurrently (`join_all`), each raced against `HUB_SESSION_PUSH_TIMEOUT_MS`,
+/// so N wedged sessions hold the push one bound, not N of them. Within one
+/// push the entries are independent; order is not a contract. Then the
+/// registry is kept truthful: a failed fetch drops its entry (as before), a
+/// tombstone answer drops its entry, a delivered answer renews its lease when
+/// due; a timeout keeps it. `broadcast.hub.socketio_fanout n=` opens the run
+/// and `broadcast.hub.socketio_done n= ok= err= timeout= ms=` closes it.
+/// Returns the count of sessions that answered (`socketioDelivered`).
+async fn fan_out_socketio<L: SocketIoLeg>(
+    leg: &L,
+    entries: &[SocketIoRegistryEntry],
+    payload: &str,
+    message_id: &str,
+) -> u32 {
+    let n = entries.len();
+    let t_start = leg.now_ms();
+    leg.log(format!(
+        "TRACE_PHD broadcast.hub.socketio_fanout n={n} msgId={message_id} t={t_start}"
+    ));
+    let outcomes = futures_util::future::join_all(entries.iter().map(|entry| async move {
+        let sid = &entry.sid;
+        let t_sio_start = leg.now_ms();
+        let answer = crate::routes::send_message::race(
+            leg.broadcast(sid, payload),
+            leg.timer(HUB_SESSION_PUSH_TIMEOUT_MS),
+        )
+        .await;
+        let t_sio_done = leg.now_ms();
+        let rtt = t_sio_done.saturating_sub(t_sio_start);
+        match answer {
+            Some(Ok((status, body))) => {
+                leg.log(format!(
+                    "TRACE_PHD broadcast.hub.socketio_ok sid={sid} msgId={message_id} t={t_sio_done} rtt_ms={rtt}"
+                ));
+                SessionOutcome::Answered(status, body)
+            }
+            Some(Err(e)) => {
+                leg.log(format!(
+                    "TRACE_PHD broadcast.hub.socketio_err sid={sid} msgId={message_id} t={t_sio_done} rtt_ms={rtt} err={e}"
+                ));
+                SessionOutcome::Failed
+            }
+            None => {
+                leg.log(format!(
+                    "TRACE_PHD broadcast.hub.socketio_timeout sid={sid} msgId={message_id} t={t_sio_done} rtt_ms={rtt}"
+                ));
+                SessionOutcome::TimedOut
+            }
+        }
+    }))
+    .await;
+    let (mut ok, mut err, mut timeout) = (0u32, 0u32, 0u32);
+    for (entry, outcome) in entries.iter().zip(outcomes) {
+        let sid = &entry.sid;
+        match outcome {
+            SessionOutcome::Answered(status, body) => {
+                ok += 1;
+                if is_tombstone(status, &body) {
+                    // The session no longer exists: bury its entry so the
+                    // next push does not pay its wake.
+                    leg.log(format!(
+                        "TRACE_PHD broadcast.hub.socketio_tombstone sid={sid} msgId={message_id}"
+                    ));
+                    leg.delete(sid).await;
+                } else if body.get("delivered").and_then(Value::as_u64).unwrap_or(0) > 0
+                    && lease_renewal_due(entry.expires_at_ms, leg.now_ms())
+                {
+                    let mut renewed = entry.clone();
+                    renewed.expires_at_ms = Some(leg.now_ms() + SOCKETIO_SUB_LEASE_MS);
+                    leg.put(&renewed).await;
+                }
+            }
+            SessionOutcome::Failed => {
+                err += 1;
+                // Stale registry entry: most likely the EngineIoSession was
+                // evicted without firing close. Drop it now so the next push
+                // doesn't waste another fetch.
+                leg.log(format!(
+                    "MessageHub: socketio fan-out failed for sid={sid}: dropping registry entry"
+                ));
+                leg.delete(sid).await;
+            }
+            SessionOutcome::TimedOut => timeout += 1,
+        }
+    }
+    let t_done = leg.now_ms();
+    leg.log(format!(
+        "TRACE_PHD broadcast.hub.socketio_done n={n} ok={ok} err={err} timeout={timeout} msgId={message_id} t={t_done} ms={}",
+        t_done.saturating_sub(t_start)
+    ));
+    ok
 }
 
 #[durable_object]
@@ -583,6 +917,7 @@ impl DurableObject for MessageHub {
         //
         //   * /internal/socketio-event       — process one inbound event
         //   * /internal/socketio-register    — register sid for broadcast push
+        //                                      (`lease: true`: renew its lease, 0.6.2)
         //   * /internal/socketio-unregister  — drop sid on disconnect/close
         //
         // Same trust model as `/internal/push`: the public internet
@@ -934,85 +1269,15 @@ impl MessageHub {
         );
         let mut socketio_delivered = 0u32;
         if !matching.is_empty() {
-            let namespace = self.env.durable_object("ENGINEIO_SESSION").ok();
-            for entry in matching {
-                let sid = entry.sid;
-                let Some(ns) = namespace.as_ref() else {
-                    break;
-                };
-                let stub = match ns.id_from_name(&sid).and_then(|id| id.get_stub()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        console_log!(
-                            "MessageHub: socketio fan-out: stub for sid={} failed: {}",
-                            sid,
-                            e
-                        );
-                        continue;
-                    }
-                };
-                let payload = json!({
-                    "roomId": body.room_id,
-                    "sender": body.sender,
-                    "messageId": body.message_id,
-                    "body": body.body,
-                })
-                .to_string();
-                let headers = Headers::new();
-                if let Err(e) = headers.set("content-type", "application/json") {
-                    console_log!("MessageHub: socketio fan-out: header setup failed: {e}");
-                    continue;
-                }
-                let mut init = RequestInit::new();
-                init.with_method(Method::Post)
-                    .with_headers(headers)
-                    .with_body(Some(payload.into()));
-                let req = match Request::new_with_init(
-                    "https://do.local/internal/socketio-broadcast",
-                    &init,
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        console_log!("MessageHub: socketio fan-out: request build failed: {e}");
-                        continue;
-                    }
-                };
-                let t_sio_start = Date::now().as_millis();
-                match stub.fetch_with_request(req).await {
-                    Ok(_) => {
-                        let t_sio_done = Date::now().as_millis();
-                        console_log!(
-                            "TRACE_PHD broadcast.hub.socketio_ok sid={} msgId={} t={} rtt_ms={}",
-                            sid,
-                            body.message_id,
-                            t_sio_done,
-                            t_sio_done.saturating_sub(t_sio_start)
-                        );
-                        socketio_delivered += 1;
-                    }
-                    Err(e) => {
-                        let t_sio_done = Date::now().as_millis();
-                        console_log!(
-                            "TRACE_PHD broadcast.hub.socketio_err sid={} msgId={} t={} rtt_ms={} err={}",
-                            sid,
-                            body.message_id,
-                            t_sio_done,
-                            t_sio_done.saturating_sub(t_sio_start),
-                            e
-                        );
-                        // Stale registry entry — most likely the EngineIoSession
-                        // was evicted without firing close. Drop it now so the
-                        // next push doesn't waste another fetch.
-                        console_log!(
-                            "MessageHub: socketio fan-out failed for sid={}: {} — dropping registry entry",
-                            sid,
-                            e
-                        );
-                        let key = format!("{SOCKETIO_SUB_PREFIX}{}", sid);
-                        let _ = self.state.storage().delete(&key).await;
-                    }
-                }
-            }
+            let payload = json!({
+                "roomId": body.room_id,
+                "sender": body.sender,
+                "messageId": body.message_id,
+                "body": body.body,
+            })
+            .to_string();
+            socketio_delivered =
+                fan_out_socketio(&self.socketio_leg(), &matching, &payload, &body.message_id).await;
         }
 
         Response::from_json(&json!({
@@ -1694,6 +1959,13 @@ impl MessageHub {
         if body.sid.is_empty() {
             return Response::error("registration sid must be non-empty", 400);
         }
+        // 0.6.2: a lease renewal from the session's heartbeat is one read
+        // and one write, nothing else of a register (no sweep, no parked
+        // presence), and never recreates an entry that is gone.
+        if body.lease {
+            let renewed = renew_lease(&self.socketio_leg(), &body.sid).await;
+            return Response::from_json(&json!({ "status": "ok", "renewed": renewed }));
+        }
         // bsv-low W-B (D10): one sweep of expired session mirrors per
         // connect (a lost teardown's residue), never per frame.
         self.sweep_expired_session_mirrors(Date::now().as_millis())
@@ -1708,10 +1980,12 @@ impl MessageHub {
             .as_ref()
             .map(|e| e.joined_rooms.clone())
             .unwrap_or_default();
+        let now_ms = Date::now().as_millis();
         let entry = SocketIoRegistryEntry {
             sid: body.sid.clone(),
-            registered_at_ms: Date::now().as_millis(),
+            registered_at_ms: now_ms,
             joined_rooms: existing.map(|e| e.joined_rooms).unwrap_or_default(),
+            expires_at_ms: Some(now_ms + SOCKETIO_SUB_LEASE_MS),
         };
         if let Err(e) = self.state.storage().put(&key, entry).await {
             console_log!(
@@ -1759,6 +2033,7 @@ impl MessageHub {
                 sid: sid.to_string(),
                 joined_rooms: Vec::new(),
                 registered_at_ms: Date::now().as_millis(),
+                expires_at_ms: None,
             },
             Err(e) => {
                 console_log!(
@@ -1769,6 +2044,8 @@ impl MessageHub {
         };
         let before: Vec<String> = entry.joined_rooms.clone();
         mutate(&mut entry.joined_rooms);
+        // 0.6.2: a room mutation is the session speaking; it renews the lease.
+        entry.expires_at_ms = Some(Date::now().as_millis() + SOCKETIO_SUB_LEASE_MS);
         let added: Vec<String> = entry
             .joined_rooms
             .iter()
@@ -1830,30 +2107,16 @@ impl MessageHub {
     /// message is already in D1; offline clients catch up via
     /// `listMessages`).
     async fn list_socketio_subscribers(&self) -> Vec<SocketIoRegistryEntry> {
-        let opts = ListOptions::new().prefix(SOCKETIO_SUB_PREFIX);
-        let map = match self.state.storage().list_with_options(opts).await {
-            Ok(m) => m,
-            Err(e) => {
-                console_log!("MessageHub: socketio sub list failed: {e}");
-                return Vec::new();
-            }
-        };
-        let mut out = Vec::new();
-        // js_sys::Map iteration: each entry is [key, value].
-        let entries = map.entries();
-        let iter = js_sys::try_iter(&entries).ok().flatten();
-        if let Some(iter) = iter {
-            for e in iter.flatten() {
-                let arr: js_sys::Array = e.into();
-                let v = arr.get(1);
-                if let Ok(entry) = serde_wasm_bindgen::from_value::<SocketIoRegistryEntry>(v) {
-                    if !entry.sid.is_empty() {
-                        out.push(entry);
-                    }
-                }
-            }
+        list_live_subscribers(&self.socketio_leg()).await
+    }
+
+    /// This hub's socket.io leg over its own storage and the
+    /// `ENGINEIO_SESSION` namespace (0.6.2).
+    fn socketio_leg(&self) -> WorkerSocketIoLeg {
+        WorkerSocketIoLeg {
+            storage: self.state.storage(),
+            sessions: self.env.durable_object("ENGINEIO_SESSION").ok(),
         }
-        out
     }
 
     // =======================================================================
@@ -5200,5 +5463,350 @@ mod decouple_787_tests {
         let lib = include_str!("lib.rs");
         let door = lib.find("first_party_box_refusal(&body)").unwrap();
         assert!(door < lib[door..].find("handle_send_body(").unwrap() + door);
+    }
+}
+
+/// 0.6.2: the hub's socket.io leg joined with a bound per session; the
+/// registry's dead buried (a tombstone answer, a lease on every entry).
+#[cfg(test)]
+mod decouple_hub_tests {
+    use super::*;
+    use crate::routes::send_message::test_hub::block_on;
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
+
+    /// How the stub session answers a broadcast.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// Never answers (a wedged or slow wake); the bound fires.
+        Never,
+        Delivered,
+        /// 200 `{"delivered": 0, "reason": "no session"}`.
+        NoSession,
+        /// 200 `{"delivered": 0, "reason": "unauthenticated"}`.
+        Unauthenticated,
+    }
+
+    /// A stub leg on a virtual clock: a timer asked for `ms` at virtual time
+    /// `t` moves the clock to `t + ms` when it fires, so timers raced together
+    /// end at one bound and timers awaited in turn end at the sum.
+    struct StubLeg {
+        registry: RefCell<BTreeMap<String, SocketIoRegistryEntry>>,
+        replies: BTreeMap<String, Reply>,
+        clock: Rc<Cell<u64>>,
+        timers_ms: RefCell<Vec<u64>>,
+        log: RefCell<Vec<String>>,
+    }
+
+    impl StubLeg {
+        fn new(entries: &[(&str, Reply, Option<u64>)]) -> Self {
+            let mut registry = BTreeMap::new();
+            let mut replies = BTreeMap::new();
+            for (sid, reply, expires_at_ms) in entries {
+                registry.insert(
+                    sid.to_string(),
+                    SocketIoRegistryEntry {
+                        sid: sid.to_string(),
+                        registered_at_ms: 0,
+                        joined_rooms: vec![format!("{sid}-room")],
+                        expires_at_ms: *expires_at_ms,
+                    },
+                );
+                replies.insert(sid.to_string(), *reply);
+            }
+            Self {
+                registry: RefCell::new(registry),
+                replies,
+                clock: Rc::new(Cell::new(0)),
+                timers_ms: RefCell::new(Vec::new()),
+                log: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn has(&self, sid: &str) -> bool {
+            self.registry.borrow().contains_key(sid)
+        }
+
+        fn line(&self, needle: &str) -> String {
+            let log = self.log.borrow();
+            log.iter()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no log line contains {needle:?}: {log:#?}"))
+                .clone()
+        }
+    }
+
+    /// Pending when polled once (so every broadcast of a joined run has
+    /// started before any bound fires), then fires and moves the clock.
+    struct VirtualTimer {
+        clock: Rc<Cell<u64>>,
+        deadline: u64,
+        polled: bool,
+    }
+
+    impl std::future::Future for VirtualTimer {
+        type Output = ();
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if !self.polled {
+                self.polled = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.clock.set(self.clock.get().max(self.deadline));
+            Poll::Ready(())
+        }
+    }
+
+    impl SocketIoLeg for StubLeg {
+        async fn entries(&self) -> Vec<SocketIoRegistryEntry> {
+            self.registry.borrow().values().cloned().collect()
+        }
+
+        async fn get(&self, sid: &str) -> Option<SocketIoRegistryEntry> {
+            self.registry.borrow().get(sid).cloned()
+        }
+
+        async fn put(&self, entry: &SocketIoRegistryEntry) {
+            self.registry
+                .borrow_mut()
+                .insert(entry.sid.clone(), entry.clone());
+        }
+
+        async fn delete(&self, sid: &str) {
+            self.registry.borrow_mut().remove(sid);
+        }
+
+        async fn broadcast(
+            &self,
+            sid: &str,
+            _payload: &str,
+        ) -> std::result::Result<(u16, Value), String> {
+            match self.replies.get(sid).copied().unwrap_or(Reply::Never) {
+                Reply::Never => std::future::pending().await,
+                Reply::Delivered => Ok((200, json!({ "delivered": 1 }))),
+                Reply::NoSession => Ok((200, json!({ "delivered": 0, "reason": "no session" }))),
+                Reply::Unauthenticated => {
+                    Ok((200, json!({ "delivered": 0, "reason": "unauthenticated" })))
+                }
+            }
+        }
+
+        fn timer(&self, ms: u64) -> impl std::future::Future<Output = ()> {
+            self.timers_ms.borrow_mut().push(ms);
+            VirtualTimer {
+                clock: self.clock.clone(),
+                deadline: self.clock.get() + ms,
+                polled: false,
+            }
+        }
+
+        fn now_ms(&self) -> u64 {
+            self.clock.get()
+        }
+
+        fn log(&self, line: String) {
+            self.log.borrow_mut().push(line);
+        }
+    }
+
+    fn push(leg: &StubLeg) -> u32 {
+        let entries = block_on(list_live_subscribers(leg));
+        block_on(fan_out_socketio(leg, &entries, "{}", "m1"))
+    }
+
+    /// A method's body (closed at its 4-space brace) or a free fn's.
+    fn body_of<'a>(src: &'a str, sig: &str) -> &'a str {
+        let a = src.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
+        let rest = &src[a..];
+        let free = src[..a].ends_with('\n');
+        let close = if free { "\n}\n" } else { "\n    }\n" };
+        &rest[..rest.find(close).unwrap()]
+    }
+
+    // Pin (i), behaviour: three entries, two wedged, one answering. The push
+    // completes at one bound (t=1500), not two in turn (t=3000), with the
+    // run bracketed and the outcomes counted.
+    #[test]
+    fn pin_i_two_wedged_sessions_hold_the_push_one_bound_not_two() {
+        let lease = Some(SOCKETIO_SUB_LEASE_MS);
+        let leg = StubLeg::new(&[
+            ("a", Reply::Never, lease),
+            ("b", Reply::Delivered, lease),
+            ("c", Reply::Never, lease),
+        ]);
+        let answered = push(&leg);
+        assert_eq!(answered, 1);
+        let bound = HUB_SESSION_PUSH_TIMEOUT_MS;
+        assert_eq!(*leg.timers_ms.borrow(), vec![bound; 3]);
+        assert!(leg
+            .line("broadcast.hub.socketio_fanout n=3 ")
+            .contains("t=0"));
+        assert!(leg
+            .line("broadcast.hub.socketio_ok sid=b ")
+            .ends_with("t=0 rtt_ms=0"));
+        for sid in ["a", "c"] {
+            let line = leg.line(&format!("broadcast.hub.socketio_timeout sid={sid} "));
+            assert!(
+                line.ends_with(&format!("t={bound} rtt_ms={bound}")),
+                "{line}"
+            );
+        }
+        let done = leg.line("broadcast.hub.socketio_done ");
+        assert!(
+            done.starts_with("TRACE_PHD broadcast.hub.socketio_done n=3 ok=1 err=0 timeout=2 "),
+            "{done}"
+        );
+        assert!(done.ends_with(&format!("t={bound} ms={bound}")), "{done}");
+        assert_eq!(leg.clock.get(), 1_500, "one bound, not two in turn");
+        // A timeout keeps its entry: a slow wake may be a live session.
+        assert!(leg.has("a") && leg.has("b") && leg.has("c"));
+    }
+
+    // Pin (ii), behaviour: a tombstone answer buries its entry in the same
+    // push; an `unauthenticated` one (mid-handshake) is kept; a delivered
+    // answer renews a lease past its refresh window.
+    #[test]
+    fn pin_ii_a_tombstone_answer_buries_its_entry_and_unauthenticated_does_not() {
+        let fresh = Some(SOCKETIO_SUB_LEASE_MS);
+        let worn = Some(SOCKETIO_SUB_LEASE_REFRESH_MS);
+        let leg = StubLeg::new(&[
+            ("dead", Reply::NoSession, fresh),
+            ("shaking", Reply::Unauthenticated, fresh),
+            ("live", Reply::Delivered, worn),
+        ]);
+        push(&leg);
+        assert!(!leg.has("dead"), "the tombstone is buried");
+        assert!(leg
+            .line("broadcast.hub.socketio_tombstone sid=dead ")
+            .contains("msgId=m1"));
+        assert!(leg.has("shaking"), "unauthenticated is not a tombstone");
+        assert_eq!(leg.registry.borrow()["shaking"].expires_at_ms, fresh);
+        assert_eq!(
+            leg.registry.borrow()["live"].expires_at_ms,
+            Some(SOCKETIO_SUB_LEASE_MS),
+            "a delivered answer renews a worn lease"
+        );
+        assert!(leg
+            .line("broadcast.hub.socketio_done ")
+            .contains("n=3 ok=3 err=0 timeout=0 "));
+
+        // The next push pays no wake for the buried entry.
+        let entries = block_on(list_live_subscribers(&leg));
+        assert_eq!(
+            entries.iter().map(|e| e.sid.as_str()).collect::<Vec<_>>(),
+            vec!["live", "shaking"]
+        );
+        assert!(is_tombstone(
+            200,
+            &json!({ "delivered": 0, "reason": "no session" })
+        ));
+        assert!(!is_tombstone(
+            200,
+            &json!({ "delivered": 0, "reason": "unauthenticated" })
+        ));
+        assert!(!is_tombstone(
+            500,
+            &json!({ "delivered": 0, "reason": "no session" })
+        ));
+    }
+
+    // Pin (iii), behaviour: an entry past its lease is skipped and deleted by
+    // the list (no wake); an entry renewed within its lease is kept.
+    #[test]
+    fn pin_iii_an_expired_entry_is_skipped_and_deleted_and_a_renewed_one_is_kept() {
+        let leg = StubLeg::new(&[
+            ("gone", Reply::Delivered, Some(1_000)),
+            ("kept", Reply::Delivered, Some(1_000)),
+        ]);
+        leg.clock.set(900);
+        assert!(block_on(renew_lease(&leg, "kept")));
+        assert!(
+            !block_on(renew_lease(&leg, "never")),
+            "no entry is recreated"
+        );
+        assert!(!leg.has("never"));
+        leg.clock.set(1_000);
+        let answered = push(&leg);
+        assert_eq!(answered, 1, "the expired entry costs a list, never a wake");
+        assert!(!leg.has("gone"));
+        assert!(leg
+            .line("broadcast.hub.socketio_expired sid=gone ")
+            .contains("t=1000"));
+        assert!(leg.has("kept"));
+        assert_eq!(
+            leg.registry.borrow()["kept"].expires_at_ms,
+            Some(900 + SOCKETIO_SUB_LEASE_MS)
+        );
+        assert!(leg.line("broadcast.hub.socketio_fanout ").contains("n=1 "));
+    }
+
+    // Pin (iii), the migration rule: an entry written before 0.6.2 (no
+    // `expires_at_ms`) reads as unexpired for one lease from when it is seen,
+    // then expires unless renewed.
+    #[test]
+    fn pin_iii_an_entry_without_a_lease_is_stamped_one_lease_from_when_it_is_seen() {
+        let old: SocketIoRegistryEntry =
+            serde_json::from_str(r#"{"sid":"old","registeredAtMs":5,"joinedRooms":["r"]}"#)
+                .expect("an entry written before 0.6.2 still reads");
+        assert_eq!(old.expires_at_ms, None);
+        let leg = StubLeg::new(&[("old", Reply::Delivered, None)]);
+        leg.clock.set(7_000);
+        let seen = block_on(list_live_subscribers(&leg));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            leg.registry.borrow()["old"].expires_at_ms,
+            Some(7_000 + SOCKETIO_SUB_LEASE_MS)
+        );
+        leg.clock.set(7_000 + SOCKETIO_SUB_LEASE_MS);
+        assert!(block_on(list_live_subscribers(&leg)).is_empty());
+        assert!(!leg.has("old"));
+    }
+
+    // Pin (iii), the renewal cadence: the heartbeat renews once in every
+    // window of six pings; a delivered answer renews only a worn lease.
+    #[test]
+    fn pin_iii_the_heartbeat_renews_the_lease_once_a_window() {
+        use crate::engineio::session::{hub_lease_renewal_due, PING_INTERVAL_MS};
+        let w = SOCKETIO_SUB_LEASE_REFRESH_MS;
+        assert_eq!(w, 150_000);
+        assert_eq!(SOCKETIO_SUB_LEASE_MS, 600_000);
+        assert!(hub_lease_renewal_due(10 * w, None));
+        let renewals = (1..=60u64)
+            .map(|k| 10 * w + k * PING_INTERVAL_MS)
+            .filter(|&now| hub_lease_renewal_due(now, Some(now - PING_INTERVAL_MS)))
+            .count();
+        assert_eq!(renewals, 10, "60 pings, 10 windows, one renewal each");
+        assert!(!lease_renewal_due(
+            Some(1_000 + SOCKETIO_SUB_LEASE_MS),
+            1_000
+        ));
+        assert!(lease_renewal_due(
+            Some(1_000 + SOCKETIO_SUB_LEASE_MS - w - 1),
+            1_000
+        ));
+        assert!(lease_renewal_due(None, 1_000));
+    }
+
+    // Pin (iv), source (RED base 8bedccc, where `handle_internal_push` awaited
+    // `stub.fetch_with_request(req)` in turn inside its loop over `matching`):
+    // the push hands the leg to `fan_out_socketio`, which joins the
+    // broadcasts and races each against its bound. Rename-defeatable; it
+    // stands beside the behaviour pins above.
+    #[test]
+    fn pin_iv_source_the_socketio_leg_is_joined_not_awaited_in_turn() {
+        let src = include_str!("message_hub.rs");
+        let push = body_of(src, "async fn handle_internal_push(");
+        assert!(
+            !push.contains("fetch_with_request("),
+            "the push must not fetch the sessions itself, one after another"
+        );
+        assert!(push.contains("fan_out_socketio("));
+        let leg = body_of(src, "async fn fan_out_socketio<");
+        assert!(leg.contains("futures_util::future::join_all("));
+        assert!(leg.contains("leg.timer(HUB_SESSION_PUSH_TIMEOUT_MS)"));
+        let list = body_of(src, "async fn list_socketio_subscribers(");
+        assert!(list.contains("list_live_subscribers("));
     }
 }

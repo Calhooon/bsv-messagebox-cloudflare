@@ -700,7 +700,9 @@ fn tip_of(cursor: &Cursor) -> Result<Option<Tip>, DoorError> {
         .get(at..at.checked_add(width).ok_or_else(short)?)
         .ok_or_else(short)?;
     let proof = entries
-        .chunks_exact(32 + 8)
+        .as_chunks::<{ 32 + 8 }>()
+        .0
+        .iter()
         .find(|entry| entry[..32] == txid)
         .map(|entry| u64::from_le_bytes(entry[32..].try_into().expect("eight bytes")));
     Ok(Some(Tip {

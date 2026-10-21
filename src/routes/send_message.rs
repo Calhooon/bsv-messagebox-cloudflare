@@ -48,7 +48,7 @@ use worker::{console_log, Date, Delay, Env, Headers, Method, Request, RequestIni
 /// full request timeout (~30s) — which wedged every authed send under load
 /// (the relay's `/sendMessage` "canceled" 30s hang, 0 CPU). 2s is far above a
 /// healthy DO RTT (single-digit ms) yet returns promptly when a DO is stuck.
-const PUSH_FANOUT_TIMEOUT_MS: u64 = 2_000;
+pub(crate) const PUSH_FANOUT_TIMEOUT_MS: u64 = 2_000;
 
 use crate::beef_upload;
 use crate::fcm;
@@ -277,7 +277,10 @@ async fn notify_fcm(env: &Env, fcm: &[FcmPush]) {
 
 /// `Some(work's output)` if `work` ends first, `None` if `timer` does (the
 /// work is then dropped, which cancels a subrequest).
-async fn race<T>(work: impl Future<Output = T>, timer: impl Future<Output = ()>) -> Option<T> {
+pub(crate) async fn race<T>(
+    work: impl Future<Output = T>,
+    timer: impl Future<Output = ()>,
+) -> Option<T> {
     let mut work = std::pin::pin!(work);
     let mut timer = std::pin::pin!(timer);
     std::future::poll_fn(|cx| {

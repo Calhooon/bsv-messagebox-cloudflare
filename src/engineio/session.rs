@@ -518,6 +518,15 @@ pub(crate) fn test_knob_n(beta_marker: Option<&str>, value: Option<&str>) -> u64
         .unwrap_or(0)
 }
 
+/// 0.6.2: the heartbeat renews this session's lease on its hub's registry
+/// entry once in every `SOCKETIO_SUB_LEASE_REFRESH_MS` window, judged by TIME
+/// from the previous ping (the ping that opens a window renews; no state of
+/// its own to clobber). An unknown previous ping is due.
+pub(crate) fn hub_lease_renewal_due(now_ms: u64, last_ping_at_ms: Option<u64>) -> bool {
+    let window = crate::message_hub::SOCKETIO_SUB_LEASE_REFRESH_MS;
+    last_ping_at_ms.is_none_or(|last| last / window != now_ms / window)
+}
+
 /// The broadcast-registry entry is refreshed by TIME (0.3.8), never by a
 /// ping count: an unknown last refresh is due (the first tick after a deploy
 /// re-registers once — harmless).
@@ -907,6 +916,11 @@ impl DurableObject for EngineIoSession {
                     let ping = EngineIoPacket::Ping(String::new()).encode();
                     match ws.send_with_str(&ping) {
                         Ok(()) => {
+                            // 0.6.2: the hub lease, judged from the previous
+                            // ping before it is overwritten (no new state).
+                            let lease = hub_lease_renewal_due(now, att.last_ping_at_ms)
+                                .then(|| att.auth.verified_identity_key().map(str::to_string))
+                                .flatten();
                             att.awaiting_pong_since_ms = Some(now);
                             att.last_ping_at_ms = Some(now);
                             // A live socket holding a broadcast room keeps its
@@ -950,6 +964,9 @@ impl DurableObject for EngineIoSession {
                             if let Some(identity) = refresh {
                                 crate::broadcast_registry::register_identity(&self.env, &identity)
                                     .await;
+                            }
+                            if let Some(identity) = lease {
+                                self.renew_hub_lease(&identity, &att.sid).await;
                             }
                         }
                         Err(e) => {
@@ -2463,6 +2480,41 @@ impl EngineIoSession {
         register: bool,
         revoke_session: Option<&str>,
     ) {
+        let endpoint = if register {
+            "https://do.local/internal/socketio-register"
+        } else {
+            "https://do.local/internal/socketio-unregister"
+        };
+        let mut payload = json!({ "sid": sid });
+        if let Some(id) = revoke_session {
+            payload["sessionId"] = json!(id);
+        }
+        let label = if register { "register" } else { "unregister" };
+        self.post_to_hub_registry(identity_key, endpoint, payload, label)
+            .await;
+    }
+
+    /// 0.6.2: renew this sid's lease on its hub's registry entry
+    /// (`SOCKETIO_SUB_LEASE_MS`): the register route with `lease: true`, one
+    /// read and one write in the hub, no new route.
+    async fn renew_hub_lease(&self, identity_key: &str, sid: &str) {
+        let payload = json!({ "sid": sid, "lease": true });
+        self.post_to_hub_registry(
+            identity_key,
+            "https://do.local/internal/socketio-register",
+            payload,
+            "lease",
+        )
+        .await;
+    }
+
+    async fn post_to_hub_registry(
+        &self,
+        identity_key: &str,
+        endpoint: &str,
+        payload: Value,
+        label: &str,
+    ) {
         let namespace = match self.env.durable_object("MESSAGE_HUB") {
             Ok(n) => n,
             Err(e) => {
@@ -2481,15 +2533,6 @@ impl EngineIoSession {
             }
         };
 
-        let endpoint = if register {
-            "https://do.local/internal/socketio-register"
-        } else {
-            "https://do.local/internal/socketio-unregister"
-        };
-        let mut payload = json!({ "sid": sid });
-        if let Some(id) = revoke_session {
-            payload["sessionId"] = json!(id);
-        }
         let payload = payload.to_string();
         let headers = Headers::new();
         if headers.set("content-type", "application/json").is_err() {
@@ -2507,10 +2550,7 @@ impl EngineIoSession {
             }
         };
         if let Err(e) = stub.fetch_with_request(req).await {
-            console_log!(
-                "EngineIoSession: registration ({}) fetch failed: {e}",
-                if register { "register" } else { "unregister" }
-            );
+            console_log!("EngineIoSession: registration ({label}) fetch failed: {e}");
         }
     }
 
