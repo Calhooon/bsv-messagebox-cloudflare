@@ -25,6 +25,7 @@ mod retention;
 mod routes;
 mod send_budget;
 mod storage;
+mod turn_credentials;
 mod types;
 pub mod validation;
 
@@ -104,6 +105,8 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     if let Ok(db) = env.d1("DB") {
         let now = worker::Date::now().as_millis() / 1000;
         send_budget::forget_closed(&db, &send_budget::Budget::from_env(&env), now).await;
+        // The TURN budgets' closed windows and the expired credentials.
+        turn_credentials::forget_closed(&db, worker::Date::now().as_millis()).await;
     }
 }
 
@@ -394,6 +397,9 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let req_method_dbg = req.method();
     let req_path_dbg = req.path();
 
+    // The edge's client address, read before the door: the TURN budget's
+    // source group (`/turn-credentials`).
+    let client_address = req.headers().get("CF-Connecting-IP").ok().flatten();
     // bsv-low W-B (D10): THE HTTP SESSION LANE. A request carrying
     // `x-low-session` is verified through the identity's hub (the mirror of
     // the socket's lane: the counter and a MAC over the method, the path and
@@ -568,6 +574,21 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         (Method::Post, "/rejoin-deadline") => {
             let url = req.url().map_err(|e| Error::from(e.to_string()))?;
             handle_rejoin_deadline_route(&url, &request_body, &env, &ctx).await
+        }
+
+        // The ICE servers of a WebRTC hand, TURN credentials included,
+        // minted for the authenticated identity from the Worker's TURN key,
+        // within the budgets charged before the provider is asked. 403 unless
+        // TURN_CREDENTIALS = "on".
+        (Method::Post, "/turn-credentials") => {
+            turn_credentials::handle_mint(
+                &request_body,
+                identity_key,
+                client_address.as_deref(),
+                &env,
+                &db,
+            )
+            .await
         }
 
         _ => (
