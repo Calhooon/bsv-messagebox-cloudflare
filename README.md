@@ -1,13 +1,13 @@
-> **Public release mirror.** This repository receives tagged releases of a private canonical repository (every Cloudflare resource identifier is scrubbed; deployment configs are placeholders). Issues and PRs are welcome here; development happens upstream and lands as the next release.
+> **The code of record.** This repository is the home of `bsv-messagebox-cloudflare` since 0.5.5: every change lands here through a pull request under the machine gate (the `test`, `fmt`, `clippy`, `wasm32` and `scrub` checks, linear history), and a `v*` tag publishes the crate through crates.io trusted publishing. The deployment config carries placeholders only; the deployed Workers' identifiers live in the operator's private infra repository, never here, and the `scrub` check (`tools/scrub.sh`) refuses an identifier, a deployment hostname, a key-shaped or token-shaped string, a second wrangler config or a secrets file on every pull request.
 
 # bsv-messagebox-cloudflare
 
 A BSV messaging relay on Cloudflare Workers: BRC-31 authentication, delivery
 permissions, optional paid delivery, D1 message storage, KV sessions, raw
 WebSockets through a hibernatable Durable Object, and a Socket.IO transport for
-unmodified `@bsv/authsocket-client` and `@bsv/message-box-client`. The public
-repository is a sanitized release mirror; development belongs on branches of the
-canonical repository, and the maintainer cuts the mirror.
+unmodified `@bsv/authsocket-client` and `@bsv/message-box-client`. This
+repository is the code of record: development happens on its branches and lands
+on `main` through pull requests.
 
 ## Version and dependencies
 

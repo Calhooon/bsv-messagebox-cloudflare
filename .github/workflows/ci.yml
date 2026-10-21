@@ -72,3 +72,9 @@ jobs:
       with:
         workspaces: . -> target
     - run: cargo build --release --target wasm32-unknown-unknown --lib
+  scrub:
+    name: scrub
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: tools/scrub.sh
