@@ -823,3 +823,5 @@ pub async fn handle_mint(
     mint(&m, identity, &source_of(source), body).await
 }
 
+#[cfg(test)]
+mod tests;
