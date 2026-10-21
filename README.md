@@ -38,6 +38,7 @@ The router is `handle` in [src/lib.rs](src/lib.rs).
 | `POST` | `/beef/upload-url`, `/beef/download-url` | BRC-31; presigned R2 URLs |
 | `GET` | `/presence` | BRC-31 |
 | `POST` | `/rejoin-deadline` | BRC-31 |
+| `POST` | `/turn-credentials`, `/turn-credentials/revoke` | BRC-31; `TURN_CREDENTIALS = "on"` only |
 
 HTTP and WebSocket sends share [src/routes/send_message.rs](src/routes/send_message.rs).
 The scheduled event drains deferred delivery fees and reclaims released payment
@@ -118,6 +119,26 @@ secret (the bearer of `/push`, `/broadcast` and `/session/attest`), the
 `ARC_URL` and `ARC_API_KEY` (the broadcaster a verified payment is announced
 to), and `RETAIN_BOX_PREFIXES` (the transcript-retained box class). A deployment
 that uses those features declares them itself.
+
+The ICE credentials of a WebRTC hand are off until `TURN_CREDENTIALS = "on"`.
+The routes need the Cloudflare Realtime TURN key's id in `TURN_KEY_ID` (the
+operator's configuration, never the template) and its API token as a secret,
+beside `SERVER_PRIVATE_KEY`'s:
+
+```sh
+wrangler secret put SERVER_PRIVATE_KEY
+wrangler secret put TURN_KEY_API_TOKEN
+```
+
+`POST /turn-credentials` (an empty body or `{}`) answers `{iceServers,
+expiresAt}` for the authenticated identity, `expiresAt` in milliseconds since
+the epoch, counted from the start of the request to Cloudflare. A mint is
+charged, before Cloudflare is asked, to the hourly budgets in `wrangler.toml`
+(the identity, the source group from `CF-Connecting-IP`, the IPv6 /48, the
+Worker), all or none; a spent budget is 429 `ERR_TURN_BUDGET` naming it, and a
+Cloudflare failure is 502 `ERR_TURN_PROVIDER` with the charge standing.
+`POST /turn-credentials/revoke` `{"username"}` revokes a username its caller
+minted; any other is 404. Apply migration 0010 before deploying.
 
 For bytes at rest, bind `BEEF_BLOBS`, configure presigning privately and retain
 the lifecycle policy for `door-state/`. Inline payments can be spooled to R2;

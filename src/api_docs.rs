@@ -32,7 +32,8 @@ fn tags() -> Value {
         { "name": "Health", "description": "Service health endpoints." },
         { "name": "Messages", "description": "Message sending, listing, and acknowledgment." },
         { "name": "Permissions", "description": "Delivery permission and fee management." },
-        { "name": "Devices", "description": "FCM device registration for push notifications." }
+        { "name": "Devices", "description": "FCM device registration for push notifications." },
+        { "name": "WebRTC", "description": "The ICE credentials of a WebRTC hand, minted from the relay's TURN key. Off unless TURN_CREDENTIALS = \"on\"." }
     ])
 }
 
@@ -477,6 +478,11 @@ fn paths() -> Value {
     m.insert("/beef/download-url".into(), path_beef_download_url());
     m.insert("/listTranscript".into(), path_list_transcript());
     m.insert("/purgeTranscript".into(), path_purge_transcript());
+    m.insert("/turn-credentials".into(), path_turn_credentials());
+    m.insert(
+        "/turn-credentials/revoke".into(),
+        path_turn_credentials_revoke(),
+    );
     Value::Object(m)
 }
 
@@ -1057,6 +1063,96 @@ fn path_devices() -> Value {
     })
 }
 
+fn error_ref(description: &str) -> Value {
+    json!({
+        "description": description,
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+    })
+}
+
+fn path_turn_credentials() -> Value {
+    json!({
+        "post": {
+            "summary": "Mint the ICE servers of a WebRTC hand",
+            "description": "Answers the ICE servers, TURN credentials included, for the authenticated identity, from the relay's Cloudflare Realtime TURN key (never sent to a client). The ttl is TURN_TTL_SECONDS, at most 172800 s; `expiresAt` is milliseconds since the epoch, the moment the request to Cloudflare started plus the ttl. Before Cloudflare is asked the mint is charged, all or none, to four hourly budgets in this order: the identity, the source group (an IPv4 address or an IPv6 /64, from CF-Connecting-IP), the IPv6 /48 above it and the Worker. A Cloudflare failure keeps the charge.",
+            "operationId": "turnCredentials",
+            "tags": ["WebRTC"],
+            "security": [{ "BRC31Auth": [] }],
+            "requestBody": {
+                "required": false,
+                "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "properties": { "identityKey": { "type": "string", "description": "Optional; when present it must be the caller's own identity key." } }
+                } } }
+            },
+            "responses": {
+                "200": {
+                    "description": "The ICE servers and their expiry.",
+                    "content": { "application/json": { "schema": {
+                        "type": "object",
+                        "required": ["status", "iceServers", "expiresAt"],
+                        "properties": {
+                            "status": { "type": "string", "enum": ["success"] },
+                            "iceServers": { "type": "array", "items": {
+                                "type": "object",
+                                "required": ["urls"],
+                                "properties": {
+                                    "urls": { "type": "array", "items": { "type": "string" } },
+                                    "username": { "type": "string" },
+                                    "credential": { "type": "string" }
+                                }
+                            } },
+                            "expiresAt": { "type": "integer", "description": "Milliseconds since the epoch." }
+                        }
+                    } } }
+                },
+                "400": error_ref("The body is neither empty nor a JSON object (ERR_INVALID_JSON)."),
+                "403": error_ref("The route is off (ERR_TURN_OFF), or the body names another identity (ERR_TURN_NOT_CALLER); nothing is charged."),
+                "429": error_ref("A budget is spent (ERR_TURN_BUDGET); `budget` names it (identity, source, prefix48 or total), `retryAt` is when the next window opens (unix seconds)."),
+                "502": error_ref("Cloudflare did not mint credentials (ERR_TURN_PROVIDER); the request was charged."),
+                "503": error_ref("The TURN key is not configured (ERR_SERVER_MISCONFIGURED, nothing charged), or the budget could not be read (ERR_TURN_UNAVAILABLE).")
+            }
+        }
+    })
+}
+
+fn path_turn_credentials_revoke() -> Value {
+    json!({
+        "post": {
+            "summary": "Revoke a TURN username the caller minted",
+            "description": "The hand's close: Cloudflare revokes the username's credentials. Only the identity that minted a username may revoke it; any other username is 404, so a username is not disclosed as existing.",
+            "operationId": "turnCredentialsRevoke",
+            "tags": ["WebRTC"],
+            "security": [{ "BRC31Auth": [] }],
+            "requestBody": {
+                "required": true,
+                "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["username"],
+                    "properties": { "username": { "type": "string" } }
+                } } }
+            },
+            "responses": {
+                "200": {
+                    "description": "Revoked.",
+                    "content": { "application/json": { "schema": {
+                        "type": "object",
+                        "properties": {
+                            "status": { "type": "string", "enum": ["success"] },
+                            "revoked": { "type": "boolean", "enum": [true] }
+                        }
+                    } } }
+                },
+                "400": error_ref("No username (ERR_USERNAME_REQUIRED)."),
+                "403": error_ref("The route is off (ERR_TURN_OFF)."),
+                "404": error_ref("No credential of this identity has that username (ERR_TURN_CREDENTIAL_NOT_FOUND)."),
+                "502": error_ref("Cloudflare did not revoke (ERR_TURN_PROVIDER); ask again."),
+                "503": error_ref("The TURN key is not configured, or the record could not be read.")
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,6 +1183,8 @@ mod tests {
             "/beef/download-url",
             "/listTranscript",
             "/purgeTranscript",
+            "/turn-credentials",
+            "/turn-credentials/revoke",
         ];
         for path in &expected {
             assert!(paths.contains_key(*path), "Missing path: {}", path);
@@ -1119,6 +1217,8 @@ mod tests {
             ("/beef/download-url", "post"),
             ("/listTranscript", "post"),
             ("/purgeTranscript", "post"),
+            ("/turn-credentials", "post"),
+            ("/turn-credentials/revoke", "post"),
         ];
         for (path, method) in auth_paths {
             let endpoint = &spec["paths"][path][method];
