@@ -1,8 +1,14 @@
 # Changelog
 
-All notable changes to the relay. Public releases are cut from this repository with
-`scripts/release-public.sh` (Cloudflare resource identifiers scrubbed) into
-`Calhooon/bsv-messagebox-cloudflare`.
+All notable changes to the relay. Since 0.5.5 this repository is the code of record:
+a change lands on `main` through a pull request under the machine gate, and a `v*`
+tag publishes the release. Before 0.5.5 releases were cut from a private canonical
+repository with a release script that scrubbed every Cloudflare resource identifier;
+the `scrub` check (`tools/scrub.sh`) now holds that rule on every pull request.
+
+## [Unreleased]
+
+- **The `scrub` check.** `tools/scrub.sh` runs on every pull request as the fifth required check: no id-shaped value in a wrangler file, no deployment hostname that is not a placeholder, no key-shaped or token-shaped string, no second wrangler config or secrets file, no private program name. The shapes are the retired release script's; AWS's documented example access keys (the SigV4 vectors) are allowed by their ending. The README's and this file's opening sentences no longer call this repository a mirror.
 
 ## [0.6.2] - 2026-10-21
 
