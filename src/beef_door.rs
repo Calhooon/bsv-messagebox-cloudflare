@@ -1192,7 +1192,9 @@ impl Rest {
     }
 
     /// The state from its bytes; anything else is no state, and the reading
-    /// starts over.
+    /// starts over. So is a state whose cursor is `BSC2` (bsv-rs 0.5.0 to
+    /// 0.8.0): 0.8.1 reads it with none of the atomic walk's edges, and a
+    /// reading resumed from it can refuse a valid payment.
     fn from_binary(bin: &[u8]) -> Option<Self> {
         let rest = bin.strip_prefix(STATE_MAGIC)?;
         let (head, rest) = rest.split_at_checked(1 + 8 + 8 + 4)?;
@@ -1206,7 +1208,9 @@ impl Rest {
             },
             phase: Phase::of(head[0])?,
             roots_asked: u64_at(9),
-            cursor: Cursor::from_binary(cursor).ok()?,
+            cursor: Cursor::from_binary(cursor)
+                .ok()
+                .filter(|_| !cursor.starts_with(b"BSC2"))?,
         })
     }
 }
@@ -2196,6 +2200,60 @@ pub(crate) mod tests {
             whole(&store, &headers).await,
             AtRest::Done(inline(&bytes, &headers).await)
         );
+        assert_eq!(store.state(KEY), None, "a verdict leaves no state");
+    }
+
+    /// bsv-rs 0.8.1 writes the cursor `BSC3` (the atomic walk's edges after
+    /// the transactions) and reads 0.5.0 to 0.8.0's `BSC2` as `BSC3` with no
+    /// edge, so a resumed walk reaches less: a valid chain paused after two
+    /// links comes back `UnrelatedTransaction` (shown here on the reader).
+    /// A door state saved by the relay on 0.7.0 holds a `BSC2` cursor, so it
+    /// is no state on 0.7.1: the next pass reads the object from its start
+    /// and comes to the whole reading's verdict, never that refusal.
+    #[tokio::test]
+    async fn a_state_saved_under_bsv_rs_0_7_is_no_state_and_the_reading_starts_over() {
+        let (bytes, root) = chain(5);
+        let headers = Roots::of(&[(HEIGHT, root)]);
+        // The BUMP and three links, between two elements.
+        let mut reader = StreamVerifier::new(bytes.as_slice(), AskedAfter, None);
+        for _ in 0..1 + 3 {
+            assert!(matches!(reader.step().unwrap(), Progress::Stepped));
+        }
+        let stored = reader.cursor().to_binary();
+        let tail = 8 + 1 + 3 * (32 + 1 + 32) + 1;
+        assert_eq!(stored[stored.len() - tail..][..8], 3u64.to_le_bytes());
+        let mut bsc2 = b"BSC2".to_vec();
+        bsc2.extend_from_slice(&stored[4..stored.len() - tail]);
+        bsc2.push(0);
+        let cursor = Cursor::from_binary(&bsc2).expect("0.8.1 reads BSC2");
+        let rest = &bytes[cursor.offset() as usize..];
+        assert!(matches!(
+            bsv_rs::transaction::beef_stream::resume(cursor, rest, AskedAfter).unwrap(),
+            Verdict::Invalid {
+                kind: Kind::UnrelatedTransaction,
+                ..
+            }
+        ));
+        // The same cursor in a door state of the scripts' reading.
+        let mut saved = STATE_MAGIC.to_vec();
+        saved.push(Phase::Scripts.byte());
+        saved.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        saved.extend_from_slice(&0u64.to_le_bytes());
+        saved.extend_from_slice(&2u32.to_le_bytes());
+        saved.extend_from_slice(b"v1");
+        let mut current = saved.clone();
+        current.extend_from_slice(&stored);
+        assert!(
+            Rest::from_binary(&current).is_some(),
+            "the layout is the door's"
+        );
+        saved.extend_from_slice(&bsc2);
+        assert_eq!(Rest::from_binary(&saved), None);
+        let store = MemStore::with(KEY, &bytes);
+        store.states.borrow_mut().insert(state_key(KEY), saved);
+        let verdict = inline(&bytes, &headers).await;
+        assert_eq!(verdict.word, PaymentVerdict::Verified { satoshis: FEE });
+        assert_eq!(whole(&store, &headers).await, AtRest::Done(verdict));
         assert_eq!(store.state(KEY), None, "a verdict leaves no state");
     }
 
