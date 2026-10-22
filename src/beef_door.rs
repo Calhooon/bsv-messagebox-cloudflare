@@ -640,21 +640,30 @@ struct Tip {
     proof: Option<u64>,
 }
 
-/// The tip of a reading: the subject. bsv-rs 0.6.0's verifier does not hand
-/// out the element it stepped, so this is read from the cursor's own bytes
-/// (`Cursor::to_binary`, `beef_stream.rs:2639-2765` at 0.6.0: the magic
-/// `BSC2`, the frame, then the index's `last_raw`, the same fields in the same
+/// The tip of a reading: the subject. bsv-rs's verifier does not hand out
+/// the element it stepped, so this is read from the cursor's own bytes
+/// (`Cursor::to_binary`, `beef_stream.rs:2772-2908` at 0.8.1: the magic
+/// `BSC3`, the frame, then the index's `last_raw`, the same fields in the same
 /// order as 0.4.4's `BSC1` up to `last_raw`; 0.5.0 renamed the magic when it
 /// added the coinbase heights after them; a paused cursor appends after them,
 /// and the door reads a tip only at a reading's end). After `last_raw` come
 /// the index's BUMPs (height and root, by place) and its proven txids (each
-/// level-0 txid and the earliest BUMP that carries it, sorted by txid,
-/// `:2682-2694`): the subject's entry there is the BUMP that proves it
-/// (0.5.6, W19). The door holds the bytes it then fetches to this txid
-/// (`subject_raw`) and the BUMP it fetches to its place (`bump_bytes`), so a
-/// cursor laid out otherwise is an error here and never a wrong answer.
+/// level-0 txid and the earliest BUMP that carries it, sorted by txid): the
+/// subject's entry there is the BUMP that proves it (0.5.6, W19). The door
+/// holds the bytes it then fetches to this txid (`subject_raw`) and the BUMP
+/// it fetches to its place (`bump_bytes`), so a cursor laid out otherwise is
+/// an error here and never a wrong answer.
 fn tip_of(cursor: &Cursor) -> Result<Option<Tip>, DoorError> {
-    let bin = cursor.to_binary();
+    tip_in(&cursor.to_binary())
+}
+
+/// The tip in a cursor's bytes. 0.8.1's `BSC3` is 0.5.0 to 0.8.0's `BSC2`
+/// up to the proven txids and differs only after them (the transactions'
+/// flags, `:2838`, then the input count and the atomic walk's edges,
+/// `:2869-2885`), which this does not read: a `BSC2` cursor reads here as
+/// 0.8.1's `Cursor::from_binary` reads it (`:2929-2931`), as `BSC3` with no
+/// edge.
+fn tip_in(bin: &[u8]) -> Result<Option<Tip>, DoorError> {
     let short = || DoorError::Internal("the cursor's bytes are not the layout read".to_string());
     let mut at = 0usize;
     let mut take = |n: usize| {
@@ -662,7 +671,8 @@ fn tip_of(cursor: &Cursor) -> Result<Option<Tip>, DoorError> {
         at += n;
         slice
     };
-    if take(4).ok_or_else(short)? != b"BSC2" {
+    let magic = take(4).ok_or_else(short)?;
+    if magic != b"BSC3" && magic != b"BSC2" {
         return Err(short());
     }
     take(1).ok_or_else(short)?; // spends checked
@@ -685,13 +695,13 @@ fn tip_of(cursor: &Cursor) -> Result<Option<Tip>, DoorError> {
         }
         _ => return Err(short()),
     };
-    let bumps = varint(&bin, &mut at).ok_or_else(short)?;
+    let bumps = varint(bin, &mut at).ok_or_else(short)?;
     let width = usize::try_from(bumps)
         .ok()
         .and_then(|n| n.checked_mul(8 + 32))
         .ok_or_else(short)?;
     at = at.checked_add(width).ok_or_else(short)?; // the BUMPs' heights and roots
-    let proven = varint(&bin, &mut at).ok_or_else(short)?;
+    let proven = varint(bin, &mut at).ok_or_else(short)?;
     let width = usize::try_from(proven)
         .ok()
         .and_then(|n| n.checked_mul(32 + 8))
@@ -1656,6 +1666,61 @@ pub(crate) mod tests {
         assert!(subject_raw(bytes[at as usize - 1..].to_vec(), &subject).is_err());
     }
 
+    /// 0.8.1's cursor (`BSC3`) at every resume point of a reading, and the
+    /// same cursor as 0.8.0 wrote it (`BSC2`: no input count and no edges),
+    /// built the way bsv-rs 0.8.1's `a_bsc2_cursor_reads_as_bsc3_with_no_edges`
+    /// builds it. The tip read from either is the last transaction read,
+    /// at its leading byte, with the BUMP that proves it when it is proven.
+    #[test]
+    fn the_tip_of_a_bsc3_cursor_and_of_its_bsc2_form_at_every_resume_point() {
+        let links = 5;
+        let (bytes, _) = chain(links);
+        let mut reader = StreamVerifier::new(bytes.as_slice(), AskedAfter, None);
+        assert!(tip_in(&reader.cursor().to_binary()).unwrap().is_none());
+        // The BUMP, then each link.
+        assert!(matches!(reader.step().unwrap(), Progress::Stepped));
+        let mut last = 0u64;
+        for read in 1..=links {
+            if let Progress::Verdict(verdict) = reader.step().unwrap() {
+                assert!(verdict.is_valid(), "link {read}: {verdict:?}");
+            }
+            let stored = reader.cursor().to_binary();
+            assert_eq!(&stored[..4], b"BSC3");
+            let tip = tip_in(&stored).unwrap().expect("a tip");
+            let at = tip.at as usize;
+            let len = raw_tx_len(&bytes[at..]).expect("a transaction");
+            assert_eq!(tip.txid, txid(&bytes[at..at + len]), "link {read}");
+            assert!(tip.at > last, "link {read}");
+            last = tip.at;
+            assert_eq!(tip.proof, (read == 1).then_some(0), "link {read}");
+            assert_eq!(
+                tip_of(&Cursor::from_binary(&stored).unwrap()).unwrap(),
+                Some(tip.clone())
+            );
+            // Between two elements: the input count, one edge list per link
+            // read (txid, count, its one prev), then `wanted`, absent.
+            let tail = 8 + 1 + read * (32 + 1 + 32) + 1;
+            let edges = &stored[stored.len() - tail..];
+            assert_eq!(edges[..8], (read as u64).to_le_bytes(), "link {read}");
+            assert_eq!(edges[8] as usize, read, "link {read}");
+            assert_eq!(edges[tail - 1], 0, "link {read}");
+            let mut bsc2 = b"BSC2".to_vec();
+            bsc2.extend_from_slice(&stored[4..stored.len() - tail]);
+            bsc2.push(0);
+            assert_eq!(tip_in(&bsc2).unwrap(), Some(tip.clone()), "link {read}");
+            let resumed = Cursor::from_binary(&bsc2).expect("0.8.1 reads BSC2");
+            assert_eq!(tip_of(&resumed).unwrap(), Some(tip), "link {read}");
+        }
+        assert_eq!(
+            last as usize,
+            bytes.len() - raw_tx(&[0; 32], FEE, PAID).len()
+        );
+        // Any other leading word is no layout this reads.
+        let mut other = reader.cursor().to_binary();
+        other[..4].copy_from_slice(b"BSC1");
+        assert!(tip_in(&other).is_err());
+    }
+
     // ---- the inline door ----
 
     async fn inline(bytes: &[u8], headers: &Roots) -> DoorVerdict {
@@ -2121,7 +2186,7 @@ pub(crate) mod tests {
         assert!(Rest::from_binary(&saved).is_some());
         let at = saved
             .windows(4)
-            .position(|w| w == b"BSC2")
+            .position(|w| w == b"BSC3")
             .expect("the cursor's magic");
         let mut old = saved.clone();
         old[at..at + 4].copy_from_slice(b"BSC1");
