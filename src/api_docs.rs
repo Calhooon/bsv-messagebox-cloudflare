@@ -782,7 +782,18 @@ fn list_messages_responses() -> Value {
         "500": {
             "description": "Internal server error.",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
-        }
+        },
+        "503": d1_unavailable("listing")
+    })
+}
+
+/// The 503 the listing and the acknowledge answer when D1 stays unavailable
+/// through the bounded retry (0.8.0, message box #22).
+fn d1_unavailable(what: &str) -> Value {
+    json!({
+        "description": format!("The store did not answer the {what} within its bounded retry (at most 6,150 ms a read); the same request may be sent again after the `Retry-After` seconds. ERR_D1_UNAVAILABLE."),
+        "headers": { "Retry-After": { "schema": { "type": "integer" }, "description": "Seconds to wait before retrying." } },
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
     })
 }
 
@@ -823,7 +834,8 @@ fn acknowledge_responses() -> Value {
         "500": {
             "description": "Internal server error.",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
-        }
+        },
+        "503": d1_unavailable("acknowledgment")
     })
 }
 
