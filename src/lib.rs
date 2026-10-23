@@ -19,6 +19,7 @@ use worker::*;
 mod broadcast_registry;
 pub use broadcast_registry::BroadcastRegistry;
 mod api_docs;
+mod archive;
 mod d1;
 mod error;
 mod retention;
@@ -96,6 +97,16 @@ async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
 /// a cron but no `RETAIN_BOX_PREFIXES` no-op inside the sweep. Retained rows
 /// older than `RETAIN_TTL_DAYS` (default 14) are tombstoned then deleted so
 /// abandoned games can not accumulate forever.
+/// Queue entry: the archive consumer of `relay-archive` (0.8.0, R1). Nothing
+/// enqueues in this release; the handler upserts D1 idempotently by message id
+/// and version (`archive::consume`).
+#[event(queue)]
+async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
+    init_panic_hook();
+    archive::consume(&batch, &env).await;
+    Ok(())
+}
+
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     init_panic_hook();
