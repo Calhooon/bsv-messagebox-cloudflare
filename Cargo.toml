@@ -28,7 +28,8 @@ name = "rust_message_box"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-worker = { version = "0.8", features = ["d1"] }
+# `queue`: the archive consumer's `#[event(queue)]` and `MessageBatch` (0.8.0).
+worker = { version = "0.8", features = ["d1", "queue"] }
 serde-wasm-bindgen = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

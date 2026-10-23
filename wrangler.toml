@@ -124,6 +124,25 @@ id = "<your-kv-namespace-id>"
 binding = "BEEF_BLOBS"
 bucket_name = "bsv-messagebox-beefs"
 
+# The archive of the relay mailbox (0.8.0): the queue relay-archive, created by
+# the operator before the deploy (`wrangler queues create relay-archive`). The
+# Worker is its consumer: each message names one change of one row (the insert
+# or the acknowledgment, by message id and version), and the consumer upserts
+# D1 so a repeated or older message changes nothing (migration 0011). In 0.8.0
+# nothing enqueues; the producer binding is here so the release that feeds the
+# queue needs no binding change. A batch of up to 100 waits at most 2 s; a batch
+# D1 could not write is retried 3 times, 10 s apart; no dead-letter queue.
+[[queues.producers]]
+binding = "ARCHIVE_QUEUE"
+queue = "relay-archive"
+
+[[queues.consumers]]
+queue = "relay-archive"
+max_batch_size = 100
+max_batch_timeout = 2
+max_retries = 3
+retry_delay = 10
+
 # The drain of the deferred delivery fees runs on the scheduled event. A fee
 # is deferred when its BEEF is more than one request hands wallet-infra, or
 # when wallet-infra could not answer; the message is delivered either way.
