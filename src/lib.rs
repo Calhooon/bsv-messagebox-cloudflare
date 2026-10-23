@@ -2765,3 +2765,89 @@ mod fanout_668_tests {
         );
     }
 }
+
+/// Message box #22 (a) and (c): the listing and the acknowledge answer a
+/// transient storage error as the send does, and a listing whose box read
+/// stalls on every attempt is a bounded 503. The host has no virtual clock
+/// (`with_d1_op_timeout` awaits the op directly off wasm), so the bound is
+/// pinned as the policy's arithmetic and the attempts' count, the mapping as
+/// the answer to the error the stalled loop propagates.
+#[cfg(test)]
+mod list_store_error_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// The error `with_d1_op_timeout` answers when the bound wins.
+    fn stalled() -> Error {
+        Error::RustError("D1_ERROR: write op exceeded 2000ms bound (transient; retrying)".into())
+    }
+
+    fn real_fault() -> Error {
+        Error::RustError("SQLITE_CONSTRAINT: no such column".into())
+    }
+
+    #[test]
+    fn the_listing_answers_a_transient_error_503_err_d1_unavailable() {
+        let (body, status) = list_store_error(stalled());
+        assert_eq!(status, 503);
+        assert_eq!(body["code"], "ERR_D1_UNAVAILABLE");
+        assert_eq!(body["status"], "error");
+        assert_eq!(
+            routes::send_message::retry_after(&body, status),
+            Some("1"),
+            "with Retry-After"
+        );
+    }
+
+    #[test]
+    fn the_acknowledge_answers_a_transient_error_503_err_d1_unavailable() {
+        let (body, status) = acknowledge_store_error(stalled());
+        assert_eq!((status, &body["code"]), (503, &json!("ERR_D1_UNAVAILABLE")));
+        assert_eq!(routes::send_message::retry_after(&body, status), Some("1"));
+    }
+
+    #[test]
+    fn a_real_fault_keeps_its_500() {
+        let (body, status) = list_store_error(real_fault());
+        assert_eq!((status, &body["code"]), (500, &json!("ERR_INTERNAL_ERROR")));
+        assert_eq!(routes::send_message::retry_after(&body, status), None);
+        let (body, status) = acknowledge_store_error(real_fault());
+        assert_eq!((status, &body["code"]), (500, &json!("ERR_INTERNAL_ERROR")));
+    }
+
+    #[test]
+    fn retry_after_rides_only_on_a_503_err_d1_unavailable() {
+        use routes::send_message::retry_after;
+        assert_eq!(
+            retry_after(&json!({"code": "ERR_D1_UNAVAILABLE"}), 503),
+            Some("1")
+        );
+        assert_eq!(
+            retry_after(&json!({"code": "ERR_D1_UNAVAILABLE"}), 500),
+            None
+        );
+        assert_eq!(
+            retry_after(&json!({"code": "ERR_PAYMENT_PENDING"}), 503),
+            None
+        );
+        assert_eq!(retry_after(&json!({"status": "success"}), 200), None);
+    }
+
+    /// (c): every attempt of the box read stalls. The loop stops after the
+    /// bounded attempts, spends at most 6,150 ms doing it (under the 6,200 ms
+    /// the issue names), and the listing answers 503, never 500.
+    #[tokio::test]
+    async fn a_listing_whose_box_read_stalls_on_every_attempt_answers_503_within_6200_ms() {
+        let calls = Cell::new(0u32);
+        let out: Result<Option<i64>> = storage::with_d1_bounded_read(|| {
+            calls.set(calls.get() + 1);
+            async { Err::<Option<i64>, _>(stalled()) }
+        })
+        .await;
+        assert_eq!(calls.get(), 3, "D1_READ_ATTEMPTS, no unbounded loop");
+        assert_eq!(storage::stalled_read_worst_ms(), 6_150);
+        assert!(storage::stalled_read_worst_ms() < 6_200);
+        let (body, status) = list_store_error(out.expect_err("the stall propagates"));
+        assert_eq!((status, &body["code"]), (503, &json!("ERR_D1_UNAVAILABLE")));
+    }
+}

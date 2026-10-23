@@ -349,3 +349,5 @@ pub async fn consume(batch: &worker::MessageBatch<serde_json::Value>, env: &work
     }
 }
 
+#[cfg(test)]
+mod tests;
