@@ -6,7 +6,9 @@ tag publishes the release. Before 0.5.5 releases were cut from a private canonic
 repository with a release script that scrubbed every Cloudflare resource identifier;
 the `scrub` check (`tools/scrub.sh`) now holds that rule on every pull request.
 
-## [Unreleased]
+## [0.8.0] - 2026-10-23
+
+0.8.0: the archive ready (R1 of the relay mailbox: migration 0011, the queue `relay-archive` and its consumer, nothing enqueued yet) and message box #22 (the typed 503 with `Retry-After` on the listing and the acknowledge, the listing's read bounded). The operator creates the queue and runs the migration before the deploy.
 
 The archive ready (R1 of the relay mailbox, bsv-stack-lean `docs/p0/mbx-hot-path-m28a.md` section 6) and message box #22. No route changes its success answers; the listing's and the acknowledge's storage failures gain the send's typed 503.
 
