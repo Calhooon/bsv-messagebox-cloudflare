@@ -633,7 +633,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // The answer: signed under BRC-104 when the middleware authenticated;
     // sealed under the session lane's K when the lane did; plain CORS
     // otherwise (never reached with `allow_unauthenticated: false`).
-    match (session, lane_seal) {
+    let answer = match (session, lane_seal) {
         (Some(ref s), _) => {
             sign_json_response(&body, status, &[], s).map_err(|e| Error::from(e.to_string()))
         }
@@ -642,7 +642,14 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
             let resp = Response::from_json(&body)?.with_status(status);
             Ok(add_cors_headers(resp))
         }
+    }?;
+    // A 503 `ERR_D1_UNAVAILABLE` says when to come back (message box #22 (a)):
+    // `Retry-After`, set on every form of the answer after it is built,
+    // outside the BRC-104 signature and the lane's MAC (neither covers it).
+    if let Some(v) = routes::send_message::retry_after(&body, status) {
+        answer.headers().set("Retry-After", v)?;
     }
+    Ok(answer)
 }
 
 // -- bsv-low W-B (D10): the HTTP session lane --------------------------------
@@ -937,15 +944,7 @@ async fn handle_list_messages(
         .await
     {
         Ok(m) => m,
-        Err(_e) => {
-            return (
-                json!({
-                    "status": "error", "code": "ERR_INTERNAL_ERROR",
-                    "description": "An internal error has occurred while listing messages."
-                }),
-                500,
-            )
-        }
+        Err(e) => return list_store_error(e),
     };
 
     // Format response: camelCase, body as raw string, timestamps as ISO 8601 for Node parity.
@@ -976,6 +975,34 @@ async fn handle_list_messages(
     (json!({ "status": "success", "messages": formatted }), 200)
 }
 
+/// `/listMessages`'s answer to a storage error (message box #22 (a)): a
+/// transient D1 failure is the send path's 503 `ERR_D1_UNAVAILABLE`; any other
+/// is the 500 it always was.
+fn list_store_error(e: Error) -> (serde_json::Value, u16) {
+    routes::send_message::transient_store_answer(e).unwrap_or_else(|| {
+        (
+            json!({
+                "status": "error", "code": "ERR_INTERNAL_ERROR",
+                "description": "An internal error has occurred while listing messages."
+            }),
+            500,
+        )
+    })
+}
+
+/// `/acknowledgeMessage`'s answer to a storage error, as `list_store_error`.
+fn acknowledge_store_error(e: Error) -> (serde_json::Value, u16) {
+    routes::send_message::transient_store_answer(e).unwrap_or_else(|| {
+        (
+            json!({
+                "status": "error", "code": "ERR_INTERNAL_ERROR",
+                "description": "An internal error has occurred while acknowledging the message"
+            }),
+            500,
+        )
+    })
+}
+
 async fn handle_acknowledge_message(
     raw_body: &[u8],
     identity_key: &str,
@@ -994,15 +1021,7 @@ async fn handle_acknowledge_message(
         .await
     {
         Ok(n) => n,
-        Err(_e) => {
-            return (
-                json!({
-                    "status": "error", "code": "ERR_INTERNAL_ERROR",
-                    "description": "An internal error has occurred while acknowledging the message"
-                }),
-                500,
-            )
-        }
+        Err(e) => return acknowledge_store_error(e),
     };
 
     if deleted == 0 {
