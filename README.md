@@ -113,6 +113,20 @@ the header service is bound and answering. A charging tenant needs a working
 `HEADER_SERVICE` binding or `HEADER_SERVICE_URL`, and a wallet storage service
 for fee internalization; a missing header service fails closed.
 
+The archive queue (0.8.0). The Worker binds the queue `relay-archive` as its
+producer (`ARCHIVE_QUEUE`) and is its consumer; migration 0011 adds the
+version the consumer writes. Before deploying 0.8.0 the operator applies the
+migration and creates the queue, once each:
+
+```sh
+wrangler d1 migrations apply <your-d1-database> -c <your-config> --remote
+wrangler queues create relay-archive
+```
+
+Nothing enqueues in 0.8.0: the consumer is ready for the release that moves
+the live mailbox into the recipient's hub, and every route still reads D1. A
+rollback to 0.7.1 is whole: 0.7.1 binds no queue and never reads the column.
+
 The code also reads names the template does not set: the `BROADCAST_TOKEN`
 secret (the bearer of `/push`, `/broadcast` and `/session/attest`), the
 `BROADCAST_REGISTRY` Durable Object (the `/broadcast` subscriber registry),
