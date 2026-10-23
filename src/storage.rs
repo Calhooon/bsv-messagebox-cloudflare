@@ -588,10 +588,7 @@ impl<'a> Storage<'a> {
         // becomes a transient timeout the retry loop re-attempts, instead of
         // hanging `/listMessages` / `get_or_create_message_box` for the client's
         // whole budget (the #249 hang class, read-side).
-        let row: Option<MessageBoxRow> = with_d1_read_retry(|| {
-            with_d1_op_timeout(q.fetch_optional(self.db), D1_READ_OP_TIMEOUT_MS)
-        })
-        .await?;
+        let row: Option<MessageBoxRow> = with_d1_bounded_read(|| q.fetch_optional(self.db)).await?;
         Ok(row.and_then(|r| r.message_box_id.map(|v| v as i64)))
     }
 
@@ -731,12 +728,16 @@ impl<'a> Storage<'a> {
         // Same bounded transient-retry as `find_message_box`: this is the second
         // (and only other) D1 touch on the `/listMessages` cold path and is an
         // equally-idempotent read, so a cold-start blip here self-heals in-request.
+        // And the same per-op bound (message box #22 (b)): a read that stalls
+        // without erroring becomes the transient timeout the loop re-attempts,
+        // so a listing whose reads all stall costs `stalled_read_worst_ms` per
+        // read and answers 503, never the client's whole budget.
         let q = Query::new(LIST_MESSAGES_SQL)
             .bind(identity_key)
             .bind(box_id)
             .bind(LIST_MESSAGES_LIMIT)
             .bind(crate::handoff::LIST_INLINE_BYTES);
-        with_d1_read_retry(|| q.fetch_all(self.db)).await
+        with_d1_bounded_read(|| q.fetch_all(self.db)).await
     }
 
     /// Acknowledge messages. For a RETAINED box (bsv-low #252 stage E — see
@@ -1419,6 +1420,41 @@ where
                 }
                 None => return Err(e),
             },
+        }
+    }
+}
+
+/// Run an idempotent D1 read `op` under the per-op bound (`D1_READ_OP_TIMEOUT_MS`)
+/// inside the bounded transient-retry (`with_d1_read_retry`): the shape of
+/// `find_message_box`'s read (#251), shared by the listing's read (message box
+/// #22 (b)) and the archive's held read.
+pub(crate) async fn with_d1_bounded_read<T, F, Fut>(mut op: F) -> worker::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = worker::Result<T>>,
+{
+    with_d1_read_retry(|| with_d1_op_timeout(op(), D1_READ_OP_TIMEOUT_MS)).await
+}
+
+/// The longest a bounded read (`with_d1_bounded_read`) runs when every attempt
+/// stalls: each attempt's bound plus each backoff the policy grants
+/// (`d1_retry_backoff_bounded`), 2,000 + 50 + 2,000 + 100 + 2,000 = 6,150 ms.
+/// Read off the policy itself, so a change of either constant moves it.
+#[cfg(test)]
+pub(crate) fn stalled_read_worst_ms() -> u64 {
+    let stall = worker::Error::RustError(format!(
+        "D1_ERROR: read op exceeded {D1_READ_OP_TIMEOUT_MS}ms bound (transient; retrying)"
+    ));
+    let mut total = 0u64;
+    let mut attempt = 0u32;
+    loop {
+        total += D1_READ_OP_TIMEOUT_MS;
+        match d1_retry_backoff(attempt, &stall) {
+            Some(backoff) => {
+                total += backoff.as_millis() as u64;
+                attempt += 1;
+            }
+            None => return total,
         }
     }
 }

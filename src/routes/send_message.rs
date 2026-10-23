@@ -471,6 +471,30 @@ fn classify_store_error(e: worker::Error) -> SendOutcome {
     }
 }
 
+/// The listing's and the acknowledge's answer to a storage error (message box
+/// #22 (a)): the send path's own classification and wire words, so a transient
+/// D1 failure is 503 `ERR_D1_UNAVAILABLE` there too (`Retry-After` is added
+/// where the answer is built, `retry_after`). `None` is a real fault: the
+/// route keeps its own 500.
+pub(crate) fn transient_store_answer(e: worker::Error) -> Option<(Value, u16)> {
+    match classify_store_error(e) {
+        outcome @ SendOutcome::TransientError { .. } => Some(outcome_to_http(outcome)),
+        _ => None,
+    }
+}
+
+/// The seconds a client waits before it retries a 503 `ERR_D1_UNAVAILABLE`
+/// (the `Retry-After` header): one second, against a bounded failure that
+/// already spent up to `storage::stalled_read_worst_ms` (6,150 ms) in the relay.
+pub(crate) const D1_UNAVAILABLE_RETRY_AFTER_SECS: &str = "1";
+
+/// The `Retry-After` value an answer carries: every 503 `ERR_D1_UNAVAILABLE`
+/// (the send's, the listing's and the acknowledge's), and nothing else.
+pub(crate) fn retry_after(body: &Value, status: u16) -> Option<&'static str> {
+    (status == 503 && body["code"] == "ERR_D1_UNAVAILABLE")
+        .then_some(D1_UNAVAILABLE_RETRY_AFTER_SECS)
+}
+
 /// Run the shared write path. Idempotent w.r.t. how the request was
 /// validated: the HTTP path validates raw bytes via
 /// `validation::validate_send_message`, then hands the `ValidatedSendMessage`
