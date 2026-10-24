@@ -87,6 +87,7 @@ fn insert(id: &str, version: u64, body: &str) -> ArchiveMessage {
         sender: "sndr".into(),
         body: Some(body.into()),
         created_at: Some("2026-10-23 15:00:00".into()),
+        body_in_hub: false,
     }
 }
 
@@ -580,8 +581,11 @@ fn the_template_binds_the_queue_and_consumes_it_with_the_designs_numbers() {
     assert!(
         !src.contains("ARCHIVE_QUEUE\")")
             && !include_str!("../routes/send_message.rs").contains("ARCHIVE_QUEUE"),
-        "nothing enqueues in R1"
+        "neither the Worker's routes nor the D1 send path enqueue"
     );
+    // 0.8.1: the mailbox hub alone enqueues, in one place.
+    let hub = include_str!("../message_hub_sql.rs");
+    assert_eq!(hub.matches("env.queue(\"ARCHIVE_QUEUE\")").count(), 1);
 }
 
 #[test]
