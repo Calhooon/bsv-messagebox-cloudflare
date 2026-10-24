@@ -6,7 +6,7 @@ tag publishes the release. Before 0.5.5 releases were cut from a private canonic
 repository with a release script that scrubbed every Cloudflare resource identifier;
 the `scrub` check (`tools/scrub.sh`) now holds that rule on every pull request.
 
-## [Unreleased]
+## [0.8.1] - 2026-10-24
 
 The mailbox's class born behind `HUB_STORE = "kv"` (R2 of the relay mailbox, bsv-stack-lean `docs/p0/mbx-hot-path-m28a.md` sections 4 to 9), the box switch, and the residuals of 0.8.0. Under the default `kv` no request reaches the new class and every answer is 0.8.0's.
 
