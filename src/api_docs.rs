@@ -729,18 +729,40 @@ fn send_message_responses() -> Value {
             }}
         },
         "403": {
-            "description": "One or more recipients have blocked the sender.",
+            "description": "One or more recipients have blocked the sender (ERR_DELIVERY_BLOCKED, `blockedRecipients`); or (0.8.1) the box is switched off by the operator's `BOXES_OFF` (ERR_BOX_OFF, the box named), refused before the send budget and before any store: nothing is stored and no budget is spent. Listings and acknowledgments of a switched-off box are served.",
             "content": { "application/json": {
                 "schema": {
                     "allOf": [
                         { "$ref": "#/components/schemas/ErrorResponse" },
                         { "type": "object", "properties": { "blockedRecipients": { "type": "array", "items": { "type": "string" } } } }
                     ]
+                },
+                "examples": {
+                    "blocked": { "value": { "status": "error", "code": "ERR_DELIVERY_BLOCKED", "description": "Blocked recipients: 02ab...", "blockedRecipients": ["02ab..."] } },
+                    "boxOff": { "value": { "status": "error", "code": "ERR_BOX_OFF", "description": "box webrtc_signal is off" } }
+                }
+            }}
+        },
+        "429": {
+            "description": "The sender's send budget for the window is spent (ERR_SEND_BUDGET, with `windowStart`, `windowSecs`, `retryAt`); or (0.8.1, under `HUB_STORE = \"sql\"`) a recipient's mailbox holds 10,000 unacknowledged rows or 1 GiB of their text (ERR_INBOX_QUOTA_EXCEEDED, the reference's quota refusal, with `resource` (`messages` or `bytes`), `limit`, `held`, `recipient` and `freedBy`). Nothing is stored for that recipient; rows stored for the recipients before it stay, so a resend with the same message ids meets the duplicate answer for those.",
+            "content": { "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+                    "inboxFull": { "value": {
+                        "status": "error",
+                        "code": "ERR_INBOX_QUOTA_EXCEEDED",
+                        "description": "The recipient inbox storage quota has been reached. Retry after messages are acknowledged or expire.",
+                        "resource": "messages",
+                        "limit": 10000,
+                        "held": 10000,
+                        "recipient": "02ab...",
+                        "freedBy": "acknowledgeMessage"
+                    } }
                 }
             }}
         },
         "500": {
-            "description": "Internal server error.",
+            "description": "Internal server error; or (0.8.1) the operator's `HUB_STORE` is not `kv`, `sql` or `kv-drain` (ERR_HUB_STORE_INVALID, on every request until it is).",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
         }
     })
@@ -791,7 +813,7 @@ fn list_messages_responses() -> Value {
 /// through the bounded retry (0.8.0, message box #22).
 fn d1_unavailable(what: &str) -> Value {
     json!({
-        "description": format!("The store did not answer the {what} within its bounded retry (at most 6,150 ms a read); the same request may be sent again after the `Retry-After` seconds. ERR_D1_UNAVAILABLE."),
+        "description": format!("The store (D1; under `HUB_STORE = \"sql\"` the caller's hub, and D1 for the rows the old path stored) did not answer the {what} within its bounded retry (at most 6,150 ms a D1 read); the same request may be sent again after the `Retry-After` seconds. ERR_D1_UNAVAILABLE."),
         "headers": { "Retry-After": { "schema": { "type": "integer" }, "description": "Seconds to wait before retrying." } },
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
     })
@@ -1202,6 +1224,33 @@ mod tests {
             assert!(paths.contains_key(*path), "Missing path: {}", path);
         }
         assert_eq!(paths.len(), expected.len());
+    }
+
+    #[test]
+    fn spec_send_message_names_the_box_switch_and_the_full_mailbox() {
+        let spec = openapi_spec();
+        let r = &spec["paths"]["/sendMessage"]["post"]["responses"];
+        assert_eq!(
+            r["403"]["content"]["application/json"]["examples"]["boxOff"]["value"]["code"],
+            "ERR_BOX_OFF"
+        );
+        let full = &r["429"]["content"]["application/json"]["examples"]["inboxFull"]["value"];
+        let (body, _) = crate::mailbox::full_answer(
+            &crate::mailbox::Full {
+                resource: "messages".into(),
+                limit: 10_000,
+                held: 10_000,
+            },
+            "02ab...",
+        );
+        assert_eq!(
+            *full, body,
+            "the documented 429 is the one the mailbox answers"
+        );
+        assert!(r["429"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("ERR_SEND_BUDGET"));
     }
 
     #[test]

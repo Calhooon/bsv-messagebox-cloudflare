@@ -146,6 +146,32 @@ wait before either answer arrives is two bounds (and a listing whose box read
 answers slowly before its row read stalls is two reads in series, up to
 12,300 ms).
 
+The mailbox's class (0.8.1, R2 of the relay mailbox). The deploy carries the
+Durable Object migration `v5`, `new_sqlite_classes = ["MessageHubSql"]`, and
+the binding `MESSAGE_HUB_SQL`; both are in the template and ship with the
+deploy, no command before it. A class lifecycle change refuses `wrangler
+rollback` across it, so the rollback of 0.8.1 is forward only: a deploy that
+keeps `v5` and the class exported. Two operator vars, neither set in the
+template:
+
+- `HUB_STORE` names the hub store: `kv` (the default when unset) keeps every
+  path of 0.8.0 (hub ids to `MESSAGE_HUB`, sends, listings and acknowledgments
+  through D1) and no request reaches `MessageHubSql`; `sql` sends hub ids to
+  `MESSAGE_HUB_SQL`, stores each unpaid send in the recipient hub's mailbox
+  (bounded at 10,000 unacknowledged rows and 1 GiB per identity, past which a
+  send answers 429 `ERR_INBOX_QUOTA_EXCEEDED`), and archives each change to D1
+  through `relay-archive`; `kv-drain`, the rollback of `sql`, routes as `kv`
+  and also lists and acknowledges the rows each identity's `MessageHubSql`
+  still holds. Any other value refuses every request with 500
+  `ERR_HUB_STORE_INVALID` naming the var. A change of the var is a new
+  version, not a class change, so `wrangler rollback` between two versions
+  that both carry `v5` stays allowed. A deploy restarts every hub and
+  disconnects every socket.
+- `BOXES_OFF` is a comma-separated list of box names whose sends are refused
+  403 `ERR_BOX_OFF` ("box <name> is off") before the send budget and before
+  any store, on HTTP, on `/push` and on the socket; listings and
+  acknowledgments of those boxes are served. Unset or empty, no box is off.
+
 The code also reads names the template does not set: the `BROADCAST_TOKEN`
 secret (the bearer of `/push`, `/broadcast` and `/session/attest`), the
 `BROADCAST_REGISTRY` Durable Object (the `/broadcast` subscriber registry),
