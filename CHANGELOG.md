@@ -6,6 +6,14 @@ tag publishes the release. Before 0.5.5 releases were cut from a private canonic
 repository with a release script that scrubbed every Cloudflare resource identifier;
 the `scrub` check (`tools/scrub.sh`) now holds that rule on every pull request.
 
+## [Unreleased]
+
+The residuals of 0.8.0 (bsv-stack-lean lane mbx-hot-path-r2, item 5).
+
+- **`Retry-After` in the CORS expose list.** No code change: `bsv-middleware-cloudflare` 0.7.2 (pinned exactly) already lists `Retry-After` in `Access-Control-Expose-Headers` from `add_cors_headers` and `add_lane_cors_headers`, and every answer the relay builds (signed, sealed on the session lane, or plain) passes through one of them, so a browser reads the 503's `Retry-After`.
+- **The archive queue is per environment** (message box #25): a second environment needs its own queue (`wrangler queues create relay-archive-<env>`) and its own producer and consumer blocks under `[env.<name>]`, because a queue has one consumer Worker and the consumer writes through its own D1 binding. The README's deploy notes say so; the template stays single-environment.
+- **The double-stall bound** (message box #22): a listing and an acknowledgment are each bounded at 6,150 ms of stalled D1 reads, so a client that does both may wait two bounds; the README names it.
+
 ## [0.8.0] - 2026-10-23
 
 0.8.0: the archive ready (R1 of the relay mailbox: migration 0011, the queue `relay-archive` and its consumer, nothing enqueued yet) and message box #22 (the typed 503 with `Retry-After` on the listing and the acknowledge, the listing's read bounded). The operator creates the queue and runs the migration before the deploy.
