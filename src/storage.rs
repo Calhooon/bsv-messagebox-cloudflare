@@ -1,6 +1,6 @@
 // D1 storage operations for message-box.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use worker::D1Database;
 
 use crate::d1::Query;
@@ -45,6 +45,17 @@ pub const LIST_MESSAGES_SQL: &str =
          AND acknowledged_at IS NULL \
          LIMIT ?)) \
      WHERE upto <= ?";
+
+/// The live-ids read of the mailbox's legacy rule (`live_message_ids`): the
+/// recipient's unacknowledged rows among `n` ids, by `UNIQUE(message_id)`.
+/// Bind order: recipient, the ids.
+pub fn live_message_ids_sql(n: usize) -> String {
+    format!(
+        "SELECT message_id FROM messages WHERE recipient = ? AND acknowledged_at IS NULL \
+         AND message_id IN ({})",
+        vec!["?"; n].join(", ")
+    )
+}
 
 /// The statements of the deferred-fee ledger (`fee_internalize`, migration
 /// 0003; `D1Ledger`). Each is idempotent: a deferral is `INSERT OR IGNORE` on
@@ -401,7 +412,7 @@ pub struct MessageBoxRow {
     pub message_box_id: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageDbRow {
     #[serde(rename = "messageId")]
     pub message_id: Option<String>,
@@ -678,6 +689,35 @@ impl<'a> Storage<'a> {
         let q = Query::new("SELECT sender, recipient, body FROM messages WHERE message_id = ?")
             .bind(message_id);
         with_d1_read_retry(|| q.fetch_optional(self.db)).await
+    }
+
+    /// Of `ids`, those the recipient holds unacknowledged (0.8.1, the
+    /// mailbox's legacy rule: an id the mailbox does not hold is acknowledged
+    /// in D1 only while D1 holds it live, so an archived acknowledged mark is
+    /// never taken for a row to acknowledge). Bounded as the listing's read.
+    pub async fn live_message_ids(
+        &self,
+        recipient: &str,
+        ids: &[String],
+    ) -> worker::Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Row {
+            message_id: Option<String>,
+        }
+        let mut live = Vec::new();
+        for chunk in ids.chunks(90) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let sql = live_message_ids_sql(chunk.len());
+            let mut q = Query::new(&sql).bind(recipient);
+            for id in chunk {
+                q = q.bind(id.as_str());
+            }
+            let rows: Vec<Row> = with_d1_bounded_read(|| q.fetch_all(self.db)).await?;
+            live.extend(rows.into_iter().filter_map(|r| r.message_id));
+        }
+        Ok(live)
     }
 
     /// The body of one of a recipient's rows, by its message id.
