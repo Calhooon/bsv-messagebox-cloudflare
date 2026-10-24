@@ -127,6 +127,25 @@ Nothing enqueues in 0.8.0: the consumer is ready for the release that moves
 the live mailbox into the recipient's hub, and every route still reads D1. A
 rollback to 0.7.1 is whole: 0.7.1 binds no queue and never reads the column.
 
+A second environment (a beta Worker beside a production one) needs its own
+queue and its own consumer, because a queue has one consumer Worker and the
+consumer writes its batches through its own D1 binding: a shared queue would
+carry one environment's archive rows into the other's database. Wrangler does
+not inherit queue bindings into `[env.*]`, so the operator creates
+`wrangler queues create relay-archive-<env>` and declares, under
+`[env.<name>]`, a `[[env.<name>.queues.producers]]` block binding
+`ARCHIVE_QUEUE` to it and a `[[env.<name>.queues.consumers]]` block with the
+template's settings (`max_batch_size = 100`, `max_batch_timeout = 2`,
+`max_retries = 3`, `retry_delay = 10`). The template stays single-environment.
+
+The listing's and the acknowledge's worst wait (message box #22). Each of the
+two is bounded on its own: a D1 read that stalls on every attempt costs
+6,150 ms and answers 503 `ERR_D1_UNAVAILABLE` with `Retry-After`. A client
+that lists and then acknowledges may meet both bounds in a row, so its worst
+wait before either answer arrives is two bounds (and a listing whose box read
+answers slowly before its row read stalls is two reads in series, up to
+12,300 ms).
+
 The code also reads names the template does not set: the `BROADCAST_TOKEN`
 secret (the bearer of `/push`, `/broadcast` and `/session/attest`), the
 `BROADCAST_REGISTRY` Durable Object (the `/broadcast` subscriber registry),
