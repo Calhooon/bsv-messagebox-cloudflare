@@ -165,6 +165,16 @@ retry_delay = 10
 name = "MESSAGE_HUB"
 class_name = "MessageHub"
 
+# MessageHubSql (0.8.1, R2 of the relay mailbox): the per-identity hub on the
+# SQLite backend, the recipient's mailbox beside everything MessageHub does.
+# Bound and exported from 0.8.1 on; a request reaches it only when the
+# operator's config sets the var HUB_STORE to "sql" (hub ids go here) or
+# "kv-drain" (listings and acknowledgments also read what it still holds).
+# Unset, HUB_STORE is "kv": no request reaches this class.
+[[durable_objects.bindings]]
+name = "MESSAGE_HUB_SQL"
+class_name = "MessageHubSql"
+
 # EngineIoSession — per-sid Engine.IO + Socket.IO transport state (M10
 # Phase A — issue #61). Routing via idFromName(sid). Holds polling
 # buffer + transport state (polling vs websocket) + pending packets.
@@ -193,4 +203,12 @@ new_classes = ["MessageHub"]
 [[migrations]]
 tag = "v4"
 new_classes = ["EngineIoSession"]
+
+# v5 (0.8.1): MessageHubSql, a SQLite-backed class (a KV-backed class cannot
+# gain SQLite storage in place). A class lifecycle change: `wrangler rollback`
+# across it is refused, so its rollback is forward only (a deploy that keeps
+# v5 and the class exported).
+[[migrations]]
+tag = "v5"
+new_sqlite_classes = ["MessageHubSql"]
 
