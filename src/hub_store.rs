@@ -132,6 +132,39 @@ pub fn hub_namespace(env: &worker::Env) -> worker::Result<worker::ObjectNamespac
     env.durable_object(store.hub_binding())
 }
 
+// -- The box switch (0.8.1; LOW's design 2026-10-23 section 2.4, the owner's word) --
+
+/// The var naming the boxes whose sends are refused: a comma-separated list
+/// of box names. A missing or empty var switches nothing off.
+pub const BOXES_OFF_VAR: &str = "BOXES_OFF";
+
+/// The box names a `BOXES_OFF` value lists (trimmed, empty entries dropped).
+pub fn boxes_off(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a send into `message_box` is switched off by a `BOXES_OFF` value.
+pub fn box_is_off(raw: Option<&str>, message_box: &str) -> bool {
+    boxes_off(raw).iter().any(|b| b == message_box)
+}
+
+/// The switch's refusal: 403 `ERR_BOX_OFF`, the box named.
+pub fn box_off_answer(message_box: &str) -> (Value, u16) {
+    (
+        json!({
+            "status": "error",
+            "code": "ERR_BOX_OFF",
+            "description": format!("box {message_box} is off"),
+        }),
+        403,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +351,35 @@ mod tests {
         assert!(!HubStore::Kv.reaches_sql_class());
         assert!(HubStore::Sql.reaches_sql_class());
         assert!(HubStore::KvDrain.reaches_sql_class());
+    }
+
+    #[test]
+    fn the_box_switch_lists_names_and_a_missing_var_switches_nothing_off() {
+        assert!(boxes_off(None).is_empty());
+        assert!(boxes_off(Some("")).is_empty());
+        assert!(boxes_off(Some(" , ,")).is_empty());
+        assert_eq!(
+            boxes_off(Some("webrtc_signal, lane-knock ,,x")),
+            vec!["webrtc_signal", "lane-knock", "x"]
+        );
+        assert!(!box_is_off(None, "webrtc_signal"));
+        assert!(box_is_off(Some("a,webrtc_signal"), "webrtc_signal"));
+        // A name, never a prefix or a pattern.
+        assert!(!box_is_off(Some("webrtc"), "webrtc_signal"));
+        assert!(!box_is_off(Some("webrtc_signal"), "webrtc"));
+    }
+
+    #[test]
+    fn the_switch_answers_403_err_box_off_naming_the_box() {
+        let (body, status) = box_off_answer("webrtc_signal");
+        assert_eq!(status, 403);
+        assert_eq!(
+            body,
+            json!({
+                "status": "error",
+                "code": "ERR_BOX_OFF",
+                "description": "box webrtc_signal is off",
+            })
+        );
     }
 }

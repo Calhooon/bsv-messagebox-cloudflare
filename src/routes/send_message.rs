@@ -367,6 +367,11 @@ pub(crate) trait SendStore {
     );
     fn now_ms(&self) -> u64;
     fn log(&self, line: String);
+    /// The box switch (0.8.1, `BOXES_OFF`): a send into a box switched off is
+    /// refused before anything else of the write path runs.
+    fn box_off(&self, _message_box: &str) -> bool {
+        false
+    }
 }
 
 /// What `SendStore::insert_message` did with one row.
@@ -418,6 +423,14 @@ pub(crate) async fn charge_on_d1(
     .await
 }
 
+/// Whether `BOXES_OFF` in the Worker's environment switches `message_box` off.
+pub(crate) fn box_off_in_env(env: &Env, message_box: &str) -> bool {
+    let raw = env
+        .var(crate::hub_store::BOXES_OFF_VAR)
+        .ok()
+        .map(|v| v.to_string());
+    crate::hub_store::box_is_off(raw.as_deref(), message_box)
+}
 
 impl SendStore for WorkerStore<'_, '_> {
     async fn read_send_context(
@@ -489,6 +502,9 @@ impl SendStore for WorkerStore<'_, '_> {
         console_log!("{}", line);
     }
 
+    fn box_off(&self, message_box: &str) -> bool {
+        box_off_in_env(self.env, message_box)
+    }
 }
 
 /// Map a `worker::Error` bubbled out of the D1 read/write helpers onto the right
@@ -594,6 +610,14 @@ async fn store_rows<S: SendStore>(
     store: &S,
     after: &mut AfterAnswer,
 ) -> SendOutcome {
+    // -- 0. The box switch (0.8.1; LOW's design 2026-10-23 section 2.4): a
+    //       send into a box named in BOXES_OFF is refused here, before the
+    //       context read, the budget and any store, on every transport. --
+    if store.box_off(&validated.message_box) {
+        let (body, status) = crate::hub_store::box_off_answer(&validated.message_box);
+        return SendOutcome::ValidationError { body, status };
+    }
+
     // -- 1. Resolve per-recipient context (recipient fee + server delivery fee + the
     //       recipient's message-box id) in ONE D1 `batch()` round-trip each — #9: this is
     //       the per-round-message relay hot path (keygen/aux), formerly 3-4 SEQUENTIAL D1
@@ -1428,6 +1452,8 @@ mod decouple_r1_tests {
         fault: Option<&'static str>,
         /// 0.8.1: the row whose recipient's mailbox is full.
         full: Option<&'static str>,
+        /// 0.8.1: the box `BOXES_OFF` names.
+        off: Option<&'static str>,
     }
 
     impl StubStore {
@@ -1437,6 +1463,7 @@ mod decouple_r1_tests {
                 dup: None,
                 fault: None,
                 full: None,
+                off: None,
             }
         }
     }
@@ -1529,6 +1556,10 @@ mod decouple_r1_tests {
         }
 
         fn log(&self, _line: String) {}
+
+        fn box_off(&self, message_box: &str) -> bool {
+            self.off == Some(message_box)
+        }
     }
 
     fn send(message_box: &str, rows: &[(&str, &str)]) -> ValidatedSendMessage {
@@ -1708,6 +1739,60 @@ mod decouple_r1_tests {
         assert_eq!(hub_reply(204), Ok(()));
         assert_eq!(hub_reply(400), Err("hub answered 400".into()));
         assert_eq!(hub_reply(500), Err("hub answered 500".into()));
+    }
+
+    // 0.8.1, the box switch: a send into a box BOXES_OFF names is refused 403
+    // ERR_BOX_OFF before the context read, the budget and any store, so a
+    // refused send spends no budget; the same send with the box on charges.
+    #[test]
+    fn a_send_into_a_box_switched_off_is_refused_before_the_budget() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let mut store = StubStore::new(log.clone());
+        store.off = Some("webrtc_signal");
+        let sent = block_on(store_send(
+            send("webrtc_signal", &[("R1", "m1"), ("R2", "m2")]),
+            "S",
+            &store,
+        ));
+        assert!(sent.after.is_empty(), "nothing stored, nothing owed");
+        let (body, status) = outcome_to_http(sent.outcome);
+        assert_eq!(status, 403);
+        assert_eq!(
+            body,
+            json!({
+                "status": "error",
+                "code": "ERR_BOX_OFF",
+                "description": "box webrtc_signal is off",
+            })
+        );
+        assert!(
+            log.borrow().is_empty(),
+            "no context read, no charge, no insert: {:?}",
+            log.borrow()
+        );
+
+        // Another box is served, and charged, as before.
+        let sent = block_on(store_send(send("low_game_x", &[("R1", "m1")]), "S", &store));
+        assert!(matches!(sent.outcome, SendOutcome::Success { .. }));
+        assert_eq!(
+            *log.borrow(),
+            vec!["context", "charge", "insert m1 stored=true"]
+        );
+    }
+
+    // 0.8.1, the box switch's absence: no BOXES_OFF switches nothing off.
+    #[test]
+    fn without_the_var_no_box_is_off() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let store = StubStore::new(log.clone());
+        let sent = block_on(store_send(
+            send("webrtc_signal", &[("R1", "m1")]),
+            "S",
+            &store,
+        ));
+        assert!(matches!(sent.outcome, SendOutcome::Success { .. }));
+        assert!(log.borrow().contains(&"charge".to_string()));
+        assert!(!crate::hub_store::box_is_off(None, "webrtc_signal"));
     }
 
     // 0.8.1, the full mailbox: the send is refused at the recipient whose
