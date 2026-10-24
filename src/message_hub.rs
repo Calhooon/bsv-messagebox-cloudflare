@@ -485,9 +485,9 @@ struct SocketIoRegistration {
 /// the body.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-struct SessionVerifyBody {
-    id: String,
-    identity: String,
+pub(crate) struct SessionVerifyBody {
+    pub(crate) id: String,
+    pub(crate) identity: String,
     // bounded: the counter is refused above MAX_SAFE_COUNTER at the header (session_lane::parse_counter)
     h: u64,
     method: String,
@@ -936,6 +936,11 @@ impl DurableObject for MessageHub {
         // bsv-low W-B (D10): the HTTP lane's verify (Worker-to-DO only).
         if req.method() == Method::Post && path == "/internal/session-verify" {
             return self.handle_session_verify(&mut req).await;
+        }
+        // 0.8.1 (R2 of the relay mailbox): `MessageHubSql`'s forwarded session
+        // read takes a lane's mirror out of this hub once, on its miss.
+        if req.method() == Method::Post && path == "/internal/session-take" {
+            return self.handle_session_take(&mut req).await;
         }
         // #40 peer presence (same worker-internal trust model as the routes
         // above — the public internet never reaches a DO stub directly):
@@ -1893,6 +1898,73 @@ impl MessageHub {
             Ok(b) => b,
             Err(e) => return Response::error(format!("invalid session-verify body: {e}"), 400),
         };
+        self.verify_session(body).await
+    }
+
+    /// The hub's state, for the class that wraps this hub (`MessageHubSql`).
+    pub(crate) fn state(&self) -> &State {
+        &self.state
+    }
+
+    /// Whether this hub holds the mirror of the lane `id`.
+    pub(crate) async fn has_session_mirror(&self, id: &str) -> bool {
+        if id.is_empty() {
+            return false;
+        }
+        matches!(
+            self.state
+                .storage()
+                .get::<HubMirror>(&Self::session_mirror_key(id))
+                .await,
+            Ok(Some(_))
+        )
+    }
+
+    /// Keep a mirror another hub handed over (`MessageHubSql`'s forwarded
+    /// session read). `false` when the storage refused it.
+    pub(crate) async fn keep_session_mirror(&self, mirror: &HubMirror) -> bool {
+        self.state
+            .storage()
+            .put(&Self::session_mirror_key(&mirror.id), mirror)
+            .await
+            .is_ok()
+    }
+
+    /// `/internal/session-take` (0.8.1): hand the mirror of one lane to the
+    /// caller and delete it here, so the lane's counter lives in one hub only.
+    /// The identity named must be the mirror's. Answers `{mirror}` or
+    /// `{mirror: null}`.
+    async fn handle_session_take(&self, req: &mut Request) -> Result<Response> {
+        #[derive(Deserialize)]
+        struct Take {
+            id: String,
+            identity: String,
+        }
+        let take: Take = match req.json().await {
+            Ok(t) => t,
+            Err(e) => return Response::error(format!("invalid session-take body: {e}"), 400),
+        };
+        let key = Self::session_mirror_key(&take.id);
+        let mirror: Option<HubMirror> = if take.id.is_empty() {
+            None
+        } else {
+            self.state.storage().get(&key).await.ok().flatten()
+        };
+        match mirror {
+            Some(m) if m.identity == take.identity.to_ascii_lowercase() => {
+                let _ = self.state.storage().delete(&key).await;
+                console_log!(
+                    "TRACE_SESSION mirror handed over id={}…",
+                    &m.id[..12.min(m.id.len())]
+                );
+                Response::from_json(&json!({ "mirror": m }))
+            }
+            _ => Response::from_json(&json!({ "mirror": null })),
+        }
+    }
+
+    /// Verify one HTTP-lane request (the body of `/internal/session-verify`).
+    pub(crate) async fn verify_session(&self, body: SessionVerifyBody) -> Result<Response> {
         let now = Date::now().as_millis();
         let body = SessionVerifyBody {
             identity: body.identity.to_ascii_lowercase(),
@@ -2363,7 +2435,7 @@ impl MessageHub {
         let Some(peer_room) = peer_room(&peer, room) else {
             return;
         };
-        let Ok(namespace) = self.env.durable_object("MESSAGE_HUB") else {
+        let Ok(namespace) = crate::hub_store::hub_namespace(&self.env) else {
             return;
         };
         let Ok(stub) = namespace.id_from_name(&peer).and_then(|id| id.get_stub()) else {
@@ -3045,7 +3117,7 @@ impl MessageHub {
         let Some(peer_room) = peer_room(&peer, room) else {
             return;
         };
-        let Ok(namespace) = self.env.durable_object("MESSAGE_HUB") else {
+        let Ok(namespace) = crate::hub_store::hub_namespace(&self.env) else {
             return;
         };
         let Ok(stub) = namespace.id_from_name(&peer).and_then(|id| id.get_stub()) else {
@@ -3090,7 +3162,7 @@ impl MessageHub {
             return presence_snapshot_json(room, None, None, None, None);
         };
         let read = async {
-            let ns = self.env.durable_object("MESSAGE_HUB").ok()?;
+            let ns = crate::hub_store::hub_namespace(&self.env).ok()?;
             let stub = ns.id_from_name(&peer).ok()?.get_stub().ok()?;
             let url = format!("https://do.local/internal/presence?room={peer_room}");
             let mut resp = stub.fetch_with_str(&url).await.ok()?;
@@ -4362,6 +4434,31 @@ mod tests {
         assert_eq!(out[0].data["messageId"], "mid-abc");
         assert_eq!(out[0].data["roomId"], room);
         assert_eq!(out[0].data["duplicate"], true);
+    }
+
+    // 0.8.1: on the socket the box switch and the full mailbox travel as the
+    // budget's refusal does, `messageFailed` with the description as `reason`.
+    #[test]
+    fn ws_box_off_and_full_mailbox_are_message_failed_with_their_descriptions() {
+        let room = format!("{ID_A}-webrtc_signal");
+        let (body, status) = crate::hub_store::box_off_answer("webrtc_signal");
+        let out = outcome_to_outbound(&room, SendOutcome::ValidationError { body, status });
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].event_name, "messageFailed");
+        assert_eq!(out[0].data["reason"], "box webrtc_signal is off");
+
+        let full = crate::mailbox::Full {
+            resource: "bytes".into(),
+            limit: crate::mailbox::MAILBOX_BYTES_LIMIT,
+            held: crate::mailbox::MAILBOX_BYTES_LIMIT,
+        };
+        let (body, status) = crate::mailbox::full_answer(&full, ID_B);
+        let out = outcome_to_outbound(&room, SendOutcome::ValidationError { body, status });
+        assert_eq!(out[0].event_name, "messageFailed");
+        assert!(out[0].data["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("The recipient inbox storage quota has been reached."));
     }
 
     // Guard the contract that was the actual bug: sendLiveMessage listens ONLY

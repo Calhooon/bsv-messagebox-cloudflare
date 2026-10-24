@@ -1,10 +1,15 @@
-//! The archive of the relay mailbox (0.8.0, R1: the archive ready).
+//! The archive of the relay mailbox (0.8.0, R1: the archive ready; 0.8.1, R2:
+//! the hub that feeds it).
 //!
-//! The recipient's hub will hold the live rows and D1 a copy behind the queue
+//! The recipient's hub holds the live rows and D1 a copy behind the queue
 //! `relay-archive` (bsv-stack-lean `docs/p0/mbx-hot-path-m28a.md`, section 5).
-//! This release ships the consumer alone: nothing enqueues yet (the producer
-//! binding `ARCHIVE_QUEUE` exists so the release that feeds it needs no binding
-//! change), and D1 stays the store every route reads.
+//! Since 0.8.1 `MessageHubSql` enqueues every change of a mailbox row (under
+//! `HUB_STORE = "sql"`; under `kv` nothing reaches it and nothing enqueues),
+//! and after a written batch the consumer tells each recipient's hub which
+//! versions the archive holds (`/internal/archive-done`), so the hub stops
+//! owing them and deletes an acknowledged row. A message whose body was too
+//! long for the queue (`bodyInHub`) has its body read from the hub before the write
+//! (`/internal/archive-read`).
 //!
 //! A message names one change of one row: the insert (version 1) or the
 //! acknowledgment (a later version), keyed by the message id and the version
@@ -103,6 +108,11 @@ pub struct ArchiveMessage {
     /// form or ISO 8601, both listed by `storage::to_iso8601`); none is now.
     #[serde(default)]
     pub created_at: Option<String>,
+    /// 0.8.1: the body is too long for a queue message (128 KB) and stays in
+    /// the recipient's `MessageHubSql`; the consumer reads it there
+    /// (`/internal/archive-read`) before the write. Absent is false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub body_in_hub: bool,
 }
 
 /// Read one queue message's body. `Err` is malformed beyond repair: the
@@ -123,7 +133,7 @@ pub fn parse(value: serde_json::Value) -> Result<ArchiveMessage, String> {
             return Err(format!("empty {name}"));
         }
     }
-    if m.change == Change::Insert && m.body.is_none() {
+    if m.change == Change::Insert && m.body.is_none() && !m.body_in_hub {
         return Err("an insert without its body".into());
     }
     Ok(m)
@@ -297,9 +307,102 @@ pub async fn archive_batch(
     Ok(verdicts)
 }
 
+/// What each recipient's hub is told after a written batch, in the order the
+/// recipients appear: every message D1 now holds at its version or a newer
+/// one (written, a repeat, superseded in the batch), and every collision.
+pub fn done_by_recipient(
+    batch: &[ArchiveMessage],
+    verdicts: &[Verdict],
+) -> Vec<(String, Vec<crate::mailbox::Done>)> {
+    let mut out: Vec<(String, Vec<crate::mailbox::Done>)> = Vec::new();
+    for (m, v) in batch.iter().zip(verdicts) {
+        let done = crate::mailbox::Done {
+            message_id: m.message_id.clone(),
+            version: m.version,
+            collision: *v == Verdict::Collision,
+        };
+        match out.iter_mut().find(|(r, _)| *r == m.recipient) {
+            Some((_, list)) => list.push(done),
+            None => out.push((m.recipient.clone(), vec![done])),
+        }
+    }
+    out
+}
+
+/// The messages whose body stayed in the hub, by recipient: `(recipient,
+/// indices into the batch)`, in the order the recipients appear.
+pub fn bodies_in_hub(batch: &[ArchiveMessage]) -> Vec<(String, Vec<usize>)> {
+    let mut out: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, m) in batch.iter().enumerate() {
+        if !(m.body_in_hub && m.body.is_none()) {
+            continue;
+        }
+        match out.iter_mut().find(|(r, _)| *r == m.recipient) {
+            Some((_, list)) => list.push(i),
+            None => out.push((m.recipient.clone(), vec![i])),
+        }
+    }
+    out
+}
+
+/// The body of a message from the rows its hub answered: the row under its id
+/// with a body (a message id's body never changes). `None`: the hub no longer
+/// holds it with a body, so the archive already holds a newer version and the
+/// message has nothing to write.
+pub fn body_from_hub(m: &ArchiveMessage, rows: &[crate::mailbox::ArchiveRow]) -> Option<String> {
+    rows.iter()
+        .find(|r| r.message_id == m.message_id)
+        .and_then(|r| r.body.clone())
+}
+
+/// `/internal/archive-read` on the recipient's `MessageHubSql`.
+async fn read_hub_rows(
+    env: &worker::Env,
+    recipient: &str,
+    ids: &[String],
+) -> worker::Result<Vec<crate::mailbox::ArchiveRow>> {
+    let ns = env.durable_object(crate::hub_store::archive_hub_binding())?;
+    let stub = ns.id_from_name(recipient)?.get_stub()?;
+    let mut pairs: Vec<(&str, &str)> = vec![("identity", recipient)];
+    pairs.extend(ids.iter().map(|id| ("id", id.as_str())));
+    let url = worker::Url::parse_with_params("https://do.local/internal/archive-read", pairs)
+        .map_err(|e| worker::Error::from(e.to_string()))?;
+    let call = async {
+        let mut res = stub.fetch_with_str(url.as_str()).await?;
+        if res.status_code() != 200 {
+            return Err(worker::Error::from(format!(
+                "archive-read answered {}",
+                res.status_code()
+            )));
+        }
+        let v: serde_json::Value = res.json().await?;
+        serde_json::from_value(v["rows"].clone()).map_err(|e| worker::Error::from(e.to_string()))
+    };
+    crate::hub_forward::with_do_op_timeout(call, crate::hub_forward::FORWARD_OP_TIMEOUT_MS).await
+}
+
+/// `/internal/archive-done` on the recipient's `MessageHubSql`.
+async fn tell_hub(
+    env: &worker::Env,
+    recipient: &str,
+    done: &[crate::mailbox::Done],
+) -> worker::Result<()> {
+    let ns = env.durable_object(crate::hub_store::archive_hub_binding())?;
+    crate::message_hub_sql::post_json(
+        &ns,
+        recipient,
+        "/internal/archive-done",
+        &serde_json::json!({ "identity": recipient, "done": done }),
+    )
+    .await
+    .map(|_| ())
+}
+
 /// The queue's handler: each message parsed, the malformed acknowledged and
 /// logged once, the rest archived in one pass; a D1 failure retries every
-/// message of the pass (a repeat is a no-op, so the retry is safe).
+/// message of the pass (a repeat is a no-op, so the retry is safe). After a
+/// written pass each recipient's hub is told what the archive holds; a hub
+/// that cannot be told keeps the rows owed and hands them again later.
 pub async fn consume(batch: &worker::MessageBatch<serde_json::Value>, env: &worker::Env) {
     use worker::{console_log, MessageExt};
 
@@ -323,13 +426,57 @@ pub async fn consume(batch: &worker::MessageBatch<serde_json::Value>, env: &work
     if msgs.is_empty() {
         return;
     }
+    // 0.8.1: a body too long for the queue is read from the recipient's hub.
+    let mut keep = vec![true; msgs.len()];
+    for (recipient, idxs) in bodies_in_hub(&msgs) {
+        let ids: Vec<String> = idxs.iter().map(|&i| msgs[i].message_id.clone()).collect();
+        match read_hub_rows(env, &recipient, &ids).await {
+            Ok(rows) => {
+                for i in idxs {
+                    match body_from_hub(&msgs[i], &rows) {
+                        Some(body) => msgs[i].body = Some(body),
+                        None => {
+                            console_log!(
+                                "archive.gone msgId={} version={}",
+                                msgs[i].message_id,
+                                msgs[i].version
+                            );
+                            raws[i].ack();
+                            keep[i] = false;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                for i in idxs {
+                    console_log!(
+                        "archive.retry msgId={} version={} err=hub read: {}",
+                        msgs[i].message_id,
+                        msgs[i].version,
+                        e
+                    );
+                    raws[i].retry();
+                    keep[i] = false;
+                }
+            }
+        }
+    }
+    let (raws, msgs): (Vec<_>, Vec<_>) = raws
+        .into_iter()
+        .zip(msgs)
+        .zip(keep)
+        .filter_map(|(pair, k)| k.then_some(pair))
+        .unzip();
+    if msgs.is_empty() {
+        return;
+    }
     let outcome = match env.d1("DB") {
         Ok(db) => archive_batch(&db, &msgs).await,
         Err(e) => Err(e),
     };
     match outcome {
         Ok(verdicts) => {
-            for ((raw, m), v) in raws.iter().zip(&msgs).zip(verdicts) {
+            for ((raw, m), v) in raws.iter().zip(&msgs).zip(&verdicts) {
                 console_log!(
                     "{} msgId={} version={} change={:?}",
                     v.as_str(),
@@ -338,6 +485,19 @@ pub async fn consume(batch: &worker::MessageBatch<serde_json::Value>, env: &work
                     m.change
                 );
                 raw.ack();
+            }
+            for (recipient, done) in done_by_recipient(&msgs, &verdicts) {
+                match tell_hub(env, &recipient, &done).await {
+                    Ok(()) => {
+                        console_log!("archive.hub_told recipient={} n={}", recipient, done.len())
+                    }
+                    Err(e) => console_log!(
+                        "archive.hub_told.err recipient={} n={} err={}",
+                        recipient,
+                        done.len(),
+                        e
+                    ),
+                }
             }
         }
         Err(e) => {
