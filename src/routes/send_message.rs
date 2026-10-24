@@ -347,7 +347,8 @@ pub(crate) trait SendStore {
         recipient: &str,
         message_box: &str,
     ) -> worker::Result<i64>;
-    /// `Ok(false)` is a duplicate `messageId`.
+    /// Store one recipient's row: stored, a duplicate `messageId`, or (the
+    /// mailbox, 0.8.1) refused at the recipient's bound with its 429 body.
     async fn insert_message(
         &self,
         message_id: &str,
@@ -356,7 +357,7 @@ pub(crate) trait SendStore {
         recipient: &str,
         body: &str,
         beef_key: Option<&str>,
-    ) -> worker::Result<bool>;
+    ) -> worker::Result<Insert>;
     async fn forget_unnamed(
         &self,
         rows_naming: usize,
@@ -368,11 +369,55 @@ pub(crate) trait SendStore {
     fn log(&self, line: String);
 }
 
-/// The Worker's `SendStore`: D1 through `Storage`, the rest through `Env`.
-struct WorkerStore<'a, 'db> {
-    env: &'a Env,
-    store: &'a Storage<'db>,
+/// What `SendStore::insert_message` did with one row.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Insert {
+    /// The row is durable (a retried hop that found its own row included).
+    Stored,
+    /// The `messageId` is held by another send.
+    Duplicate,
+    /// The recipient's mailbox is at its bound: the 429
+    /// `ERR_INBOX_QUOTA_EXCEEDED` body (`mailbox::full_answer`).
+    Full(Value),
 }
+
+impl Insert {
+    /// The D1 path's answer: `true` stored, `false` a duplicate.
+    pub(crate) fn of_d1(stored: bool) -> Self {
+        if stored {
+            Insert::Stored
+        } else {
+            Insert::Duplicate
+        }
+    }
+}
+
+/// The Worker's `SendStore`: D1 through `Storage`, the rest through `Env`.
+pub(crate) struct WorkerStore<'a, 'db> {
+    pub(crate) env: &'a Env,
+    pub(crate) store: &'a Storage<'db>,
+}
+
+/// The sender's budget for the window on D1 (`send_budget`), the D1 path's
+/// and the mailbox path's alike in 0.8.1.
+pub(crate) async fn charge_on_d1(
+    env: &Env,
+    sender: &str,
+    unjudged: u64,
+) -> Result<(), (Value, u16)> {
+    let Ok(db) = env.d1("DB") else {
+        return Ok(());
+    };
+    crate::send_budget::charge(
+        &crate::send_budget::D1Windows { db: &db },
+        &crate::send_budget::Budget::from_env(env),
+        sender,
+        Date::now().as_millis() / 1000,
+        unjudged,
+    )
+    .await
+}
+
 
 impl SendStore for WorkerStore<'_, '_> {
     async fn read_send_context(
@@ -387,17 +432,7 @@ impl SendStore for WorkerStore<'_, '_> {
     }
 
     async fn charge(&self, sender: &str, unjudged: u64) -> Result<(), (Value, u16)> {
-        let Ok(db) = self.env.d1("DB") else {
-            return Ok(());
-        };
-        crate::send_budget::charge(
-            &crate::send_budget::D1Windows { db: &db },
-            &crate::send_budget::Budget::from_env(self.env),
-            sender,
-            Date::now().as_millis() / 1000,
-            unjudged,
-        )
-        .await
+        charge_on_d1(self.env, sender, unjudged).await
     }
 
     async fn settle(
@@ -429,10 +464,11 @@ impl SendStore for WorkerStore<'_, '_> {
         recipient: &str,
         body: &str,
         beef_key: Option<&str>,
-    ) -> worker::Result<bool> {
+    ) -> worker::Result<Insert> {
         self.store
             .insert_message(message_id, box_id, sender, recipient, body, beef_key)
             .await
+            .map(Insert::of_d1)
     }
 
     async fn forget_unnamed(
@@ -452,6 +488,7 @@ impl SendStore for WorkerStore<'_, '_> {
     fn log(&self, line: String) {
         console_log!("{}", line);
     }
+
 }
 
 /// Map a `worker::Error` bubbled out of the D1 read/write helpers onto the right
@@ -459,7 +496,7 @@ impl SendStore for WorkerStore<'_, '_> {
 /// after exhausting their attempts (a genuine error short-circuits without
 /// retry), so a transient class here means "D1 momentarily unavailable" →
 /// client-retryable, whereas anything else is a real internal fault.
-fn classify_store_error(e: worker::Error) -> SendOutcome {
+pub(crate) fn classify_store_error(e: worker::Error) -> SendOutcome {
     if crate::storage::is_transient_d1_error(&e) {
         SendOutcome::TransientError {
             detail: e.to_string(),
@@ -507,13 +544,35 @@ pub(crate) fn retry_after(body: &Value, status: u16) -> Option<&'static str> {
 ///
 /// The returned `Sent` carries the hub pushes apart from the outcome: no push
 /// runs here, so the caller answers once the rows are durable (0.6.1).
+///
+/// The store is the router's (0.8.1, `hub_store`): under `HUB_STORE = "sql"`
+/// the rows land in each recipient hub's mailbox (`MailboxSendStore`); under
+/// `kv` (the default) and `kv-drain` they land in D1 as before. A refused
+/// `HUB_STORE` stores nothing and answers its typed 500.
 pub async fn process_send(
     validated: ValidatedSendMessage,
     sender_key: &str,
     env: &Env,
     store: &Storage<'_>,
 ) -> Sent {
-    store_send(validated, sender_key, &WorkerStore { env, store }).await
+    use crate::hub_store::{refused_boot_answer, HubStore, StorePath};
+    match HubStore::from_env(env).map(HubStore::send_path) {
+        Err(value) => {
+            let (body, status) = refused_boot_answer(&value);
+            Sent {
+                outcome: SendOutcome::ValidationError { body, status },
+                after: AfterAnswer::default(),
+            }
+        }
+        Ok(StorePath::Mailbox) => {
+            let mailbox = crate::message_hub_sql::MailboxSendStore {
+                worker: WorkerStore { env, store },
+                message_box: validated.message_box.clone(),
+            };
+            store_send(validated, sender_key, &mailbox).await
+        }
+        Ok(_) => store_send(validated, sender_key, &WorkerStore { env, store }).await,
+    }
 }
 
 /// `process_send`'s body over any `SendStore`: every row it stores leaves its
@@ -709,11 +768,11 @@ async fn store_rows<S: SendStore>(
             recipient,
             message_id,
             store.now_ms().saturating_sub(t_ins_start),
-            matches!(&ins, Ok(false))
+            matches!(&ins, Ok(Insert::Duplicate))
         ));
         match ins {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(Insert::Stored) => {}
+            Ok(Insert::Duplicate) => {
                 store
                     .forget_unnamed(rows_naming, &handed, r2_key.as_deref(), true)
                     .await;
@@ -721,6 +780,15 @@ async fn store_rows<S: SendStore>(
                     recipient: recipient.clone(),
                     message_id: message_id.clone(),
                 };
+            }
+            // The recipient's mailbox is full (0.8.1, the design's section
+            // 4): refused at this recipient, the rows before it kept, as a
+            // duplicate or a fault keeps them.
+            Ok(Insert::Full(body)) => {
+                store
+                    .forget_unnamed(rows_naming, &handed, r2_key.as_deref(), true)
+                    .await;
+                return SendOutcome::ValidationError { body, status: 429 };
             }
             Err(e) => {
                 store
@@ -861,10 +929,8 @@ impl PushHub for WorkerHub {
         })
         .to_string();
 
-        let namespace = self
-            .env
-            .durable_object("MESSAGE_HUB")
-            .map_err(|e| format!("MESSAGE_HUB binding lookup failed: {e}"))?;
+        let namespace = crate::hub_store::hub_namespace(&self.env)
+            .map_err(|e| format!("hub binding lookup failed: {e}"))?;
         let stub = namespace
             .id_from_name(&job.recipient)
             .and_then(|id| id.get_stub())
@@ -1334,7 +1400,7 @@ mod decouple_787_tests {
     #[test]
     fn pin_c_source_the_duplicate_return_waits_on_no_push() {
         let path = write_path_src();
-        assert!(path.contains("Ok(false) =>") && path.contains("DuplicateMessage {"));
+        assert!(path.contains("Ok(Insert::Duplicate) =>") && path.contains("DuplicateMessage {"));
         assert!(
             !path.contains("push_to_recipient_sockets("),
             "the duplicate return must not wait on the pushes of the rows before it"
@@ -1360,6 +1426,8 @@ mod decouple_r1_tests {
         log: Log,
         dup: Option<&'static str>,
         fault: Option<&'static str>,
+        /// 0.8.1: the row whose recipient's mailbox is full.
+        full: Option<&'static str>,
     }
 
     impl StubStore {
@@ -1368,6 +1436,7 @@ mod decouple_r1_tests {
                 log,
                 dup: None,
                 fault: None,
+                full: None,
             }
         }
     }
@@ -1379,6 +1448,7 @@ mod decouple_r1_tests {
             _sender: &str,
             _message_box: &str,
         ) -> worker::Result<SendContext> {
+            self.log.borrow_mut().push("context".into());
             Ok(SendContext {
                 recipient_fee: 0,
                 server_fee: 0,
@@ -1387,6 +1457,7 @@ mod decouple_r1_tests {
         }
 
         async fn charge(&self, _sender: &str, _unjudged: u64) -> Result<(), (Value, u16)> {
+            self.log.borrow_mut().push("charge".into());
             Ok(())
         }
 
@@ -1417,15 +1488,31 @@ mod decouple_r1_tests {
             _recipient: &str,
             _body: &str,
             _beef_key: Option<&str>,
-        ) -> worker::Result<bool> {
+        ) -> worker::Result<Insert> {
             if self.fault == Some(message_id) {
                 return Err(worker::Error::RustError("D1 write failed".into()));
+            }
+            if self.full == Some(message_id) {
+                self.log
+                    .borrow_mut()
+                    .push(format!("insert {message_id} full"));
+                return Ok(Insert::Full(
+                    crate::mailbox::full_answer(
+                        &crate::mailbox::Full {
+                            resource: "messages".into(),
+                            limit: 10_000,
+                            held: 10_000,
+                        },
+                        _recipient,
+                    )
+                    .0,
+                ));
             }
             let stored = self.dup != Some(message_id);
             self.log
                 .borrow_mut()
                 .push(format!("insert {message_id} stored={stored}"));
-            Ok(stored)
+            Ok(Insert::of_d1(stored))
         }
 
         async fn forget_unnamed(
@@ -1621,5 +1708,28 @@ mod decouple_r1_tests {
         assert_eq!(hub_reply(204), Ok(()));
         assert_eq!(hub_reply(400), Err("hub answered 400".into()));
         assert_eq!(hub_reply(500), Err("hub answered 500".into()));
+    }
+
+    // 0.8.1, the full mailbox: the send is refused at the recipient whose
+    // mailbox is full with the reference's 429; the rows before it stay and
+    // keep their pushes, as a duplicate's do.
+    #[test]
+    fn a_full_mailbox_answers_429_at_its_recipient_and_keeps_the_earlier_rows() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let mut store = StubStore::new(log.clone());
+        store.full = Some("m2");
+        let sent = block_on(store_send(
+            send("low_game_x", &[("R1", "m1"), ("R2", "m2"), ("R3", "m3")]),
+            "S",
+            &store,
+        ));
+        assert_eq!(ids(&sent.after), vec!["m1"]);
+        let (body, status) = outcome_to_http(sent.outcome);
+        assert_eq!(status, 429);
+        assert_eq!(body["code"], "ERR_INBOX_QUOTA_EXCEEDED");
+        assert_eq!(body["recipient"], "R2");
+        assert_eq!(body["resource"], "messages");
+        assert_eq!(body["freedBy"], "acknowledgeMessage");
+        assert!(!log.borrow().iter().any(|l| l.contains("m3")));
     }
 }

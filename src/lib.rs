@@ -50,6 +50,10 @@ mod r2_presign;
 // Durable Objects (M9)
 mod hub_forward;
 mod message_hub;
+// The relay mailbox's R2 (0.8.1): the router, the machine, the SQLite hub.
+mod hub_store;
+mod mailbox;
+mod message_hub_sql;
 /// The session lane (bsv-low W-B, register row D10): one BRC-103 handshake per
 /// connection, then MAC'd frames — zero wallet calls per frame.
 pub mod session_lane;
@@ -97,9 +101,10 @@ async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
 /// a cron but no `RETAIN_BOX_PREFIXES` no-op inside the sweep. Retained rows
 /// older than `RETAIN_TTL_DAYS` (default 14) are tombstoned then deleted so
 /// abandoned games can not accumulate forever.
-/// Queue entry: the archive consumer of `relay-archive` (0.8.0, R1). Nothing
-/// enqueues in this release; the handler upserts D1 idempotently by message id
-/// and version (`archive::consume`).
+/// Queue entry: the archive consumer of `relay-archive` (0.8.0, R1). Since
+/// 0.8.1 `MessageHubSql` enqueues each change of a mailbox row; the handler
+/// upserts D1 idempotently by message id and version and tells the hub what
+/// the archive holds (`archive::consume`).
 #[event(queue)]
 async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
     init_panic_hook();
@@ -140,6 +145,16 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // from here (`req`, `send.answered` on `/sendMessage` and `/push` alike;
     // 0.6.1, R1 L4).
     let t_req_start = Date::now().as_millis();
+    // The hub store's router (0.8.1): a HUB_STORE that is not kv, sql or
+    // kv-drain refuses the boot, every request a typed 500 naming the var,
+    // never a silent kv (`hub_store`).
+    if let Err(value) = hub_store::HubStore::from_env(&env) {
+        let (body, status) = hub_store::refused_boot_answer(&value);
+        console_error!("hub_store.refused value={value:?}");
+        return Ok(add_cors_headers(
+            Response::from_json(&body)?.with_status(status),
+        ));
+    }
     // CORS preflight — must respond before auth
     if req.method() == Method::Options {
         // bsv-low W-B (D10): the browser's preflight must allow the HTTP
@@ -280,7 +295,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         }
         let ask = body.to_string();
         let answer = async {
-            let namespace = env.durable_object("MESSAGE_HUB")?;
+            let namespace = crate::hub_store::hub_namespace(&env)?;
             let stub = namespace.id_from_name(&identity)?.get_stub()?;
             let hdrs = Headers::new();
             hdrs.set("content-type", "application/json")?;
@@ -506,7 +521,8 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
             handle_list_messages(&request_body, identity_key, &env, &store).await
         }
         (Method::Post, "/acknowledgeMessage") => {
-            handle_acknowledge_message(&request_body, identity_key, &retention_cfg, &store).await
+            handle_acknowledge_message(&request_body, identity_key, &env, &retention_cfg, &store)
+                .await
         }
 
         // Transcript retention-until-terminal (bsv-low #252 stage E): a
@@ -530,7 +546,15 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         }
 
         (Method::Post, "/permissions/set") => {
-            permissions::handle_set(&request_body, identity_key, &store).await
+            let answer = permissions::handle_set(&request_body, identity_key, &store).await;
+            // 0.8.1: under HUB_STORE = "sql" the identity's hub holds a copy
+            // of its permissions for the send path; a change clears it.
+            if answer.1 == 200
+                && hub_store::HubStore::from_env(&env).ok() == Some(hub_store::HubStore::Sql)
+            {
+                message_hub_sql::forget_permissions(&env, identity_key).await;
+            }
+            answer
         }
         (Method::Get, "/permissions/get") => {
             let url = req.url().map_err(|e| Error::from(e.to_string()))?;
@@ -736,7 +760,7 @@ async fn session_lane_auth(
     })
     .to_string();
     let answer = async {
-        let namespace = env.durable_object("MESSAGE_HUB")?;
+        let namespace = crate::hub_store::hub_namespace(env)?;
         let stub = namespace.id_from_name(&identity)?.get_stub()?;
         let hdrs = Headers::new();
         hdrs.set("content-type", "application/json")?;
@@ -950,10 +974,33 @@ async fn handle_list_messages(
         Err(e) => return e,
     };
 
-    let messages = match store
-        .list_messages(identity_key, &validated.message_box)
-        .await
-    {
+    // The router (0.8.1): D1 under kv; the caller's hub under sql (the legacy
+    // merge done there); D1 and the hub's remaining rows under kv-drain.
+    use hub_store::{HubStore, StorePath};
+    let path = match HubStore::from_env(env) {
+        Ok(store) => store.read_path(),
+        Err(value) => return hub_store::refused_boot_answer(&value),
+    };
+    let listed = match path {
+        StorePath::D1 => {
+            store
+                .list_messages(identity_key, &validated.message_box)
+                .await
+        }
+        StorePath::Mailbox => {
+            message_hub_sql::list_on_hub(env, identity_key, &validated.message_box).await
+        }
+        StorePath::D1AndDrain => match store
+            .list_messages(identity_key, &validated.message_box)
+            .await
+        {
+            Ok(d1) => {
+                message_hub_sql::drain_list(env, identity_key, &validated.message_box, d1).await
+            }
+            Err(e) => Err(e),
+        },
+    };
+    let messages = match listed {
         Ok(m) => m,
         Err(e) => return list_store_error(e),
     };
@@ -1017,6 +1064,7 @@ fn acknowledge_store_error(e: Error) -> (serde_json::Value, u16) {
 async fn handle_acknowledge_message(
     raw_body: &[u8],
     identity_key: &str,
+    env: &Env,
     retention_cfg: &retention::RetentionConfig,
     store: &storage::Storage<'_>,
 ) -> (serde_json::Value, u16) {
@@ -1025,12 +1073,45 @@ async fn handle_acknowledge_message(
         Err(e) => return e,
     };
 
+    // The router (0.8.1), as the listing's: D1 under kv; the caller's hub
+    // under sql (ids it does not hold acknowledged in D1 there); under
+    // kv-drain the hub's ids at the hub and the rest in D1.
+    use hub_store::{HubStore, StorePath};
+    let path = match HubStore::from_env(env) {
+        Ok(store) => store.read_path(),
+        Err(value) => return hub_store::refused_boot_answer(&value),
+    };
     // For RETAINED boxes (bsv-low #252 stage E) this MARKS delivery instead of
     // deleting — the wire contract (success / 0-affected → 400) is unchanged.
-    let deleted = match store
-        .acknowledge_messages(identity_key, &validated.message_ids, retention_cfg)
-        .await
-    {
+    let acknowledged = match path {
+        StorePath::D1 => {
+            store
+                .acknowledge_messages(identity_key, &validated.message_ids, retention_cfg)
+                .await
+        }
+        StorePath::Mailbox => {
+            message_hub_sql::ack_on_hub(env, identity_key, &validated.message_ids, true)
+                .await
+                .map(|(n, _)| n)
+        }
+        StorePath::D1AndDrain => {
+            match message_hub_sql::ack_on_hub(env, identity_key, &validated.message_ids, false)
+                .await
+            {
+                Ok((n, missing)) if missing.is_empty() => Ok(n),
+                Ok((n, missing)) => message_hub_sql::legacy_acknowledge(
+                    store,
+                    identity_key,
+                    &missing,
+                    retention_cfg,
+                )
+                .await
+                .map(|d1| n + d1),
+                Err(e) => Err(e),
+            }
+        }
+    };
+    let deleted = match acknowledged {
         Ok(n) => n,
         Err(e) => return acknowledge_store_error(e),
     };
@@ -1103,7 +1184,7 @@ async fn handle_presence_route(url: &Url, env: &Env) -> (serde_json::Value, u16)
     // Every `?` below is a hop that FAILED to produce an answer — each one
     // lands on `HubFault`, never on a fabricated `present:false`.
     let read = async {
-        let namespace = env.durable_object("MESSAGE_HUB").ok()?;
+        let namespace = crate::hub_store::hub_namespace(env).ok()?;
         let stub = namespace.id_from_name(owner).ok()?.get_stub().ok()?;
         // Url::parse_with_params percent-encodes the room for us.
         let do_url = Url::parse_with_params(
@@ -1244,7 +1325,7 @@ async fn handle_rejoin_deadline_route(
     // The hub answers with the room's remembered COUNTERPARTY (the seat that
     // posted into this room) when it has one.
     let peer: Option<String> = async {
-        let namespace = env.durable_object("MESSAGE_HUB").ok()?;
+        let namespace = crate::hub_store::hub_namespace(env).ok()?;
         let stub = namespace.id_from_name(owner).ok()?.get_stub().ok()?;
         let do_url = Url::parse_with_params(
             "https://do.local/internal/rejoin-deadline",
@@ -1348,7 +1429,7 @@ async fn route_websocket_upgrade(
         AuthResult::Response(response) => return Ok(response),
     };
 
-    let namespace = env.durable_object("MESSAGE_HUB")?;
+    let namespace = crate::hub_store::hub_namespace(env)?;
     let stub = namespace.id_from_name(&identity_key)?.get_stub()?;
     stub.fetch_with_request(request).await
 }
@@ -1800,7 +1881,7 @@ pub(crate) async fn fan_out_broadcast(
             }
         }
     }
-    let Ok(namespace) = env.durable_object("MESSAGE_HUB") else {
+    let Ok(namespace) = crate::hub_store::hub_namespace(env) else {
         return FanOut::of(identities.len(), &[]);
     };
     if identities.len() > BROADCAST_FANOUT_CAP {
