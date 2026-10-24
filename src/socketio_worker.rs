@@ -736,7 +736,7 @@ async fn forward_event_to_message_hub(
     event_name: &str,
     data: &Value,
 ) -> Vec<(String, Value)> {
-    let Ok(namespace) = env.durable_object("MESSAGE_HUB") else {
+    let Ok(namespace) = crate::hub_store::hub_namespace(env) else {
         return Vec::new();
     };
     let Ok(stub) = namespace
@@ -809,7 +809,7 @@ async fn forward_event_to_message_hub(
 }
 
 async fn register_sid_with_hub(env: &Env, identity_key: &str, sid: &str) -> Result<()> {
-    let namespace = env.durable_object("MESSAGE_HUB")?;
+    let namespace = crate::hub_store::hub_namespace(env)?;
     let stub = namespace.id_from_name(identity_key)?.get_stub()?;
     let payload = json!({ "sid": sid }).to_string();
     let headers = Headers::new();
