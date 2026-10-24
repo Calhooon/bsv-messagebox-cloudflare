@@ -127,8 +127,12 @@ fn cargo_toml_has_no_patch_section() {
     );
 }
 
-/// The 0.8 line (the relay's 0.7.1): the payment words are
-/// bsv-middleware-rs 0.6.2's, built on the relay's bsv-rs 0.8.1 (0.6.1 on
+/// The 0.8 line (the relay's 0.7.1; 0.8.1 moves the copy to bsv-rs 0.8.2,
+/// read: `Error::WalletTransport { status, detail }` for a bare 502, 503 or
+/// 504, a connection error or a timeout, additive under `#[non_exhaustive]`;
+/// the busy word, the wire and the cursor unchanged; the relay matches no
+/// error text): the payment words are
+/// bsv-middleware-rs 0.6.2's, built on the relay's bsv-rs 0.8.2 (0.6.1 on
 /// 0.7.0 from the relay's 0.6.0, 0.5.0 on 0.6.0 from the relay's 0.5.0,
 /// 0.4.1 on 0.4.5 before), and
 /// bsv-rs is one copy. The door keeps its own
@@ -138,7 +142,7 @@ fn cargo_toml_has_no_patch_section() {
 /// graph and the manifest names no second copy. A move of either is a move of
 /// this test in the same commit.
 #[test]
-fn the_payment_words_are_bsv_middleware_rs_0_6_2_on_bsv_rs_0_8_1_one_copy() {
+fn the_payment_words_are_bsv_middleware_rs_0_6_2_on_bsv_rs_0_8_2_one_copy() {
     let lock = manifest_file("Cargo.lock");
     let versions = |name: &str| -> Vec<String> {
         lock.split("[[package]]")
@@ -153,7 +157,7 @@ fn the_payment_words_are_bsv_middleware_rs_0_6_2_on_bsv_rs_0_8_1_one_copy() {
             .collect()
     };
     assert_eq!(versions("bsv-middleware-rs"), ["0.6.2"]);
-    assert_eq!(versions("bsv-rs"), ["0.8.1"]);
+    assert_eq!(versions("bsv-rs"), ["0.8.2"]);
     // 0.7.1: the BRC-31 layer's core is 0.4.1 (the middleware's release on
     // bsv-rs 0.8), pinned exactly beside it, one copy.
     assert_eq!(versions("bsv-middleware-core"), ["0.4.1"]);

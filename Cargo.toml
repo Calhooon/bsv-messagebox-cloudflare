@@ -74,8 +74,10 @@ bsv-middleware-core = "=0.4.1"
 # 0.8.1 (a caret, one bsv-rs per lock): the atomic rule on the subject's graph
 # (BRC-95), the typed busy answer, `Error` non_exhaustive; the cursor's magic
 # is `BSC3` (`tip_of` reads it, and a `BSC2` cursor, the same layout up to the
-# fields it reads).
-bsv-rs = { version = "0.8.1", features = ["auth", "wallet", "transaction", "wasm"] }
+# fields it reads). 0.8.2 (0.8.1 of the relay): `Error::WalletTransport`, the
+# typed transport fault of a bare 5xx, a connection error or a timeout,
+# additive; nothing of the wire or the cursor moves.
+bsv-rs = { version = "0.8.2", features = ["auth", "wallet", "transaction", "wasm"] }
 # The shared payment check (P0-3): the six-word verdict, the BRC-29 script and
 # the header service as a trait. 0.6.1 refuses a reused derivation prefix
 # (M14); 0.6.2 asks bsv-rs ^0.8, so it is built on the relay's 0.8.1

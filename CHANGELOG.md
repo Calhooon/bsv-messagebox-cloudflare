@@ -18,6 +18,7 @@ The mailbox's class born behind `HUB_STORE = "kv"` (R2 of the relay mailbox, bsv
 - **`Retry-After` in the CORS expose list.** No code change: `bsv-middleware-cloudflare` 0.7.2 (pinned exactly) already lists `Retry-After` in `Access-Control-Expose-Headers` from `add_cors_headers` and `add_lane_cors_headers`, and every answer the relay builds (signed, sealed on the session lane, or plain) passes through one of them, so a browser reads the 503's `Retry-After`.
 - **The archive queue is per environment** (message box #25): a second environment needs its own queue (`wrangler queues create relay-archive-<env>`) and its own producer and consumer blocks under `[env.<name>]`, because a queue has one consumer Worker and the consumer writes through its own D1 binding. The README's deploy notes say so; the template stays single-environment.
 - **The double-stall bound** (message box #22): a listing and an acknowledgment are each bounded at 6,150 ms of stalled D1 reads, so a client that does both may wait two bounds; the README names it.
+- **bsv-rs 0.8.2** (from 0.8.1): `Error::WalletTransport { status, detail }`, the typed transport fault of a bare 502, 503 or 504, a connection error or a timeout, additive under `#[non_exhaustive]`; the busy word, the wire and the cursor unchanged; the version guard test moves with it in this commit.
 - **`api_docs`**: `/sendMessage` documents the 403 `ERR_BOX_OFF`, the 429 `ERR_INBOX_QUOTA_EXCEEDED` (and the 429 `ERR_SEND_BUDGET` it lacked), and the 500 `ERR_HUB_STORE_INVALID`.
 
 ## [0.8.0] - 2026-10-23
