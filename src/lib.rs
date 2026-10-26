@@ -45,6 +45,8 @@ pub mod handoff;
 /// (`tests/deep_beef_door.rs`, P0-5b) runs the delivery check itself.
 pub mod payments;
 mod permissions;
+/// The presence read's hops and counts (0.8.2, message box #20).
+mod presence;
 mod r2_presign;
 
 // Durable Objects (M9)
@@ -642,8 +644,18 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // try_consume_nonce, UNBOUNDED in 0.3.0); route_ms = time in the handler
     // (for /sendMessage: D1 read_send_context + box + insert_message, which have
     // their own per-op timing under TRACE_LAT send.* in routes::send_message).
+    // 0.8.2 (message box #20 (b)): a `/presence` fault names its hop and the
+    // hub's undecided answer names itself (`reason=`), so the relay's log
+    // alone tells the classes apart; every other line is as before.
+    let reason = if req_path_dbg == "/presence" {
+        presence::presence_trace_reason(&body, status)
+            .map(|r| format!(" reason={r}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     console_log!(
-        "TRACE_LAT req method={:?} path={} auth_ms={} route_ms={} status={} lane={}",
+        "TRACE_LAT req method={:?} path={} auth_ms={} route_ms={} status={} lane={}{}",
         req_method_dbg,
         req_path_dbg,
         t_auth_done.saturating_sub(t_req_start),
@@ -653,7 +665,8 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
             "session"
         } else {
             "brc104"
-        }
+        },
+        reason
     );
     // 0.6.1 (bsv-low #787): the send's answer time, apart from its hub push,
     // which now runs after the answer (`broadcast.fanout.*` under wait_until).
@@ -681,7 +694,11 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // A 503 `ERR_D1_UNAVAILABLE` says when to come back (message box #22 (a)):
     // `Retry-After`, set on every form of the answer after it is built,
     // outside the BRC-104 signature and the lane's MAC (neither covers it).
-    if let Some(v) = routes::send_message::retry_after(&body, status) {
+    // A presence fault says when to ask again too (0.8.2, message box #20
+    // (b): `presence::PRESENCE_RETRY_AFTER_SECS`).
+    if let Some(v) = routes::send_message::retry_after(&body, status)
+        .or_else(|| presence::presence_retry_after(&body, status))
+    {
         answer.headers().set("Retry-After", v)?;
     }
     Ok(answer)
