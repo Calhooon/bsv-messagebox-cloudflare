@@ -1130,47 +1130,85 @@ async fn handle_acknowledge_message(
     (json!({ "status": "success" }), 200)
 }
 
-/// The three honest answers `GET /presence` can give — the #313 (H1) shape.
+/// The three honest answers `GET /presence` can give, and its faults: the
+/// #313 (H1) shape, widened in 0.8.2 (message box #20).
 ///
-/// The middle state is the point: "the owner's hub told us nobody is seated"
-/// and "we could not LOOK" are DIFFERENT facts, and the wire must be able to
-/// say so. Before #313 the route collapsed the second into the first
-/// (`unwrap_or((false, None, None))` → HTTP 200 `present:false`), which was
-/// safe only while every consumer latched on `true` alone (#40 leave toast,
-/// #206 arrival latch). A consumer that counts `false` as EVIDENCE — the
-/// lobby away tag (#309/#313) — would have read one relay-internal blip as
+/// "The owner's hub told us nobody is seated" and "we could not LOOK" are
+/// DIFFERENT facts, and the wire must be able to say so. Before #313 the
+/// route collapsed the second into the first (`unwrap_or((false, None, None))`
+/// gave HTTP 200 `present:false`). A consumer that counts `false` as EVIDENCE
+/// (the lobby away tag, #309/#313) would have read one relay-internal blip as
 /// "every probed host stepped away at the same instant".
 ///
 /// `HubFault` is therefore a SEPARATE VARIANT, not a flag beside a boolean:
 /// its response carries no `present` key at all (and a 503), so the absence
-/// is structurally UNREPRESENTABLE as a `false` rather than merely
-/// detectable. Existing `true`-only consumers are unaffected — they already
-/// degrade a non-2xx to "unknown", which is exactly what a hub fault is.
+/// is structurally UNREPRESENTABLE as a `false`. Since 0.8.2 it names the hop
+/// that failed (`presence::PresenceHop`) and the hub's own `null` is not a
+/// fault: it is the third answer, "undecided", a 200 of its own.
+///
 /// Version of the `GET /presence` ANSWER contract, echoed as `presenceWire`
-/// on every HTTP 200. Its presence is the proof that this relay separates a
-/// hub fault from an absence (#313 H1); its absence means "an older relay,
-/// whose `present:false` may be fabricated".
-const PRESENCE_WIRE_VERSION: u64 = 1;
+/// on every HTTP 200.
+///
+/// - `1` (#313 H1): this relay separates a hub fault from an absence; its
+///   absence means "an older relay, whose `present:false` may be fabricated".
+///   `present` was a boolean; the hub's `null` was folded into the 503.
+/// - `2` (0.8.2, message box #20): `present` is `true`, `false` or `null`.
+///   `null` is the hub's own verdict ("undecided": a room inside its
+///   departure debounce, or a room the hub holds no sign of), answered as a
+///   200, never as `ERR_PRESENCE_UNAVAILABLE`; on LOW's beta relay that fold
+///   was the steady 503 of lobby rooms probed at their advert time. A 503
+///   now carries `hop` (and `hubStatus` on the `status` hop) and a
+///   `Retry-After`. The version moved because the meaning of the answer's
+///   `present` moved: a v1 reader taking `present` as a boolean must accept
+///   `null` before it reads a v2 relay. `tests/fixtures/presence-wire-v1.json`
+///   stays as the record of v1; `presence-wire-v2.json` is the agreement now.
+const PRESENCE_WIRE_VERSION: u64 = 2;
 
 enum PresenceRead {
-    /// The owner's hub answered. `present` is its real verdict; the advisory
-    /// fields are threaded through only when the DO actually emitted them.
+    /// The owner's hub answered. `present` is its real verdict, `None` its
+    /// "undecided"; the advisory fields are threaded through only when the
+    /// object actually emitted them.
     Answered {
-        present: bool,
+        present: Option<bool>,
         last_seen_ms: Option<u64>,
         rejoin_deadline_ms: Option<u64>,
     },
-    /// Could not read: DO namespace / stub / fetch / unreadable body / a body
-    /// with no usable `present`. NEVER an absence.
-    HubFault,
+    /// Could not read: the hop that failed, and the hub's status when the
+    /// hop is `status`. NEVER an absence.
+    HubFault {
+        hop: presence::PresenceHop,
+        hub_status: Option<u16>,
+    },
 }
 
-/// #40 — `GET /presence?room=<roomId>`: route to the room OWNER's
+impl From<&presence::HubVerdict> for PresenceRead {
+    fn from(v: &presence::HubVerdict) -> Self {
+        match v {
+            presence::HubVerdict::Answered {
+                present,
+                last_seen_ms,
+                rejoin_deadline_ms,
+            } => PresenceRead::Answered {
+                present: *present,
+                last_seen_ms: *last_seen_ms,
+                rejoin_deadline_ms: *rejoin_deadline_ms,
+            },
+            presence::HubVerdict::Fault {
+                hop, hub_status, ..
+            } => PresenceRead::HubFault {
+                hop: *hop,
+                hub_status: *hub_status,
+            },
+        }
+    }
+}
+
+/// #40 - `GET /presence?room=<roomId>`: route to the room OWNER's
 /// per-identity MessageHub and ask whether any of their live sessions is
 /// joined to it. The owner is the room's `<66-hex-identity>-` prefix; a
-/// malformed room is a 400. Hub unreachable → 503 with NO `present` field
-/// (#313: "could not look" is never spelled like "nobody is there"). Still
-/// UX-only — never a money/delivery signal.
+/// malformed room is a 400. The hub's verdict (`true`, `false`, `null`) is a
+/// 200; a hop that fails is a 503 naming it, one `TRACE_PRESENCE` line and
+/// its counter (0.8.2). Still UX-only, never a money/delivery signal.
 async fn handle_presence_route(url: &Url, env: &Env) -> (serde_json::Value, u16) {
     let room = url
         .query_pairs()
@@ -1181,36 +1219,44 @@ async fn handle_presence_route(url: &Url, env: &Env) -> (serde_json::Value, u16)
     if owner.len() != 66 || !owner.chars().all(|c| c.is_ascii_hexdigit()) {
         return presence_invalid_room_response();
     }
-    // Every `?` below is a hop that FAILED to produce an answer — each one
-    // lands on `HubFault`, never on a fabricated `present:false`.
-    let read = async {
-        let namespace = crate::hub_store::hub_namespace(env).ok()?;
-        let stub = namespace.id_from_name(owner).ok()?.get_stub().ok()?;
-        // Url::parse_with_params percent-encodes the room for us.
-        let do_url = Url::parse_with_params(
-            "https://do.local/internal/presence",
-            [("room", room.as_str())],
-        )
-        .ok()?;
-        let mut res = stub.fetch_with_str(do_url.as_str()).await.ok()?;
-        let body: serde_json::Value = res.json().await.ok()?;
-        let present = body.get("present").and_then(|v| v.as_bool())?;
-        // Advisory: absent/non-numeric => None (omit later). The CLIENT, not
-        // the relay, decides whether a returned deadline is past or future.
-        let last_seen_ms = body.get("lastSeenMs").and_then(|v| v.as_u64());
-        let rejoin_deadline_ms = body.get("rejoinDeadlineMs").and_then(|v| v.as_u64());
-        Some(PresenceRead::Answered {
-            present,
-            last_seen_ms,
-            rejoin_deadline_ms,
-        })
-    }
-    .await
-    .unwrap_or(PresenceRead::HubFault);
-    presence_route_response(&room, &read)
+    let verdict = presence::read_presence(&WorkerPresenceHub { env }, owner, &room).await;
+    presence::log_presence_verdict(&verdict, &room, |line| console_log!("{line}"));
+    presence_route_response(&room, &PresenceRead::from(&verdict))
 }
 
-/// A malformed `?room=` — the caller's bug, not a presence answer. Pure so
+/// The owner's hub through the Worker's namespace: each hop that fails is
+/// named (`presence::PresenceHop`); the status is read before the body.
+struct WorkerPresenceHub<'a> {
+    env: &'a Env,
+}
+
+impl presence::PresenceHub for WorkerPresenceHub<'_> {
+    async fn ask(&self, owner: &str, room: &str) -> presence::HubAnswer {
+        use presence::PresenceHop as Hop;
+        let env = self.env;
+        let namespace =
+            crate::hub_store::hub_namespace(env).map_err(|e| (Hop::Namespace, e.to_string()))?;
+        let stub = namespace
+            .id_from_name(owner)
+            .and_then(|id| id.get_stub())
+            .map_err(|e| (Hop::Stub, e.to_string()))?;
+        // Url::parse_with_params percent-encodes the room for us.
+        let do_url = Url::parse_with_params("https://do.local/internal/presence", [("room", room)])
+            .map_err(|e| (Hop::Fetch, e.to_string()))?;
+        let mut res = stub
+            .fetch_with_str(do_url.as_str())
+            .await
+            .map_err(|e| (Hop::Fetch, e.to_string()))?;
+        let status = res.status_code();
+        let body = res
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string());
+        Ok((status, body))
+    }
+}
+
+/// A malformed `?room=` - the caller's bug, not a presence answer. Pure so
 /// the cross-repo wire fixture can drive it (a 400 must also read as
 /// "unknown" on the client, never as an absence).
 fn presence_invalid_room_response() -> (serde_json::Value, u16) {
@@ -1225,39 +1271,45 @@ fn presence_invalid_room_response() -> (serde_json::Value, u16) {
 
 /// Build the public `GET /presence` response (body + HTTP status).
 ///
-/// `Answered` ⇒ HTTP 200 with `present` as the primary signal; the advisory
-/// `last_seen_ms` (heartbeat) and `rejoin_deadline_ms` (tier-2 stayer
-/// deadline) are threaded through ONLY when `Some` — an absent value OMITS
+/// `Answered` is HTTP 200 with `present` as the primary signal (`null` the
+/// hub's "undecided"); the advisory `last_seen_ms` (heartbeat, or the last
+/// lease or close the hub holds) and `rejoin_deadline_ms` (tier-2 stayer
+/// deadline) are threaded through ONLY when `Some`; an absent value OMITS
 /// its field (never 0/null), so a client can never misread a missing signal
-/// as a real one. Both are independent of `present` and of each other.
+/// as a real one.
 ///
-/// `HubFault` ⇒ HTTP 503 and a body that contains NO `present` key. There is
-/// no boolean to misread: the third state is unrepresentable as an answer,
-/// which is the whole #313 (H1) fix.
+/// `HubFault` is HTTP 503 and a body that contains NO `present` key, with
+/// the hop that failed (`hop`, and `hubStatus` on the `status` hop). The
+/// `Retry-After` header is set by `handle` from the code
+/// (`presence::presence_retry_after`).
 fn presence_route_response(room: &str, read: &PresenceRead) -> (serde_json::Value, u16) {
     match read {
-        PresenceRead::HubFault => (
-            json!({
+        PresenceRead::HubFault { hop, hub_status } => {
+            let mut body = json!({
                 "status": "error",
-                "code": "ERR_PRESENCE_UNAVAILABLE",
+                "code": presence::PRESENCE_UNAVAILABLE_CODE,
+                "hop": hop.as_str(),
                 "room": room,
-                "description": "presence could not be read (owner hub unreachable) — this is NOT an absence"
-            }),
-            503,
-        ),
+                "description": format!(
+                    "presence could not be read (the owner hub's {} hop failed); this is NOT an absence",
+                    hop.as_str()
+                ),
+            });
+            if let Some(s) = hub_status {
+                body["hubStatus"] = json!(s);
+            }
+            (body, 503)
+        }
         PresenceRead::Answered {
             present,
             last_seen_ms,
             rejoin_deadline_ms,
         } => {
             // `presenceWire` is this producer SELF-IDENTIFYING (#313): it says
-            // "the `present` below is a real read — I would have answered 503
+            // "the `present` below is a real read; I would have answered 503
             // if I could not look". It rides only the ANSWER, never the fault
-            // body. Relay and client deploy independently, so without it a
-            // client cannot tell a pre-#313 build's fabricated `false` from a
-            // genuine one; consumers that count `false` as evidence require it
-            // and read an unmarked `false` as unknown. Bump only if the
-            // meaning of `present` itself changes.
+            // body. Bump only if the meaning of `present` itself changes (it
+            // did in 0.8.2: `null` is an answer, `PRESENCE_WIRE_VERSION`).
             let mut body = json!({
                 "status": "success",
                 "room": room,
