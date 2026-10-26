@@ -4067,20 +4067,32 @@ mod tests {
 
         // A live session wins regardless of any marker.
         assert_eq!(
-            presence_answer(true, Some(&armed), None, 10_500),
+            presence_answer(true, Some(&armed), None, None, 10_500),
             Some(true)
         );
         assert_eq!(
-            presence_answer(true, None, Some(Absent), 10_500),
+            presence_answer(true, None, Some(Absent), None, 10_500),
             Some(true),
             "a live socket beats a stale confirmed-gone marker (a re-join)"
         );
 
         // Inside the debounce window: undecided (0.3.25, unchanged).
-        assert_eq!(presence_answer(false, Some(&armed), None, 10_500), None);
-        assert_eq!(presence_answer(false, Some(&armed), None, 14_000), None);
         assert_eq!(
-            presence_answer(false, Some(&armed), None, 14_000 + PEER_LEFT_DEBOUNCE_MS),
+            presence_answer(false, Some(&armed), None, None, 10_500),
+            None
+        );
+        assert_eq!(
+            presence_answer(false, Some(&armed), None, None, 14_000),
+            None
+        );
+        assert_eq!(
+            presence_answer(
+                false,
+                Some(&armed),
+                None,
+                None,
+                14_000 + PEER_LEFT_DEBOUNCE_MS
+            ),
             None,
             "a late alarm gets one more window"
         );
@@ -4088,19 +4100,19 @@ mod tests {
         // PIN 3 — an OVERDUE/stranded pending (a lost alarm) is undecided, NOT a
         // confirmed close (RED on 419bf18: Some(false)). This is the loop-29 churn.
         assert_eq!(
-            presence_answer(false, Some(&armed), None, overdue),
+            presence_answer(false, Some(&armed), None, None, overdue),
             None,
             "overdue pending, no confirmed marker: the re-check has not run — undecided"
         );
         // PIN 1 — empty, no pending, no confirmed marker is undecided (RED on
         // 419bf18: Some(false)). The live re-joining peer whose churn left no marker.
         assert_eq!(
-            presence_answer(false, None, None, 10_500),
+            presence_answer(false, None, None, None, 10_500),
             None,
             "no pending, no confirmed marker: nothing confirms a departure — undecided"
         );
         assert_eq!(
-            presence_answer(false, None, Some(Present), 10_500),
+            presence_answer(false, None, Some(Present), None, 10_500),
             None,
             "a Present (cleared) marker is not a close — undecided"
         );
@@ -4109,12 +4121,12 @@ mod tests {
         // the ONLY `false`; a killed peer is still caught. Also an overdue pending
         // ATOP a prior confirmed marker stands as the confirmed close.
         assert_eq!(
-            presence_answer(false, None, Some(Absent), 10_500),
+            presence_answer(false, None, Some(Absent), None, 10_500),
             Some(false),
             "a confirmed close: the killed-peer signal a survivor must learn"
         );
         assert_eq!(
-            presence_answer(false, Some(&armed), Some(Absent), overdue),
+            presence_answer(false, Some(&armed), Some(Absent), None, overdue),
             Some(false),
             "overdue pending but a prior confirmed close stands"
         );
@@ -4742,6 +4754,28 @@ mod tests {
             }
         }
 
+        /// 0.8.2 (message box #20 (c)): ONE socket.io session of `leaver` in
+        /// `room` stops renewing its lease at `last_renewal`, and the list
+        /// finds it lapsed now. Mirrors `arm_lapsed_departures`: no close
+        /// fires; `lastseen` takes the last renewal unless it holds later;
+        /// an emptied room arms the debounce on the close's own path.
+        fn lease_lapse(&mut self, room: &str, leaver: &str, last_renewal: u64) {
+            if let Some(n) = self.sessions.get_mut(room) {
+                *n = n.saturating_sub(1);
+            }
+            let held = self.lastseen.entry(room.to_string()).or_insert(0);
+            *held = (*held).max(last_renewal);
+            if self.occupied(room) {
+                return;
+            }
+            let entry = arm_departure_debounce(leaver, self.now);
+            let due = entry.due_at_ms;
+            self.pending.insert(room.to_string(), entry);
+            if self.alarm_at.is_none_or(|t| t > due) {
+                self.alarm_at = Some(due);
+            }
+        }
+
         /// Advance the clock, firing the DO alarm whenever due. Mirrors
         /// `MessageHub::alarm` → `run_departure_debounce_alarm`.
         fn advance_to(&mut self, t: u64) {
@@ -4811,7 +4845,13 @@ mod tests {
             } else {
                 self.read_confirmed_gone(room)
             };
-            presence_answer(occupied, pending.as_ref(), confirmed, self.now)
+            presence_answer(
+                occupied,
+                pending.as_ref(),
+                confirmed,
+                self.lastseen.get(room).copied(),
+                self.now,
+            )
         }
     }
 
@@ -4915,9 +4955,104 @@ mod tests {
         // EMPTY read (the churn gap) is undecided, never a fabricated false.
         let marker = sim.read_confirmed_gone(&room);
         assert_eq!(
-            presence_answer(false, None, marker, sim.now),
+            presence_answer(false, None, marker, None, sim.now),
             None,
             "a flap never leaves a fabricated false for a live, re-joining peer"
+        );
+    }
+
+    /// Message box #20 (c): a host whose socket.io session stops renewing
+    /// its lease (no close, no unregister) is undecided only for the
+    /// debounce: the lapsed lease arms it as a close does, the alarm confirms
+    /// the room still empty, and the room reads `false` with the lease's last
+    /// renewal as `lastSeenMs`. Before 0.8.2 the entry was deleted with no
+    /// departure and the room read `null` for ever.
+    #[test]
+    fn a_lapsed_lease_arms_the_debounce_and_the_room_reads_false_with_its_last_seen() {
+        let room = sim_room_a();
+        let mut sim = PresenceSim {
+            now: 10_000,
+            ..Default::default()
+        };
+        sim.join(&room);
+        let last_renewal = 10_000 + SOCKETIO_SUB_LEASE_REFRESH_MS;
+        // The list meets the entry one lease after its last renewal.
+        sim.now = last_renewal + SOCKETIO_SUB_LEASE_MS;
+        sim.lease_lapse(&room, ID_A, last_renewal);
+        assert!(
+            sim.pending.contains_key(&room),
+            "the lapse armed the debounce"
+        );
+        assert_eq!(sim.snapshot(&room), None, "inside the debounce: undecided");
+        sim.advance_to(sim.now + PEER_LEFT_DEBOUNCE_MS);
+        assert_eq!(
+            sim.pushes.len(),
+            1,
+            "the confirmed lapse pushes once, as a close"
+        );
+        assert_eq!(sim.read_confirmed_gone(&room), Some(ToldPresence::Absent));
+        assert_eq!(sim.snapshot(&room), Some(false));
+        assert_eq!(
+            sim.lastseen.get(&room).copied(),
+            Some(last_renewal),
+            "lastSeenMs is the lease's last renewal, not the time the list met it"
+        );
+        let body = presence_body_json(&room, sim.snapshot(&room), Some(last_renewal), None);
+        assert_eq!(body["present"], json!(false));
+        assert_eq!(body["lastSeenMs"], json!(last_renewal));
+
+        // A second tab still seated: the lapse of one session arms nothing.
+        let mut sim = PresenceSim {
+            now: 10_000,
+            ..Default::default()
+        };
+        sim.join(&room);
+        sim.join(&room);
+        sim.now = 10_000 + SOCKETIO_SUB_LEASE_MS;
+        sim.lease_lapse(&room, ID_A, 10_000);
+        assert!(sim.pending.is_empty());
+        assert_eq!(sim.snapshot(&room), Some(true));
+    }
+
+    /// Message box #20 (c): the idle window. An empty, unmarked room with no
+    /// pending departure answers `false` once its last stamp is a whole
+    /// window old, `null` before it, and `null` with no stamp at all (a room
+    /// nobody ever joined); a pending departure keeps the 0.3.25 and LOW #85
+    /// rules whatever the stamp.
+    #[test]
+    fn an_unmarked_empty_room_ages_to_false_past_the_idle_window() {
+        assert_eq!(PRESENCE_IDLE_WINDOW_MS, SOCKETIO_SUB_LEASE_MS);
+        let seen = 100_000;
+        let edge = seen + PRESENCE_IDLE_WINDOW_MS;
+        assert_eq!(
+            presence_answer(false, None, None, Some(seen), edge - 1),
+            None
+        );
+        assert_eq!(
+            presence_answer(false, None, None, Some(seen), edge),
+            Some(false)
+        );
+        assert_eq!(
+            presence_answer(false, None, Some(ToldPresence::Present), Some(seen), edge),
+            Some(false),
+            "a join's cleared marker does not keep an idle room undecided"
+        );
+        assert_eq!(presence_answer(false, None, None, None, edge * 10), None);
+        assert_eq!(
+            presence_answer(true, None, None, Some(seen), edge),
+            Some(true)
+        );
+        let armed = arm_departure_debounce("02bb", edge);
+        assert_eq!(
+            presence_answer(false, Some(&armed), None, Some(seen), edge + 1),
+            None,
+            "inside a debounce the room is undecided, however old its stamp"
+        );
+        let overdue = edge + 2 * PEER_LEFT_DEBOUNCE_MS + 1;
+        assert_eq!(
+            presence_answer(false, Some(&armed), None, Some(seen), overdue),
+            None,
+            "an overdue pending waits for its re-check (LOW #85)"
         );
     }
 
@@ -6058,6 +6193,72 @@ mod decouple_hub_tests {
         assert!(leg.contains("futures_util::future::join_all("));
         assert!(leg.contains("leg.timer(HUB_SESSION_PUSH_TIMEOUT_MS)"));
         let list = body_of(src, "async fn list_socketio_subscribers(");
-        assert!(list.contains("list_live_subscribers("));
+        assert!(list.contains("list_subscribers("));
+        // 0.8.2 (message box #20 (c)): the lapsed entries the list hands back
+        // arm their departures, on the one arm path a close takes.
+        assert!(list.contains("self.arm_lapsed_departures(&lapsed, &live)"));
+        let lapsed = body_of(src, "async fn arm_lapsed_departures(");
+        assert!(lapsed.contains("self.arm_departure(&d.room, &d.leaver)"));
+        assert!(!lapsed.contains("set_alarm("), "no alarm of its own");
+        let close = body_of(src, "async fn maybe_notify_peer_left(");
+        assert!(close.contains("self.arm_departure(room, leaver)"));
+    }
+
+    /// Message box #20 (c): an entry whose lease lapsed leaves the list as
+    /// before (deleted, logged) and comes back as lapsed, and the departure
+    /// it owes names its room, the room's owner as the leaver, and the
+    /// lease's last renewal as the last seen; a room another live entry or a
+    /// raw socket still holds owes nothing.
+    #[test]
+    fn a_lapsed_lease_owes_its_rooms_departure_with_its_last_renewal() {
+        let owner = format!("02{}", "ab".repeat(32));
+        let room = format!("{owner}-low_lobby_{}", "cd".repeat(32));
+        let shared = format!("{owner}-low_game_{}", "ef".repeat(32));
+        let leg = StubLeg::new(&[
+            (
+                "gone",
+                Reply::Delivered,
+                Some(1_000 + SOCKETIO_SUB_LEASE_MS),
+            ),
+            (
+                "live",
+                Reply::Delivered,
+                Some(50_000 + SOCKETIO_SUB_LEASE_MS),
+            ),
+        ]);
+        leg.registry
+            .borrow_mut()
+            .get_mut("gone")
+            .unwrap()
+            .joined_rooms = vec![room.clone(), shared.clone(), "not-an-owner-room".into()];
+        leg.registry
+            .borrow_mut()
+            .get_mut("live")
+            .unwrap()
+            .joined_rooms = vec![shared.clone()];
+        leg.clock.set(1_000 + SOCKETIO_SUB_LEASE_MS);
+        let (live, lapsed) = block_on(list_subscribers(&leg));
+        assert_eq!(live.len(), 1);
+        assert_eq!(lapsed.len(), 1);
+        assert!(!leg.has("gone"), "the lapsed entry is deleted as before");
+        leg.line("broadcast.hub.socketio_expired sid=gone");
+        let owed = lapsed_departures(&lapsed, &live, &[]);
+        assert_eq!(
+            owed,
+            vec![LapsedDeparture {
+                room: room.clone(),
+                leaver: owner.clone(),
+                last_seen_ms: 1_000,
+            }],
+            "the shared room is held by the live entry; the malformed room has no leaver"
+        );
+        assert!(
+            lapsed_departures(&lapsed, &live, std::slice::from_ref(&room)).is_empty(),
+            "a raw socket in the room holds it"
+        );
+        // Nothing lapses inside the lease.
+        let leg = StubLeg::new(&[("a", Reply::Delivered, Some(9_000))]);
+        leg.clock.set(8_999);
+        assert!(block_on(list_subscribers(&leg)).1.is_empty());
     }
 }
