@@ -303,6 +303,19 @@ const CONFIRMED_GONE_PREFIX: &str = "confirmed_gone:";
 /// departure, #225) and is unaffected by this delay.
 const PEER_LEFT_DEBOUNCE_MS: u64 = 4_000;
 
+/// 0.8.2 (message box #20 (c)): the idle window of a room's presence. An
+/// EMPTY room with no pending departure and no confirmed close, whose
+/// `lastseen:` (the last join, send, close, or lapsed lease's last renewal)
+/// is at least this old, answers `false` with that `lastSeenMs`, so the
+/// `null` class has an end a client can age. One socket.io lease
+/// (`SOCKETIO_SUB_LEASE_MS`, ten minutes): a live socket.io session renews
+/// its lease well inside it and a raw socket is read directly, so a room
+/// that held anyone inside the window still reads occupied or holds a fresher
+/// stamp. A room with no `lastseen:` at all (nobody ever joined: a lobby
+/// room probed before its host arrives) stays `null`: there is nothing to
+/// age.
+const PRESENCE_IDLE_WINDOW_MS: u64 = SOCKETIO_SUB_LEASE_MS;
+
 /// The identity-key prefix of an owner-prefixed room id
 /// (`<66-hex-identity>-<suffix>`), or `None` when the shape doesn't
 /// match. Mirrors `validate_room_owned`'s ownership model without
@@ -705,17 +718,29 @@ impl SocketIoLeg for WorkerSocketIoLeg {
 /// The registry's live entries (0.6.2): an expired entry is deleted and
 /// skipped (`broadcast.hub.socketio_expired`), so an evicted session's entry
 /// costs at most one list, never a wake; an entry written before 0.6.2 is
-/// stamped with one lease from now.
+/// stamped with one lease from now. The hub lists through
+/// `list_subscribers` (0.8.2); the pins read the live half here.
+#[cfg(test)]
 async fn list_live_subscribers<L: SocketIoLeg>(leg: &L) -> Vec<SocketIoRegistryEntry> {
+    list_subscribers(leg).await.0
+}
+
+/// The registry's live entries and the entries whose lease lapsed in this
+/// list (deleted, as `list_live_subscribers` says). 0.8.2 (message box #20
+/// (c)): a lapsed entry is a session that left without a close, so its rooms
+/// owe the departure a close would have armed (`lapsed_departures`).
+async fn list_subscribers<L: SocketIoLeg>(
+    leg: &L,
+) -> (Vec<SocketIoRegistryEntry>, Vec<SocketIoRegistryEntry>) {
     let now = leg.now_ms();
-    let mut out = Vec::new();
+    let (mut live, mut lapsed) = (Vec::new(), Vec::new());
     for mut entry in leg.entries().await {
         match lease_verdict(entry.expires_at_ms, now) {
-            LeaseVerdict::Live => out.push(entry),
+            LeaseVerdict::Live => live.push(entry),
             LeaseVerdict::Stamp(t) => {
                 entry.expires_at_ms = Some(t);
                 leg.put(&entry).await;
-                out.push(entry);
+                live.push(entry);
             }
             LeaseVerdict::Expired => {
                 leg.log(format!(
@@ -723,6 +748,58 @@ async fn list_live_subscribers<L: SocketIoLeg>(leg: &L) -> Vec<SocketIoRegistryE
                     entry.sid
                 ));
                 leg.delete(&entry.sid).await;
+                lapsed.push(entry);
+            }
+        }
+    }
+    (live, lapsed)
+}
+
+/// One departure a lapsed lease owes (0.8.2, message box #20 (c)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LapsedDeparture {
+    room: String,
+    /// The room's owner, the leaver of the eventual push (as the unregister
+    /// path reads it from the room's prefix).
+    leaver: String,
+    /// The lease's last renewal (its expiry less one lease): the last time
+    /// the relay knew the session alive, the honest "was here until T".
+    last_seen_ms: u64,
+}
+
+/// PURE (0.8.2, message box #20 (c)): the departures that lapsed entries
+/// owe. Each room a lapsed entry had joined, once, that no live entry and no
+/// raw socket (`raw_rooms`) still holds; a room whose prefix is not an
+/// identity is skipped (no leaver to name). Several lapsed entries in one
+/// room keep the latest renewal.
+fn lapsed_departures(
+    lapsed: &[SocketIoRegistryEntry],
+    live: &[SocketIoRegistryEntry],
+    raw_rooms: &[String],
+) -> Vec<LapsedDeparture> {
+    let mut out: Vec<LapsedDeparture> = Vec::new();
+    for entry in lapsed {
+        let last_seen_ms = entry
+            .expires_at_ms
+            .unwrap_or(0)
+            .saturating_sub(SOCKETIO_SUB_LEASE_MS)
+            .max(entry.registered_at_ms);
+        for room in &entry.joined_rooms {
+            let held =
+                raw_rooms.contains(room) || live.iter().any(|e| e.joined_rooms.contains(room));
+            let Some(leaver) = room_identity(room) else {
+                continue;
+            };
+            if held || !departure_signals(room, true) {
+                continue;
+            }
+            match out.iter_mut().find(|d| &d.room == room) {
+                Some(d) => d.last_seen_ms = d.last_seen_ms.max(last_seen_ms),
+                None => out.push(LapsedDeparture {
+                    room: room.clone(),
+                    leaver: leaver.to_string(),
+                    last_seen_ms,
+                }),
             }
         }
     }
@@ -2179,7 +2256,46 @@ impl MessageHub {
     /// message is already in D1; offline clients catch up via
     /// `listMessages`).
     async fn list_socketio_subscribers(&self) -> Vec<SocketIoRegistryEntry> {
-        list_live_subscribers(&self.socketio_leg()).await
+        let (live, lapsed) = list_subscribers(&self.socketio_leg()).await;
+        if !lapsed.is_empty() {
+            self.arm_lapsed_departures(&lapsed, &live).await;
+        }
+        live
+    }
+
+    /// 0.8.2 (message box #20 (c)): a socket.io entry whose lease lapsed is a
+    /// session that left without a close; each room it held that is now empty
+    /// arms the departure debounce exactly as a close does (`arm_departure`,
+    /// the same alarm path, no timer of its own), after stamping `lastseen:`
+    /// with the lease's last renewal (never later than what it holds). The
+    /// room's later reads are the debounce's: `null` inside the window, then
+    /// `false` once the alarm confirms it still empty. Occupancy is read from
+    /// the list in hand and the raw sockets, never by listing again.
+    async fn arm_lapsed_departures(
+        &self,
+        lapsed: &[SocketIoRegistryEntry],
+        live: &[SocketIoRegistryEntry],
+    ) {
+        let raw_rooms: Vec<String> = self
+            .state
+            .get_websockets()
+            .iter()
+            .filter_map(|ws| {
+                ws.deserialize_attachment::<SocketAttachment>()
+                    .ok()
+                    .flatten()
+            })
+            .flat_map(|a| a.joined_rooms)
+            .collect();
+        for d in lapsed_departures(lapsed, live, &raw_rooms) {
+            console_log!(
+                "TRACE_PHD presence.lease_lapsed room={} last_seen_ms={}",
+                d.room,
+                d.last_seen_ms
+            );
+            self.stamp_last_seen_at_least(&d.room, d.last_seen_ms).await;
+            self.arm_departure(&d.room, &d.leaver).await;
+        }
     }
 
     /// This hub's socket.io leg over its own storage and the
@@ -2242,6 +2358,20 @@ impl MessageHub {
             .put(&key, Date::now().as_millis())
             .await
         {
+            console_log!("MessageHub: last_seen put failed for {room}: {e}");
+        }
+    }
+
+    /// 0.8.2 (message box #20 (c)): stamp `lastseen:<room>` with `ms` unless
+    /// it already holds a later time (a lapsed lease's last renewal is older
+    /// than a send or join stamped since). Same fail-quiet discipline.
+    async fn stamp_last_seen_at_least(&self, room: &str, ms: u64) {
+        let key = format!("{LAST_SEEN_PREFIX}{room}");
+        let held: Option<u64> = self.state.storage().get(&key).await.ok().flatten();
+        if held.is_some_and(|t| t >= ms) {
+            return;
+        }
+        if let Err(e) = self.state.storage().put(&key, ms).await {
             console_log!("MessageHub: last_seen put failed for {room}: {e}");
         }
     }
@@ -2356,47 +2486,56 @@ impl MessageHub {
             {
                 continue; // another tab/device of the same identity is still seated
             }
-            // Presence-flap debounce: arm (or re-arm — trailing edge) the
-            // single pending entry for this room and make sure the DO
-            // alarm rings no later than its due time. The alarm handler
-            // (`run_departure_debounce_alarm`) re-checks occupancy and
-            // pushes at most once.
-            let entry = arm_departure_debounce(leaver, Date::now().as_millis());
-            let due_at_ms = entry.due_at_ms;
-            let key = format!("{PENDING_LEFT_PREFIX}{room}");
-            if let Err(e) = self.state.storage().put(&key, entry).await {
-                // Can't persist the pending entry — the trailing check
-                // would never fire and a REAL departure would go silent
-                // forever. Fall back to the pre-debounce immediate push:
-                // a rare flap false-positive (absorbed by the client's
-                // verify) beats a permanently missed departure. Delete
-                // any PRIOR pending entry for this room first — the put
-                // failed, so a stale earlier-departure entry may still
-                // be stored, and left in place it would fire a SECOND
-                // push at its original due time on top of this
-                // immediate one.
-                console_log!(
-                    "MessageHub: pendingleft put failed for {room} ({e}) — \
-                     falling back to immediate peerLeft push"
-                );
-                let _ = self.state.storage().delete(&key).await;
-                self.push_peer_left(room, leaver).await;
-                continue;
-            }
-            if !self.ensure_alarm_no_later_than(due_at_ms).await {
-                // Entry stored but NO wake guaranteed — without an alarm
-                // the trailing check never runs and the entry strands
-                // (recoverable only by the next departure or the
-                // fetch-time re-arm scan, i.e. poll latency for the
-                // peer). Same reasoning as the put failure above:
-                // un-store and push immediately.
-                console_log!(
-                    "MessageHub: alarm arm failed for {room} — \
-                     falling back to immediate peerLeft push"
-                );
-                let _ = self.state.storage().delete(&key).await;
-                self.push_peer_left(room, leaver).await;
-            }
+            self.arm_departure(room, leaver).await;
+        }
+    }
+
+    /// Arm (or re-arm) the departure debounce for `room`, whose last session
+    /// `leaver`'s departure left it empty: the pending entry and an alarm no
+    /// later than its due time, or the immediate push when either cannot be
+    /// stored. The one arm path of a close, a leave and (0.8.2) a lapsed
+    /// lease.
+    async fn arm_departure(&self, room: &str, leaver: &str) {
+        // Presence-flap debounce: arm (or re-arm: trailing edge) the
+        // single pending entry for this room and make sure the DO
+        // alarm rings no later than its due time. The alarm handler
+        // (`run_departure_debounce_alarm`) re-checks occupancy and
+        // pushes at most once.
+        let entry = arm_departure_debounce(leaver, Date::now().as_millis());
+        let due_at_ms = entry.due_at_ms;
+        let key = format!("{PENDING_LEFT_PREFIX}{room}");
+        if let Err(e) = self.state.storage().put(&key, entry).await {
+            // Can't persist the pending entry: the trailing check
+            // would never fire and a REAL departure would go silent
+            // forever. Fall back to the pre-debounce immediate push:
+            // a rare flap false-positive (absorbed by the client's
+            // verify) beats a permanently missed departure. Delete
+            // any PRIOR pending entry for this room first; the put
+            // failed, so a stale earlier-departure entry may still
+            // be stored, and left in place it would fire a SECOND
+            // push at its original due time on top of this
+            // immediate one.
+            console_log!(
+                "MessageHub: pendingleft put failed for {room} ({e}); \
+                 falling back to immediate peerLeft push"
+            );
+            let _ = self.state.storage().delete(&key).await;
+            self.push_peer_left(room, leaver).await;
+            return;
+        }
+        if !self.ensure_alarm_no_later_than(due_at_ms).await {
+            // Entry stored but NO wake guaranteed: without an alarm
+            // the trailing check never runs and the entry strands
+            // (recoverable only by the next departure or the
+            // fetch-time re-arm scan, i.e. poll latency for the
+            // peer). Same reasoning as the put failure above:
+            // un-store and push immediately.
+            console_log!(
+                "MessageHub: alarm arm failed for {room}; \
+                 falling back to immediate peerLeft push"
+            );
+            let _ = self.state.storage().delete(&key).await;
+            self.push_peer_left(room, leaver).await;
         }
     }
 
@@ -3234,15 +3373,10 @@ impl MessageHub {
                 self.ensure_alarm_no_later_than(p.due_at_ms).await;
             }
         }
-        let present = presence_answer(
-            occupied,
-            pending.as_ref(),
-            confirmed_gone,
-            Date::now().as_millis(),
-        );
         // Advisory last-seen: read `lastseen:<room>` (u64 millis) and
         // thread it through ONLY when present. A missing/unreadable key
         // omits the field entirely — never 0/null, never a false claim.
+        // 0.8.2: it also ages an unmarked empty room (`PRESENCE_IDLE_WINDOW_MS`).
         let last_seen_ms: Option<u64> = self
             .state
             .storage()
@@ -3250,6 +3384,13 @@ impl MessageHub {
             .await
             .ok()
             .flatten();
+        let present = presence_answer(
+            occupied,
+            pending.as_ref(),
+            confirmed_gone,
+            last_seen_ms,
+            Date::now().as_millis(),
+        );
         // Tier-2 stayer-published rejoin deadline: read `rejoindeadline:<room>`
         // (u64 millis) verbatim and thread it through ONLY when present. The
         // relay does NOT judge past-vs-future — that's the client's call. A
@@ -3370,10 +3511,17 @@ fn presence_body_json(
 ///
 /// A genuinely killed peer is still caught: its debounce fires still-empty →
 /// `confirmed_gone = Absent` → a survivor joining later reads `false`.
+///
+/// 0.8.2 (message box #20 (c)): an empty room with NO pending departure and
+/// no confirmed close whose `last_seen_ms` is at least
+/// `PRESENCE_IDLE_WINDOW_MS` old is `Some(false)`: idle past the window,
+/// nobody can be seated unseen (the caller threads that `lastSeenMs`). With
+/// no stamp at all it stays `None`.
 fn presence_answer(
     occupied: bool,
     pending: Option<&PendingPeerLeft>,
     confirmed_gone: Option<ToldPresence>,
+    last_seen_ms: Option<u64>,
     now_ms: u64,
 ) -> Option<bool> {
     if occupied {
@@ -3386,7 +3534,13 @@ fn presence_answer(
     }
     match confirmed_gone {
         Some(ToldPresence::Absent) => Some(false), // a CONFIRMED close
-        _ => None,                                 // nothing confirms a departure
+        _ if pending.is_none()
+            && last_seen_ms
+                .is_some_and(|t| now_ms >= t.saturating_add(PRESENCE_IDLE_WINDOW_MS)) =>
+        {
+            Some(false) // idle past the window (0.8.2)
+        }
+        _ => None, // nothing confirms a departure
     }
 }
 
