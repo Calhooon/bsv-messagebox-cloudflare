@@ -47,6 +47,8 @@ pub mod payments;
 mod permissions;
 /// The presence read's hops and counts (0.8.2, message box #20).
 mod presence;
+/// The presence read's counters per reason (0.8.2, message box #20 (e)).
+mod presence_counters;
 mod r2_presign;
 
 // Durable Objects (M9)
@@ -147,6 +149,8 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // from here (`req`, `send.answered` on `/sendMessage` and `/push` alike;
     // 0.6.1, R1 L4).
     let t_req_start = Date::now().as_millis();
+    // The presence counters' `sinceMs`: this isolate's first request.
+    presence_counters::PRESENCE_COUNTERS.mark_start(t_req_start);
     // The hub store's router (0.8.1): a HUB_STORE that is not kv, sql or
     // kv-drain refuses the boot, every request a typed 500 naming the var,
     // never a silent kv (`hub_store`).
@@ -438,6 +442,13 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // takes the full BRC-104 path exactly as before.
     let mut req = req;
     let lane = session_lane_auth(&mut req, &env).await;
+    // The door's one 503 is `hub-unavailable` (its refusals are 401s);
+    // counted here, outside the door, for the health answer's presence
+    // figure (0.8.2, message box #20 (e)).
+    if matches!(&lane, Some(Err(refusal)) if refusal.status_code() == 503) {
+        presence_counters::PRESENCE_COUNTERS
+            .count(presence_counters::PresenceReason::HubUnavailable);
+    }
     let (identity_key, req, session, request_body, lane_seal) = match lane {
         Some(Ok(auth)) => (
             auth.identity,
@@ -496,6 +507,9 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
                     health["fees"] = fees;
                 }
             }
+            // The presence read's counts per reason, this isolate's since it
+            // started (0.8.2, message box #20 (e); `presence_counters::PresenceCounters`).
+            health["presence"] = presence_counters::PRESENCE_COUNTERS.health_json();
             (health, 200)
         }
         (Method::Post, "/sendMessage") => {
@@ -1238,6 +1252,7 @@ async fn handle_presence_route(url: &Url, env: &Env) -> (serde_json::Value, u16)
     }
     let verdict = presence::read_presence(&WorkerPresenceHub { env }, owner, &room).await;
     presence::log_presence_verdict(&verdict, &room, |line| console_log!("{line}"));
+    presence_counters::count_presence_verdict(&presence_counters::PRESENCE_COUNTERS, &verdict);
     presence_route_response(&room, &PresenceRead::from(&verdict))
 }
 
