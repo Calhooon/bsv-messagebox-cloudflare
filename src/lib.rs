@@ -2318,10 +2318,16 @@ mod push_route_tests {
 #[cfg(test)]
 mod presence_route_tests {
     use super::*;
+    use crate::presence::{
+        classify_hub_answer, presence_retry_after, presence_trace_reason, read_presence, HubAnswer,
+        HubVerdict, PresenceHop, PresenceHub, PRESENCE_RETRY_AFTER_SECS,
+    };
+    use crate::presence_counters::{count_presence_verdict, PresenceCounters, PresenceReason};
+    use crate::routes::send_message::test_hub::block_on;
     use bsv_rs::primitives::sha256;
 
     fn answered(
-        present: bool,
+        present: Option<bool>,
         last_seen_ms: Option<u64>,
         rejoin_deadline_ms: Option<u64>,
     ) -> PresenceRead {
@@ -2332,31 +2338,87 @@ mod presence_route_tests {
         }
     }
 
+    fn fault(hop: PresenceHop) -> PresenceRead {
+        PresenceRead::HubFault {
+            hop,
+            hub_status: (hop == PresenceHop::Status).then_some(500),
+        }
+    }
+
+    /// A hub behind the seam that hands back one fixed answer.
+    struct StubHub(HubAnswer);
+
+    impl PresenceHub for StubHub {
+        async fn ask(&self, _owner: &str, _room: &str) -> HubAnswer {
+            self.0.clone()
+        }
+    }
+
+    /// The route's pure tail over a stub hub: the read, the counter, the
+    /// response, and the `Retry-After` `handle` sets.
+    fn route_over(
+        hub: StubHub,
+        counters: &PresenceCounters,
+    ) -> (serde_json::Value, u16, Option<&'static str>) {
+        let verdict = block_on(read_presence(&hub, "03aa", "03aa-inbox"));
+        count_presence_verdict(counters, &verdict);
+        let (body, status) = presence_route_response("03aa-inbox", &PresenceRead::from(&verdict));
+        let retry = presence_retry_after(&body, status);
+        (body, status, retry)
+    }
+
+    /// Every hop of (b) as the hub's leg would hand it back.
+    fn hop_answers() -> Vec<(PresenceHop, HubAnswer)> {
+        vec![
+            (
+                PresenceHop::Namespace,
+                Err((PresenceHop::Namespace, "binding missing".into())),
+            ),
+            (
+                PresenceHop::Stub,
+                Err((PresenceHop::Stub, "id_from_name failed".into())),
+            ),
+            (
+                PresenceHop::Fetch,
+                Err((
+                    PresenceHop::Fetch,
+                    "Durable Object is overloaded. Too many requests queued.".into(),
+                )),
+            ),
+            (
+                PresenceHop::Status,
+                Ok((500, Ok(json!({ "present": true })))),
+            ),
+            (
+                PresenceHop::Body,
+                Ok((200, Err("expected value at line 1 column 1".into()))),
+            ),
+            (
+                PresenceHop::Present,
+                Ok((200, Ok(json!({ "present": "yes" })))),
+            ),
+        ]
+    }
+
     #[test]
     fn presence_route_omits_last_seen_when_unset() {
         // Advisory contract at the public edge: an absent heartbeat
         // OMITS `lastSeenMs` (never 0/null) and never affects `present`.
-        // With no tier-2 deadline either, `rejoinDeadlineMs` is likewise absent.
-        let (body, status) = presence_route_response("03aa-inbox", &answered(true, None, None));
+        let (body, status) =
+            presence_route_response("03aa-inbox", &answered(Some(true), None, None));
         assert_eq!(status, 200);
         assert_eq!(body["status"], "success");
         assert_eq!(body["room"], "03aa-inbox");
         assert_eq!(body["present"], json!(true));
-        assert!(
-            body.get("lastSeenMs").is_none(),
-            "lastSeenMs must be omitted when unset, got: {body}"
-        );
-        assert!(
-            body.get("rejoinDeadlineMs").is_none(),
-            "rejoinDeadlineMs must be omitted when unset, got: {body}"
-        );
+        assert!(body.get("lastSeenMs").is_none(), "got: {body}");
+        assert!(body.get("rejoinDeadlineMs").is_none(), "got: {body}");
     }
 
     #[test]
     fn presence_route_threads_last_seen_when_set() {
         let (body, status) = presence_route_response(
             "03aa-inbox",
-            &answered(false, Some(1_700_000_000_123), None),
+            &answered(Some(false), Some(1_700_000_000_123), None),
         );
         assert_eq!(status, 200);
         assert_eq!(body["present"], json!(false));
@@ -2366,92 +2428,274 @@ mod presence_route_tests {
 
     #[test]
     fn presence_route_threads_rejoin_deadline_when_set() {
-        // Tier-2: the stayer-published deadline is threaded through as a
-        // number, independent of the heartbeat and of `present`.
-        let (body, _) =
-            presence_route_response("03aa-inbox", &answered(true, None, Some(1_700_000_060_000)));
-        assert_eq!(body["present"], json!(true));
-        assert_eq!(body["rejoinDeadlineMs"], json!(1_700_000_060_000u64));
-        assert!(
-            body.get("lastSeenMs").is_none(),
-            "lastSeenMs stays omitted when only the deadline is set, got: {body}"
-        );
-    }
-
-    #[test]
-    fn presence_route_threads_both_last_seen_and_rejoin_deadline() {
         let (body, _) = presence_route_response(
             "03aa-inbox",
-            &answered(false, Some(1_700_000_000_123), Some(1_700_000_060_000)),
+            &answered(Some(true), None, Some(1_700_000_060_000)),
         );
-        assert_eq!(body["lastSeenMs"], json!(1_700_000_000_123u64));
+        assert_eq!(body["present"], json!(true));
         assert_eq!(body["rejoinDeadlineMs"], json!(1_700_000_060_000u64));
+        assert!(body.get("lastSeenMs").is_none(), "got: {body}");
     }
 
-    /// #313 H1 — the whole point. A hub fault must not be spelled like an
-    /// absence: no `present` key exists to be misread, and the status is a
-    /// 5xx so even a caller that never parses the body cannot mistake it for
-    /// an answer.
+    /// #313 H1, kept: a hub fault must not be spelled like an absence. No
+    /// `present` key exists to be misread, the status is a 5xx, and since
+    /// 0.8.2 the body names the hop.
     #[test]
     fn hub_fault_carries_no_present_key_and_a_503() {
-        let (body, status) = presence_route_response("03aa-inbox", &PresenceRead::HubFault);
-        assert_eq!(status, 503, "a hub fault is not a successful read");
-        assert!(
-            body.get("present").is_none(),
-            "a hub fault must carry NO `present` key — an absent field is \
-             unrepresentable as `false`, a flag beside one is not. Got: {body}"
-        );
-        assert_eq!(body["status"], "error");
-        assert_eq!(body["code"], "ERR_PRESENCE_UNAVAILABLE");
-        assert_eq!(body["room"], "03aa-inbox");
+        for hop in PresenceHop::ALL {
+            let (body, status) = presence_route_response("03aa-inbox", &fault(hop));
+            assert_eq!(status, 503, "a hub fault is not a successful read");
+            assert!(body.get("present").is_none(), "got: {body}");
+            assert_eq!(body["status"], "error");
+            assert_eq!(body["code"], "ERR_PRESENCE_UNAVAILABLE");
+            assert_eq!(body["hop"], hop.as_str());
+            assert_eq!(body["room"], "03aa-inbox");
+            assert_eq!(
+                body.get("hubStatus").is_some(),
+                hop == PresenceHop::Status,
+                "hubStatus rides the status hop only: {body}"
+            );
+        }
     }
 
-    /// The two states must be DISTINGUISHABLE on the wire — not just
-    /// differently-worded. A genuine absence and a hub fault share no
-    /// (status, present-key) pair.
+    /// The states are DISTINGUISHABLE on the wire: a genuine absence, the
+    /// hub's undecided answer and a fault share no (status, present) pair.
     #[test]
-    fn genuine_absence_and_hub_fault_are_distinguishable() {
-        let (absent_body, absent_status) =
-            presence_route_response("03aa-inbox", &answered(false, None, None));
+    fn absence_undecided_and_fault_are_distinguishable() {
+        let (absent, absent_status) =
+            presence_route_response("03aa-inbox", &answered(Some(false), None, None));
+        let (undecided, undecided_status) =
+            presence_route_response("03aa-inbox", &answered(None, None, None));
         let (fault_body, fault_status) =
-            presence_route_response("03aa-inbox", &PresenceRead::HubFault);
+            presence_route_response("03aa-inbox", &fault(PresenceHop::Fetch));
+        assert_eq!(absent_status, 200);
+        assert_eq!(undecided_status, 200);
         assert_ne!(absent_status, fault_status);
-        assert_eq!(absent_body["present"], json!(false));
+        assert_eq!(absent["present"], json!(false));
+        assert_eq!(undecided["present"], serde_json::Value::Null);
+        assert!(
+            undecided.as_object().unwrap().contains_key("present"),
+            "the undecided answer carries `present: null`, not a missing key"
+        );
         assert!(fault_body.get("present").is_none());
     }
 
-    // ── the CROSS-REPO agreement pin (#313, epoch Rule 16) ─────────────────
+    /// Message box #20 (d): the hub's 200 `{"present": null}` is its own
+    /// answer, a 200 `present: null` under `presenceWire: 2`, never
+    /// `ERR_PRESENCE_UNAVAILABLE`, and it carries no `Retry-After`.
+    #[test]
+    fn a_hub_answering_null_is_a_200_null_never_unavailable() {
+        let counters = PresenceCounters::new();
+        let hub = StubHub(Ok((
+            200,
+            Ok(json!({ "room": "03aa-inbox", "present": null })),
+        )));
+        let (body, status, retry) = route_over(hub, &counters);
+        assert_eq!(status, 200, "got: {body}");
+        assert_ne!(body["code"], "ERR_PRESENCE_UNAVAILABLE");
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["present"], serde_json::Value::Null);
+        assert_eq!(body["presenceWire"], json!(2));
+        assert_eq!(retry, None);
+        assert_eq!(presence_trace_reason(&body, status), Some("null"));
+        assert_eq!(counters.get(PresenceReason::Null), 1);
+        for hop in PresenceHop::ALL {
+            assert_eq!(counters.get(PresenceReason::Hop(hop)), 0);
+        }
+    }
+
+    /// The hub's `null` with its last-seen stamp keeps the stamp.
+    #[test]
+    fn a_hub_null_threads_its_last_seen() {
+        let counters = PresenceCounters::new();
+        let hub = StubHub(Ok((
+            200,
+            Ok(json!({ "present": null, "lastSeenMs": 1_700_000_000_123u64 })),
+        )));
+        let (body, status, _) = route_over(hub, &counters);
+        assert_eq!(status, 200);
+        assert_eq!(body["lastSeenMs"], json!(1_700_000_000_123u64));
+    }
+
+    /// The hub's decided answers are 200s as before, under `presenceWire: 2`,
+    /// with no `reason=` and no counter.
+    #[test]
+    fn the_hubs_booleans_stay_answers_under_wire_2() {
+        for present in [true, false] {
+            let counters = PresenceCounters::new();
+            let hub = StubHub(Ok((200, Ok(json!({ "present": present })))));
+            let (body, status, retry) = route_over(hub, &counters);
+            assert_eq!(status, 200);
+            assert_eq!(body["present"], json!(present));
+            assert_eq!(body["presenceWire"], json!(2));
+            assert_eq!(retry, None);
+            assert_eq!(presence_trace_reason(&body, status), None);
+            assert_eq!(counters.get(PresenceReason::Null), 0);
+        }
+    }
+
+    /// Message box #20 (b): each hop that fails is its own 503, naming the
+    /// hop, with the `Retry-After`, the `reason=` of its `TRACE_LAT` line, one
+    /// `TRACE_PRESENCE` line, and its own counter.
+    #[test]
+    fn each_hop_is_its_named_503_with_retry_after_and_its_counter() {
+        let counters = PresenceCounters::new();
+        for (n, (hop, answer)) in hop_answers().into_iter().enumerate() {
+            let verdict = classify_hub_answer(answer.clone());
+            let mut lines = Vec::new();
+            crate::presence::log_presence_verdict(&verdict, "03aa-inbox", |l| lines.push(l));
+            assert_eq!(lines.len(), 1, "one log line per fault");
+            assert!(
+                lines[0].starts_with(&format!("TRACE_PRESENCE hop={} err=", hop.as_str())),
+                "{}",
+                lines[0]
+            );
+            assert!(lines[0].ends_with(" room=03aa-inbox"), "{}", lines[0]);
+            let (body, status, retry) = route_over(StubHub(answer), &counters);
+            assert_eq!(status, 503, "hop {hop:?}: {body}");
+            assert_eq!(body["code"], "ERR_PRESENCE_UNAVAILABLE");
+            assert_eq!(body["hop"], hop.as_str());
+            assert_eq!(retry, Some(PRESENCE_RETRY_AFTER_SECS));
+            assert_eq!(presence_trace_reason(&body, status), Some(hop.as_str()));
+            assert_eq!(counters.get(PresenceReason::Hop(hop)), 1);
+            let total: u64 = PresenceHop::ALL
+                .iter()
+                .map(|h| counters.get(PresenceReason::Hop(*h)))
+                .sum();
+            assert_eq!(total, n as u64 + 1, "only this hop's counter moved");
+        }
+        assert_eq!(counters.get(PresenceReason::Null), 0);
+    }
+
+    /// The status is read before the body: a non-200 whose body says
+    /// `present: true` is the `status` hop, its code on the answer.
+    #[test]
+    fn the_hubs_status_is_read_before_its_body() {
+        let v = classify_hub_answer(Ok((503, Ok(json!({ "present": true })))));
+        assert_eq!(
+            v,
+            HubVerdict::Fault {
+                hop: PresenceHop::Status,
+                hub_status: Some(503),
+                err: "hub status 503".into()
+            }
+        );
+        let (body, _) = presence_route_response("03aa-inbox", &PresenceRead::from(&v));
+        assert_eq!(body["hubStatus"], json!(503));
+        // A missing `present` is the `present` hop, not an undecided answer.
+        let v = classify_hub_answer(Ok((200, Ok(json!({ "room": "03aa-inbox" })))));
+        assert!(matches!(
+            v,
+            HubVerdict::Fault {
+                hop: PresenceHop::Present,
+                ..
+            }
+        ));
+    }
+
+    /// Message box #20 (e): the health figure names every reason, the
+    /// session lane's `hub-unavailable` among them, and its scope.
+    #[test]
+    fn the_health_figure_counts_per_reason_in_its_isolate() {
+        let counters = PresenceCounters::new();
+        counters.mark_start(1_700_000_000_000);
+        counters.mark_start(1_800_000_000_000);
+        counters.count(PresenceReason::HubUnavailable);
+        counters.count(PresenceReason::HubUnavailable);
+        counters.count(PresenceReason::Null);
+        counters.count(PresenceReason::Hop(PresenceHop::Fetch));
+        let h = counters.health_json();
+        assert_eq!(h["scope"], "isolate");
+        assert_eq!(
+            h["sinceMs"],
+            json!(1_700_000_000_000u64),
+            "the first mark holds"
+        );
+        let counts = h["counts"].as_object().unwrap();
+        let mut names: Vec<&str> = counts.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "body",
+                "fetch",
+                "hubUnavailable",
+                "namespace",
+                "null",
+                "present",
+                "status",
+                "stub"
+            ]
+        );
+        assert_eq!(counts["hubUnavailable"], json!(2));
+        assert_eq!(counts["null"], json!(1));
+        assert_eq!(counts["fetch"], json!(1));
+        assert_eq!(counts["status"], json!(0));
+    }
+
+    /// The `reason=` field is the presence route's only: a send's 503 or
+    /// another route's 200 names none.
+    #[test]
+    fn the_trace_reason_reads_only_presence_answers() {
+        let d1 = json!({ "status": "error", "code": "ERR_D1_UNAVAILABLE" });
+        assert_eq!(presence_trace_reason(&d1, 503), None);
+        assert_eq!(presence_retry_after(&d1, 503), None);
+        let ok = json!({ "status": "success" });
+        assert_eq!(presence_trace_reason(&ok, 200), None);
+    }
+
+    // -- the CROSS-REPO agreement pins (#313, epoch Rule 16) ------------------
     //
-    // `tests/fixtures/presence-wire-v1.json` is the shared artifact between
-    // this relay and the LOW client (bsv-low `app/src/lib/fixtures/` holds a
-    // byte-identical copy). THIS test drives the REAL producer through every
-    // case and asserts the emitted (status, body) equals the fixture's; the
-    // client's test drives those SAME bytes through its real consumer. The
-    // sha256 below is asserted in BOTH repos, so a one-sided edit turns both
-    // gates red instead of silently splitting the two beliefs apart.
+    // `tests/fixtures/presence-wire-v1.json` is the record of v1 (bsv-low
+    // `app/src/lib/fixtures/` holds a byte-identical copy); its bytes stay
+    // pinned. `presence-wire-v2.json` is the agreement from 0.8.2: THIS test
+    // drives the REAL producer through every case and asserts the emitted
+    // (status, body, Retry-After) equals the fixture's; the client's test
+    // drives the SAME bytes through its real consumer. Each sha256 is asserted
+    // in both repos once the client takes the file.
     const PRESENCE_WIRE_V1_SHA256: &str =
         "471c19a3b347a508b794699c5ff21c621427b06805ca81751bf4f527460937f5";
     const PRESENCE_WIRE_V1: &str = include_str!("../tests/fixtures/presence-wire-v1.json");
+    const PRESENCE_WIRE_V2_SHA256: &str =
+        "73bda74a62df89aa10299f2c500434469c152821dc9802c68faf3fb2d8914640";
+    const PRESENCE_WIRE_V2: &str = include_str!("../tests/fixtures/presence-wire-v2.json");
 
     #[test]
-    fn presence_wire_fixture_is_the_pinned_bytes() {
-        let digest = hex::encode(sha256(PRESENCE_WIRE_V1.as_bytes()));
+    fn presence_wire_fixtures_are_the_pinned_bytes() {
         assert_eq!(
-            digest, PRESENCE_WIRE_V1_SHA256,
-            "presence-wire-v1.json changed. This file is a CROSS-REPO agreement: \
+            hex::encode(sha256(PRESENCE_WIRE_V1.as_bytes())),
+            PRESENCE_WIRE_V1_SHA256,
+            "presence-wire-v1.json is the record of v1 and never changes"
+        );
+        assert_eq!(
+            hex::encode(sha256(PRESENCE_WIRE_V2.as_bytes())),
+            PRESENCE_WIRE_V2_SHA256,
+            "presence-wire-v2.json changed. This file is a CROSS-REPO agreement: \
              update bsv-low's copy to the identical bytes and the constant in \
              BOTH repos' tests, or the two sides have silently diverged."
         );
     }
 
+    /// v1's record: this relay no longer emits its answers (they say
+    /// `presenceWire: 1`), and the one change between the versions is the
+    /// marker, `null`, and the fault's hop.
     #[test]
-    fn real_producer_emits_the_fixture_bytes_for_every_case() {
+    fn this_relay_no_longer_emits_the_v1_answers() {
         let fixture: serde_json::Value = serde_json::from_str(PRESENCE_WIRE_V1).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            if case["status"] == 200 && case["body"].get("presenceWire").is_some() {
+                assert_eq!(case["body"]["presenceWire"], json!(1));
+            }
+        }
+        assert_eq!(PRESENCE_WIRE_VERSION, 2);
+    }
+
+    #[test]
+    fn real_producer_emits_the_v2_fixture_bytes_for_every_case() {
+        let fixture: serde_json::Value = serde_json::from_str(PRESENCE_WIRE_V2).unwrap();
         let cases = fixture["cases"].as_array().expect("cases[]");
-        assert!(cases.len() >= 7, "the fixture lost cases");
         let default_room = fixture["room"].as_str().expect("room");
-        let mut saw_hub_fault = false;
-        let mut saw_legacy = false;
+        let (mut saw_null, mut saw_hops, mut saw_legacy) = (false, 0, false);
         for case in cases {
             let name = case["name"].as_str().unwrap();
             let p = &case["producer"];
@@ -2460,35 +2704,49 @@ mod presence_route_tests {
                 .and_then(|v| v.as_str())
                 .unwrap_or(default_room);
             let (body, status) = match p["kind"].as_str().unwrap() {
-                "answered" => presence_route_response(
-                    room,
-                    &answered(
-                        p["present"].as_bool().unwrap(),
-                        p.get("lastSeenMs").and_then(|v| v.as_u64()),
-                        p.get("rejoinDeadlineMs").and_then(|v| v.as_u64()),
-                    ),
-                ),
+                "answered" => {
+                    let present = p["present"].as_bool();
+                    saw_null |= present.is_none();
+                    presence_route_response(
+                        room,
+                        &answered(
+                            present,
+                            p.get("lastSeenMs").and_then(|v| v.as_u64()),
+                            p.get("rejoinDeadlineMs").and_then(|v| v.as_u64()),
+                        ),
+                    )
+                }
                 "hub-fault" => {
-                    saw_hub_fault = true;
-                    presence_route_response(room, &PresenceRead::HubFault)
+                    saw_hops += 1;
+                    let hop = PresenceHop::ALL
+                        .into_iter()
+                        .find(|h| p["hop"] == h.as_str())
+                        .expect("a named hop");
+                    presence_route_response(
+                        room,
+                        &PresenceRead::HubFault {
+                            hop,
+                            hub_status: p
+                                .get("hubStatus")
+                                .and_then(|v| v.as_u64())
+                                .map(|s| s as u16),
+                        },
+                    )
                 }
                 "invalid-room" => presence_invalid_room_response(),
-                // A shape this relay must NEVER emit again: the pre-#313
-                // un-marked `present:false`. The client keeps a case for it
-                // (version skew — an old relay is still reachable), so the
-                // assertion here is the mirror image: prove we don't emit it.
+                // Shapes this relay must NEVER emit: the pre-#313 unmarked
+                // `present:false` and a v1 relay's answer. The client keeps
+                // them (version skew); here the assertion is the mirror.
                 "never-emitted-by-this-relay" => {
                     saw_legacy = true;
                     for read in [
-                        answered(false, None, None),
-                        answered(true, None, None),
-                        PresenceRead::HubFault,
+                        answered(Some(false), None, None),
+                        answered(Some(true), None, None),
+                        answered(None, None, None),
+                        fault(PresenceHop::Fetch),
                     ] {
                         let (emitted, _) = presence_route_response(room, &read);
-                        assert_ne!(
-                            emitted, case["body"],
-                            "case {name} is supposed to be UNREACHABLE from this producer"
-                        );
+                        assert_ne!(emitted, case["body"], "case {name} is unreachable here");
                     }
                     continue;
                 }
@@ -2500,29 +2758,29 @@ mod presence_route_tests {
                 "status mismatch for case {name}"
             );
             assert_eq!(body, case["body"], "body mismatch for case {name}");
+            assert_eq!(
+                presence_retry_after(&body, status).map(serde_json::Value::from),
+                Some(case["retryAfter"].clone()).filter(|v| !v.is_null()),
+                "Retry-After mismatch for case {name}"
+            );
         }
-        assert!(
-            saw_hub_fault,
-            "the fixture must keep a hub-fault case — it is the #313 H1 pin"
-        );
-        assert!(
-            saw_legacy,
-            "the fixture must keep the pre-#313 un-marked absence — it is the \
-             version-skew pin the client's away tag depends on"
-        );
+        assert!(saw_null, "the fixture must keep the hub's null answer");
+        assert_eq!(saw_hops, 6, "the fixture must keep one fault per hop");
+        assert!(saw_legacy, "the fixture must keep the version-skew cases");
     }
 
-    /// The marker rides the ANSWER only. A fault body carrying it would let a
-    /// client believe a fabricated read was a real one.
+    /// The marker rides the ANSWER only, `null` included. A fault body
+    /// carrying it would let a client believe a fabricated read was a real one.
     #[test]
     fn the_wire_marker_rides_answers_only() {
-        let (answer, _) = presence_route_response("03aa-inbox", &answered(false, None, None));
-        assert_eq!(answer["presenceWire"], json!(PRESENCE_WIRE_VERSION));
-        let (fault, _) = presence_route_response("03aa-inbox", &PresenceRead::HubFault);
-        assert!(
-            fault.get("presenceWire").is_none(),
-            "the fault body must not claim the answer contract: {fault}"
-        );
+        for present in [Some(true), Some(false), None] {
+            let (answer, _) = presence_route_response("03aa-inbox", &answered(present, None, None));
+            assert_eq!(answer["presenceWire"], json!(PRESENCE_WIRE_VERSION));
+        }
+        for hop in PresenceHop::ALL {
+            let (fault_body, _) = presence_route_response("03aa-inbox", &fault(hop));
+            assert!(fault_body.get("presenceWire").is_none(), "{fault_body}");
+        }
         let (invalid, _) = presence_invalid_room_response();
         assert!(invalid.get("presenceWire").is_none());
     }
