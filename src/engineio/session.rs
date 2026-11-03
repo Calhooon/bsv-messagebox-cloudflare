@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use worker::*;
 
+use crate::engineio::attach::{AttachPort, Commit as AttachCommit, Gate as AttachGate, HubFault};
 use crate::engineio::auth::{
     self, build_outbound_general, encode_event_payload, make_wallet, session_from_initial_response,
     AuthOutcome, SessionAuthState,
@@ -57,7 +58,7 @@ use crate::engineio::codec::{
     decode_polling_batch, encode_polling_batch, EngineIoPacket, SocketIoPacket,
 };
 use crate::session_lane::{
-    AttachEnd, Frame as LaneFrame, MirrorUpdate, Refusal as LaneRefusal, SessionLane,
+    Frame as LaneFrame, LineLevel, MirrorUpdate, Refusal as LaneRefusal, SessionLane,
 };
 
 /// How long a polling GET waits for the queue to fill before returning
@@ -772,11 +773,18 @@ impl DurableObject for EngineIoSession {
         // blank `SessionState`, dropping `connected`/`auth`/etc. and
         // breaking the EVENT-before-CONNECT guard plus all signed
         // emits.
-        let attachment = match ws.deserialize_attachment::<WsAttachment>()? {
-            Some(a) if !a.sid.is_empty() => a,
-            _ => {
-                console_error!("EngineIoSession: ws message with no attachment");
+        // message box #44: a frame this DO cannot read as an event (no
+        // attachment, binary, undecodable) writes the attach's line at warn,
+        // `outcome=dropped reason=undecoded.<why>`: it may have been an attach.
+        let attachment = match ws.deserialize_attachment::<WsAttachment>() {
+            Ok(Some(a)) if !a.sid.is_empty() => a,
+            Ok(_) => {
+                self.undecoded_line("undecoded.no-attachment", None);
                 return Ok(());
+            }
+            Err(e) => {
+                self.undecoded_line("undecoded.attachment-unreadable", None);
+                return Err(e);
             }
         };
         if self.inner.borrow().is_none() {
@@ -799,6 +807,7 @@ impl DurableObject for EngineIoSession {
             WebSocketIncomingMessage::Binary(_) => {
                 // Engine.IO binary frames are out of scope for Phase A
                 // (the AuthSocket transport is text-only).
+                self.undecoded_line("undecoded.binary", Some(&attachment.sid));
                 return Ok(());
             }
         };
@@ -807,8 +816,8 @@ impl DurableObject for EngineIoSession {
         // separation — that's polling-only).
         let pkt = match EngineIoPacket::decode(&text) {
             Ok(p) => p,
-            Err(e) => {
-                console_log!("EngineIoSession: WS decode error: {e}");
+            Err(_) => {
+                self.undecoded_line("undecoded.engineio", Some(&attachment.sid));
                 return Ok(());
             }
         };
@@ -1159,6 +1168,14 @@ impl EngineIoSession {
     /// dispatch each one. The response body is the literal `"ok"` per
     /// the socket.io reference server.
     async fn handle_polling_post(&self, req: &mut Request) -> Result<Response> {
+        // message box #44 (Read A, latent): on THIS path `frame_at_ms` is one
+        // DO-wide cell, and `req.text()` and the batch's earlier packets (an
+        // `authMessage` and its hub fetch) open the input gate before an attach
+        // in the batch reads it, so a WS frame landing meanwhile can overwrite
+        // it and understate the attach's `ms`. Not taken today: `lib.rs`
+        // (`route_socketio_request`) sends every polling request to the Worker
+        // (`socketio_worker`), which never answers an attach and times its own
+        // line from the request's arrival there.
         self.frame_at_ms.set(Some(Date::now().as_millis()));
         let body = req.text().await.unwrap_or_default();
         match decode_polling_batch(&body) {
@@ -1372,8 +1389,8 @@ impl EngineIoSession {
     async fn dispatch_socketio(&self, payload: &str, ws_for_response: Option<&WebSocket>) {
         let pkt = match SocketIoPacket::decode(payload) {
             Ok(p) => p,
-            Err(e) => {
-                console_log!("EngineIoSession: socket.io decode error: {e}");
+            Err(_) => {
+                self.undecoded_line("undecoded.socketio", None);
                 return;
             }
         };
@@ -1434,7 +1451,7 @@ impl EngineIoSession {
                 let name = match iter.next().and_then(|v| v.as_str().map(String::from)) {
                     Some(n) => n,
                     None => {
-                        console_log!("EngineIoSession: EVENT with non-string name — dropping");
+                        self.undecoded_line("undecoded.event-name", None);
                         return;
                     }
                 };
@@ -1839,13 +1856,10 @@ impl EngineIoSession {
         else {
             return None;
         };
+        // No line here: the handshake's mint (`mint_session_lane`) and the
+        // attach's line each name a failed mint once (message box #44).
         let mut random = [0u8; 64];
-        if let Err(e) = getrandom::getrandom(&mut random) {
-            console_error!(
-                "EngineIoSession: session lane: no randomness ({e}); the reference lane stands"
-            );
-            return None;
-        }
+        getrandom::getrandom(&mut random).ok()?;
         let now = Date::now().as_millis();
         Some(SessionLane::mint(
             identity_key,
@@ -1866,7 +1880,14 @@ impl EngineIoSession {
         identity_key: &str,
         ask: &str,
     ) -> Option<crate::session_lane::SessionOffer> {
-        let (lane, offer) = self.mint_lane_pure(state, identity_key, ask)?;
+        let Some((lane, offer)) = self.mint_lane_pure(state, identity_key, ask) else {
+            if matches!(state, SessionAuthState::Authenticated { .. }) {
+                console_error!(
+                    "EngineIoSession: session lane: no randomness; the reference lane stands"
+                );
+            }
+            return None;
+        };
         let sid = {
             let mut guard = self.inner.borrow_mut();
             let s = guard.as_mut()?;
@@ -1882,6 +1903,28 @@ impl EngineIoSession {
             offer.expires_at_ms
         );
         Some(offer)
+    }
+
+    /// message box #44: the line of a frame this DO could not read as an event
+    /// (it may have been an attach): the attach's line, `outcome=dropped`, at
+    /// warn, timed from the frame's arrival.
+    fn undecoded_line(&self, reason: &'static str, sid: Option<&str>) {
+        let now = Date::now().as_millis();
+        let elapsed = now.saturating_sub(self.frame_at_ms.get().unwrap_or(now));
+        let sid = sid.map(str::to_string).unwrap_or_else(|| {
+            self.inner
+                .borrow()
+                .as_ref()
+                .map(|s| s.sid.clone())
+                .unwrap_or_else(|| "-".into())
+        });
+        let (_, line) = crate::session_lane::attach_line(
+            &crate::session_lane::AttachEnd::Dropped(reason),
+            None,
+            &sid,
+            elapsed,
+        );
+        console_warn!("{line}");
     }
 
     /// bsv-low #443 step 4 (2026-09-14): `sessionAttach` — a socket of a tab that
@@ -1906,183 +1949,23 @@ impl EngineIoSession {
         ws_for_response: Option<&WebSocket>,
     ) {
         // message box #44: every exit of the attach is an `AttachEnd`, written
-        // here ONCE (a refusal, a drop or a late end at warn; a timely answer at
-        // debug), timed from the frame's arrival at this DO.
+        // here ONCE through `run_attach` (the seam `engineio::attach`, the same
+        // code the witness drives), timed from the frame's arrival at this DO.
         let started = self
             .frame_at_ms
             .get()
             .unwrap_or_else(|| Date::now().as_millis());
-        let seat = crate::session_lane::attach_seat(arg);
-        let end = self.attach_exchange(arg, nsp, ws_for_response).await;
-        let elapsed = Date::now().as_millis().saturating_sub(started);
-        let sid = self
-            .inner
-            .borrow()
-            .as_ref()
-            .map(|s| s.sid.clone())
-            .unwrap_or_else(|| "-".into());
-        match crate::session_lane::attach_line(&end, seat.as_deref(), &sid, elapsed) {
-            Some(line) => console_warn!("{line}"),
-            None => console_debug!(
-                "ATTACH_LINE outcome=answered late=false seat={} room=- sid={sid} ms={elapsed}",
-                seat.as_deref().unwrap_or("-")
-            ),
+        let port = DoAttachPort {
+            s: self,
+            nsp,
+            ws: ws_for_response,
+        };
+        let (_, level, line) = crate::engineio::attach::run_attach(&port, arg, started).await;
+        match level {
+            LineLevel::Warn => console_warn!("{line}"),
+            LineLevel::Info => console_log!("{line}"),
+            LineLevel::Debug => console_debug!("{line}"),
         }
-    }
-
-    /// The attach itself (`dispatch_session_attach` writes its end).
-    async fn attach_exchange(
-        &self,
-        arg: &Value,
-        nsp: &str,
-        ws_for_response: Option<&WebSocket>,
-    ) -> AttachEnd {
-        let refuse = |reason: &str| {
-            let evt = SocketIoPacket::Event {
-                nsp: nsp.to_string(),
-                ack_id: None,
-                data: vec![
-                    Value::String(crate::session_lane::ATTACH_REFUSED_EVENT.into()),
-                    json!({ "reason": reason }),
-                ],
-            };
-            self.send_or_enqueue(EngineIoPacket::Message(evt.encode()), ws_for_response);
-            AttachEnd::Refused(reason.to_string())
-        };
-        let Some(frame) = crate::session_lane::parse_attach_frame(arg) else {
-            return refuse(LaneRefusal::Malformed.as_str());
-        };
-        // One attach per socket (L1), judged and spent in ONE borrow with the
-        // authenticated check, before the hub is asked.
-        let gate = {
-            let mut guard = self.inner.borrow_mut();
-            match guard.as_mut() {
-                None => None,
-                Some(s) if s.auth.is_authenticated() => Some("already-authenticated"),
-                Some(s) if s.attach_attempted => Some("attach-exhausted"),
-                Some(s) => {
-                    s.attach_attempted = true;
-                    Some("")
-                }
-            }
-        };
-        match gate {
-            None => return AttachEnd::Dropped("no-session"),
-            Some("") => {}
-            Some(reason) => return refuse(reason),
-        }
-        self.persist_to_ws_attachment();
-        // The hub: the identity's own DO, asked with the HTTP-lane verify body.
-        let verify_body = crate::session_lane::attach_verify_body(&frame).to_string();
-        let answer = async {
-            let namespace = self.env.durable_object("MESSAGE_HUB")?;
-            let stub = namespace.id_from_name(&frame.identity)?.get_stub()?;
-            let hdrs = Headers::new();
-            hdrs.set("content-type", "application/json")?;
-            let mut init = RequestInit::new();
-            init.with_method(Method::Post)
-                .with_headers(hdrs)
-                .with_body(Some(verify_body.into()));
-            let r = Request::new_with_init("https://do.local/internal/session-verify", &init)?;
-            let mut res = stub.fetch_with_request(r).await?;
-            res.json::<Value>().await
-        };
-        // Bounded BELOW the client's attach wait (M1): a slow hub is a fallback.
-        let answer = crate::hub_forward::with_do_op_timeout(
-            answer,
-            crate::session_lane::ATTACH_HUB_TIMEOUT_MS,
-        )
-        .await;
-        let verdict = match answer {
-            Ok(v) => v,
-            Err(e) => {
-                console_debug!(
-                    "TRACE_SESSION attach hub-unavailable identity={} err={e}",
-                    frame.identity
-                );
-                return refuse("hub-unavailable");
-            }
-        };
-        if verdict.get("ok").and_then(Value::as_bool) != Some(true) {
-            let reason = verdict
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown-session")
-                .to_string();
-            return refuse(&reason);
-        }
-        // The identity the HUB holds the mirror for, and the mirror's key for the ack.
-        let identity = verdict
-            .get("identity")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let hub_key = verdict
-            .get("key")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if identity.is_empty() || identity != frame.identity || hub_key.is_empty() {
-            return refuse(LaneRefusal::UnknownSession.as_str());
-        }
-        let mut random = [0u8; 32];
-        if let Err(e) = getrandom::getrandom(&mut random) {
-            console_error!("EngineIoSession: attach: no randomness ({e})");
-            return refuse("no-randomness");
-        }
-        let server_session_nonce = hex::encode(random);
-        let state = SessionAuthState::Authenticated {
-            server_session_nonce: server_session_nonce.clone(),
-            peer_nonce: frame.nonce.clone(),
-            peer_identity_key: identity.clone(),
-        };
-        let Some((lane, offer)) = self.mint_lane_pure(&state, &identity, &frame.nonce) else {
-            return refuse("mint-failed");
-        };
-        // Compare-and-set (M2): the hub was asked across an await, and a
-        // handshake that completed meanwhile owns this socket. Authenticated
-        // and the lane land in ONE borrow, or nothing does.
-        let cas = {
-            let mut guard = self.inner.borrow_mut();
-            match guard.as_mut() {
-                None => None,
-                Some(s) if s.auth.is_authenticated() => Some(false),
-                Some(s) => {
-                    s.auth = state.clone();
-                    s.authenticated_emitted = true;
-                    s.lane = Some(lane);
-                    Some(true)
-                }
-            }
-        };
-        match cas {
-            Some(true) => {}
-            Some(false) => return refuse("already-authenticated"),
-            None => return AttachEnd::Dropped("no-session"),
-        }
-        self.persist_to_ws_attachment();
-        let d =
-            json!({ "session": offer, "serverNonce": server_session_nonce, "nonce": frame.nonce })
-                .to_string();
-        let Some(m) = crate::session_lane::attach_ack_mac(&hub_key, &d) else {
-            return refuse("mint-failed");
-        };
-        let evt = SocketIoPacket::Event {
-            nsp: nsp.to_string(),
-            ack_id: None,
-            data: vec![
-                Value::String(crate::session_lane::ATTACHED_EVENT.into()),
-                json!({ "d": d, "m": m }),
-            ],
-        };
-        self.send_or_enqueue(EngineIoPacket::Message(evt.encode()), ws_for_response);
-        console_debug!(
-            "TRACE_SESSION attached identity={} hub_lane={}… socket_lane={}…",
-            identity,
-            &frame.s[..12],
-            &offer.id[..12]
-        );
-        AttachEnd::Answered
     }
 
     /// bsv-low W-B (D10): a `sessionMessage` from the client. Verified by the
@@ -2876,6 +2759,144 @@ pub fn make_session_id() -> String {
     // matches the visual style of socket.io's reference sids.
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id.as_bytes())
+}
+
+/// message box #44: the DO's side of the attach seam (`engineio::attach`): the
+/// socket's state, the identity's `MESSAGE_HUB`, the platform clock and RNG.
+struct DoAttachPort<'a> {
+    s: &'a EngineIoSession,
+    nsp: &'a str,
+    ws: Option<&'a WebSocket>,
+}
+
+impl AttachPort for DoAttachPort<'_> {
+    fn now_ms(&self) -> u64 {
+        Date::now().as_millis()
+    }
+
+    fn emit(&self, event: &'static str, data: Value) {
+        let evt = SocketIoPacket::Event {
+            nsp: self.nsp.to_string(),
+            ack_id: None,
+            data: vec![Value::String(event.into()), data],
+        };
+        self.s
+            .send_or_enqueue(EngineIoPacket::Message(evt.encode()), self.ws);
+    }
+
+    /// One attach per socket (L1), judged and spent in ONE borrow with the
+    /// authenticated check, before the hub is asked.
+    fn gate(&self) -> AttachGate {
+        let mut guard = self.s.inner.borrow_mut();
+        match guard.as_mut() {
+            None => AttachGate::NoSession,
+            Some(s) if s.auth.is_authenticated() => AttachGate::Refuse("already-authenticated"),
+            Some(s) if s.attach_attempted => AttachGate::Refuse("attach-exhausted"),
+            Some(s) => {
+                s.attach_attempted = true;
+                AttachGate::Proceed
+            }
+        }
+    }
+
+    fn persist(&self) {
+        self.s.persist_to_ws_attachment();
+    }
+
+    /// The hub: the identity's own DO, asked with the HTTP-lane verify body,
+    /// bounded BELOW the client's attach wait (M1): a slow hub is a fallback.
+    /// A fault is named by its kind (the line's cause; the wire says only
+    /// `hub-unavailable`, as before).
+    async fn ask_hub(
+        &self,
+        identity: &str,
+        verify_body: String,
+    ) -> std::result::Result<Value, HubFault> {
+        let ask = async {
+            let Ok(namespace) = self.s.env.durable_object("MESSAGE_HUB") else {
+                return Ok(Err(HubFault::Binding));
+            };
+            let Ok(id) = namespace.id_from_name(identity) else {
+                return Ok(Err(HubFault::Binding));
+            };
+            let Ok(stub) = id.get_stub() else {
+                return Ok(Err(HubFault::Binding));
+            };
+            let request = (|| {
+                let hdrs = Headers::new();
+                hdrs.set("content-type", "application/json")?;
+                let mut init = RequestInit::new();
+                init.with_method(Method::Post)
+                    .with_headers(hdrs)
+                    .with_body(Some(verify_body.into()));
+                Request::new_with_init("https://do.local/internal/session-verify", &init)
+            })();
+            let Ok(r) = request else {
+                return Ok(Err(HubFault::Binding));
+            };
+            let Ok(mut res) = stub.fetch_with_request(r).await else {
+                return Ok(Err(HubFault::Fetch));
+            };
+            let status = res.status_code();
+            Ok::<_, Error>(match res.json::<Value>().await {
+                Ok(v) => Ok(v),
+                Err(_) if !(200..300).contains(&status) => Err(HubFault::Status),
+                Err(_) => Err(HubFault::Decode),
+            })
+        };
+        match crate::hub_forward::with_do_op_timeout(
+            ask,
+            crate::session_lane::ATTACH_HUB_TIMEOUT_MS,
+        )
+        .await
+        {
+            Ok(answer) => answer,
+            Err(_) => Err(HubFault::Timeout),
+        }
+    }
+
+    fn random32(&self) -> Option<[u8; 32]> {
+        let mut random = [0u8; 32];
+        getrandom::getrandom(&mut random).ok().map(|()| random)
+    }
+
+    fn mint(
+        &self,
+        state: &SessionAuthState,
+        identity: &str,
+        ask: &str,
+    ) -> Option<(SessionLane, crate::session_lane::SessionOffer)> {
+        self.s.mint_lane_pure(state, identity, ask)
+    }
+
+    /// Compare-and-set (M2): Authenticated and the lane land in ONE borrow,
+    /// or nothing does.
+    fn commit(&self, state: SessionAuthState, lane: SessionLane) -> AttachCommit {
+        let mut guard = self.s.inner.borrow_mut();
+        match guard.as_mut() {
+            None => AttachCommit::NoSession,
+            Some(s) if s.auth.is_authenticated() => AttachCommit::Lost,
+            Some(s) => {
+                s.auth = state;
+                s.authenticated_emitted = true;
+                s.lane = Some(lane);
+                AttachCommit::Won
+            }
+        }
+    }
+
+    fn sid(&self) -> String {
+        self.s
+            .inner
+            .borrow()
+            .as_ref()
+            .map(|s| s.sid.clone())
+            .unwrap_or_else(|| "-".into())
+    }
+
+    fn debug(&self, line: &str) {
+        console_debug!("{line}");
+    }
 }
 
 // ============================================================================
@@ -3733,61 +3754,69 @@ mod attach_structure_tests {
     /// minted by the SAME `mint_session_lane` as the handshake path.
     #[test]
     fn the_attach_asks_the_hub_first_and_mints_for_the_hub_s_identity_without_leaking_the_key() {
+        // message box #44: the exchange is `engineio::attach::attach_exchange`
+        // (the seam the witness drives); the DO's side is `DoAttachPort`.
         let src = include_str!("session.rs");
-        let handler = &src[src.find("async fn dispatch_session_attach(").unwrap()..];
-        let handler = &handler[..handler
-            .find("/// bsv-low W-B (D10): a `sessionMessage` from the client.")
-            .unwrap()];
-        let verify = handler
-            .find("https://do.local/internal/session-verify")
-            .expect("the hub's verify");
-        let gate = handler
-            .find("Some(s) if s.attach_attempted => Some(\"attach-exhausted\")")
+        let exchange = include_str!("attach.rs");
+        let exchange = &exchange[exchange
+            .find("pub(crate) async fn attach_exchange<")
+            .unwrap()..];
+        let exchange = &exchange[..exchange.find("#[cfg(test)]").unwrap()];
+        let port = &src[src.find("impl AttachPort for DoAttachPort<'_> {").unwrap()..];
+        let port = &port[..port.find("\n}\n").unwrap()];
+        let gate = exchange
+            .find("match p.gate() {")
             .expect("one attach per socket (L1)");
-        let bind = handler
+        let verify = exchange.find("p.ask_hub(").expect("the hub's verify");
+        let bind = exchange
             .find("identity != frame.identity")
             .expect("the identity binding");
-        let mint = handler
-            .find("self.mint_lane_pure(&state, &identity, &frame.nonce)")
+        let mint = exchange
+            .find("p.mint(&state, &identity, &frame.nonce)")
             .expect("the shared pure mint");
-        let cas = handler
-            .find("Some(s) if s.auth.is_authenticated() => Some(false),")
+        let cas = exchange
+            .find("match p.commit(state, lane) {")
             .expect("the compare-and-set (M2)");
-        let authed = handler
-            .find("s.auth = state.clone();")
-            .expect("Authenticated set");
-        let lane_set = handler.find("s.lane = Some(lane);").expect("the lane set");
         assert!(
-            gate < verify
-                && verify < bind
-                && bind < mint
-                && mint < cas
-                && cas < authed
-                && authed < lane_set,
-            "gate → hub → bind → pure mint → compare-and-set → authenticated + lane in one borrow"
+            gate < verify && verify < bind && bind < mint && mint < cas,
+            "gate → hub → bind → pure mint → compare-and-set"
+        );
+        assert!(port
+            .contains("Some(s) if s.attach_attempted => AttachGate::Refuse(\"attach-exhausted\")"));
+        assert!(port.contains("https://do.local/internal/session-verify"));
+        let commit = &port[port.find("fn commit(").unwrap()..];
+        let lost = commit
+            .find("Some(s) if s.auth.is_authenticated() => AttachCommit::Lost,")
+            .expect("the compare-and-set refuses an authenticated socket");
+        let authed = commit.find("s.auth = state;").expect("Authenticated set");
+        let lane_set = commit.find("s.lane = Some(lane);").expect("the lane set");
+        assert!(
+            lost < authed && authed < lane_set,
+            "authenticated + lane in one borrow"
         );
         assert!(
-            handler.contains("crate::session_lane::ATTACH_HUB_TIMEOUT_MS"),
+            port.contains("crate::session_lane::ATTACH_HUB_TIMEOUT_MS"),
             "the hub ask is bounded below the client's attach wait (M1)"
         );
         assert!(
-            !handler.contains("FORWARD_OP_TIMEOUT_MS"),
+            !port.contains("FORWARD_OP_TIMEOUT_MS"),
             "never the forward's 3 s bound"
         );
-        let src_all = include_str!("session.rs");
-        let src_code = &src_all[..src_all.find("#[cfg(test)]").unwrap()];
+        let src_code = &src[..src.find("#[cfg(test)]").unwrap()];
         assert_eq!(
-            src_code.matches("self.mint_lane_pure(").count(),
+            src_code.matches(".mint_lane_pure(").count(),
             2,
             "the handshake's mint_session_lane and the attach share the ONE pure mint"
         );
         assert!(
-            handler.contains("attach_ack_mac(&hub_key, &d)"),
+            exchange.contains("attach_ack_mac(&hub_key, &d)"),
             "the ack is sealed under the hub key"
         );
-        let ack = &handler[handler.find("ATTACHED_EVENT.into()").unwrap()..];
+        let ack = &exchange[exchange
+            .find("crate::session_lane::ATTACHED_EVENT,")
+            .unwrap()..];
         assert!(
-            !ack[..ack.find("send_or_enqueue").unwrap()].contains("hub_key"),
+            !ack[..ack.find("AttachEnd::Answered").unwrap()].contains("hub_key"),
             "the key never rides the ack"
         );
         let dispatch = &src[src

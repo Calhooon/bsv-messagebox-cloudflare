@@ -1540,16 +1540,24 @@ async fn route_websocket_upgrade(
 /// Phase A is intentionally auth-less. Phase B will wrap the surface in
 /// BRC-103 over the `authMessage` event.
 async fn route_socketio_request(mut req: Request, env: &Env, ctx: &Context) -> Result<Response> {
+    // message box #44: the Worker's entry line times a request from here.
+    let received_at_ms = Date::now().as_millis();
     let url = req.url()?;
     let qp: std::collections::HashMap<String, String> = url
         .query_pairs()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-    let namespace = env.durable_object("ENGINEIO_SESSION")?;
-
     let sid_opt = qp.get("sid").map(String::as_str).filter(|s| !s.is_empty());
     let transport = qp.get("transport").map(String::as_str).unwrap_or("");
+
+    let namespace = match env.durable_object("ENGINEIO_SESSION") {
+        Ok(n) => n,
+        Err(e) => {
+            socketio_worker::entry_binding_fault(transport, sid_opt.unwrap_or("-"), received_at_ms);
+            return Err(e);
+        }
+    };
 
     if sid_opt.is_none() {
         // Only a polling GET with no sid is a valid handshake.
@@ -1607,7 +1615,7 @@ async fn route_socketio_request(mut req: Request, env: &Env, ctx: &Context) -> R
         match req.method() {
             Method::Post => {
                 let body = req.text().await.unwrap_or_default();
-                return socketio_worker::handle_polling_post(&body, env, sid).await;
+                return socketio_worker::handle_polling_post(&body, env, sid, received_at_ms).await;
             }
             Method::Get => {
                 return socketio_worker::handle_polling_get(env, sid).await;
@@ -1617,9 +1625,10 @@ async fn route_socketio_request(mut req: Request, env: &Env, ctx: &Context) -> R
     }
 
     // WS upgrade and anything else (transport=websocket Upgrade GET):
-    // route to the per-sid DO unchanged.
-    let stub = namespace.id_from_name(sid)?.get_stub()?;
-    stub.fetch_with_request(req).await
+    // route to the per-sid DO unchanged; the request leaves the Worker's
+    // entry line when the DO refuses it, faults, or has not answered by the
+    // client's attach wait (message box #44).
+    socketio_worker::forward_to_session(&namespace, req, sid, transport, received_at_ms).await
 }
 
 /// The LOW lobby-watcher broadcast box (the app-layer's `lobby` producer
