@@ -3238,6 +3238,17 @@ mod list_store_error_tests {
         assert_eq!((status, &body["code"]), (500, &json!("ERR_INTERNAL_ERROR")));
     }
 
+    /// Message box #43: D1's refusal of a statement past its bound-parameter
+    /// limit is the request's shape, never the transient 503.
+    #[test]
+    fn too_many_sql_variables_is_never_err_d1_unavailable() {
+        let past =
+            Error::RustError("D1_ERROR: too many SQL variables at offset 412: SQLITE_ERROR".into());
+        let (body, status) = acknowledge_store_error(past);
+        assert_eq!((status, &body["code"]), (500, &json!("ERR_INTERNAL_ERROR")));
+        assert_eq!(routes::send_message::retry_after(&body, status), None);
+    }
+
     #[test]
     fn retry_after_rides_only_on_a_503_err_d1_unavailable() {
         use routes::send_message::retry_after;

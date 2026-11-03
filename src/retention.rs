@@ -212,6 +212,60 @@ pub fn ack_delete_sql(n_ids: usize, n_prefixes: usize) -> String {
     )
 }
 
+/// D1's bound parameters per query: 100. Cloudflare's D1 platform limits page
+/// (developers.cloudflare.com/d1/platform/limits/, the row "Maximum bound
+/// parameters per query"), read 2026-11-03, the page last updated Oct 30,
+/// 2026. Past it D1 refuses the statement with `too many SQL variables`
+/// (message box #43: a 100-id acknowledgment bound 101 or more).
+pub const D1_MAX_BOUND_PARAMS: usize = 100;
+
+/// The ids one ack statement carries: the limit less the recipient and the
+/// prefix patterns each statement also binds. The prefixes are the
+/// operator's `RETAINED_BOX_PREFIXES`, never a caller's; at least one id, so
+/// the plan always moves.
+pub fn ack_ids_per_statement(n_prefixes: usize) -> usize {
+    D1_MAX_BOUND_PARAMS.saturating_sub(1 + n_prefixes).max(1)
+}
+
+/// One statement of an acknowledgment and the text values it binds, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AckStatement {
+    pub sql: String,
+    pub binds: Vec<String>,
+}
+
+/// An acknowledgment of `ids`, of any length, as statements inside
+/// `D1_MAX_BOUND_PARAMS` (message box #43): the ids in order, chunked by
+/// `ack_ids_per_statement`; with retention on, the MARK of every chunk, then
+/// the delete of every chunk (the two halves stay exact complements per id,
+/// as `ack_update_sql` and `ack_delete_sql` are). Bind order of each:
+/// identity_key, the chunk's ids, like_patterns.
+pub fn ack_statements(
+    identity_key: &str,
+    ids: &[String],
+    patterns: &[String],
+) -> Vec<AckStatement> {
+    let n_prefixes = patterns.len();
+    let per = ack_ids_per_statement(n_prefixes);
+    let statement = |sql: String, chunk: &[String]| {
+        let mut binds = Vec::with_capacity(1 + chunk.len() + n_prefixes);
+        binds.push(identity_key.to_string());
+        binds.extend(chunk.iter().cloned());
+        binds.extend(patterns.iter().cloned());
+        AckStatement { sql, binds }
+    };
+    let mut out = Vec::new();
+    if n_prefixes > 0 {
+        for chunk in ids.chunks(per) {
+            out.push(statement(ack_update_sql(chunk.len(), n_prefixes), chunk));
+        }
+    }
+    for chunk in ids.chunks(per) {
+        out.push(statement(ack_delete_sql(chunk.len(), n_prefixes), chunk));
+    }
+    out
+}
+
 /// Transcript read: the caller's full entitlement in one ordered pass — rows
 /// they RECEIVED (their own box, what `/listMessages` always granted) plus
 /// rows they SENT (bytes they authored, sitting in the peer's box of the same
@@ -974,6 +1028,98 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stranger, 0);
+    }
+
+    // ---- message box #43: an ack of any size inside D1's bound-parameter limit
+
+    /// The ack's statements for 1, 99, 100, 101 and 1,000 ids, retention off
+    /// and on: every statement's placeholders equal its binds and sit at or
+    /// under `D1_MAX_BOUND_PARAMS`; each half covers every id exactly once, in
+    /// the request's order; each statement binds the recipient first and the
+    /// patterns last.
+    #[test]
+    fn ack_statements_stay_inside_d1s_bound_parameter_limit() {
+        for cfg in [RetentionConfig::parse(None), low_cfg()] {
+            let patterns = cfg.like_patterns();
+            for n in [1usize, 99, 100, 101, 1_000] {
+                let ids: Vec<String> = (0..n).map(|i| format!("id-{i}")).collect();
+                let plan = ack_statements("r", &ids, &patterns);
+                let (mut marked, mut deleted) = (Vec::new(), Vec::new());
+                for s in &plan {
+                    let holes = s.sql.matches('?').count();
+                    assert_eq!(holes, s.binds.len(), "n={n}: {}", s.sql);
+                    assert!(
+                        holes <= D1_MAX_BOUND_PARAMS,
+                        "n={n}: a statement binds {holes} > {D1_MAX_BOUND_PARAMS}"
+                    );
+                    assert_eq!(s.binds[0], "r");
+                    assert_eq!(&s.binds[s.binds.len() - patterns.len()..], &patterns[..]);
+                    let chunk = &s.binds[1..s.binds.len() - patterns.len()];
+                    if s.sql.starts_with("UPDATE") {
+                        marked.extend_from_slice(chunk);
+                    } else {
+                        deleted.extend_from_slice(chunk);
+                    }
+                }
+                assert_eq!(deleted, ids, "n={n}: the delete half, once each, in order");
+                if patterns.is_empty() {
+                    assert!(marked.is_empty());
+                } else {
+                    assert_eq!(marked, ids, "n={n}: the mark half, once each, in order");
+                }
+            }
+        }
+    }
+
+    /// The same plans run on a SQLite held to D1's limit
+    /// (`SQLITE_LIMIT_VARIABLE_NUMBER` = 100): 100 and 1,000 ids of one
+    /// recipient acknowledged in full, retention off (all deleted) and on
+    /// (the retained third marked, the rest deleted); D1's own refusal
+    /// (`too many SQL variables`) is what a statement past the limit meets.
+    #[test]
+    fn an_ack_of_1000_ids_runs_on_a_sqlite_held_to_d1s_limit() {
+        for cfg in [RetentionConfig::parse(None), low_cfg()] {
+            let patterns = cfg.like_patterns();
+            for n in [100i64, 1_000] {
+                let db = migrated_db();
+                db.set_limit(
+                    rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER,
+                    D1_MAX_BOUND_PARAMS as i32,
+                );
+                db.execute(
+                    "UPDATE messages SET recipient = 'ack-me' WHERE rowid <= ?",
+                    [n],
+                )
+                .unwrap();
+                let ids: Vec<String> = (1..=n).map(|i| format!("m{i}")).collect();
+                let mut changes = 0usize;
+                for s in ack_statements("ack-me", &ids, &patterns) {
+                    let binds: Vec<&dyn rusqlite::ToSql> =
+                        s.binds.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
+                    changes += db
+                        .execute(&s.sql, binds.as_slice())
+                        .unwrap_or_else(|e| panic!("n={n}: {e}"));
+                }
+                assert_eq!(changes, n as usize, "n={n}: every id acknowledged");
+                let live: i64 = db
+                    .query_row(
+                        "SELECT COUNT(*) FROM messages WHERE recipient = 'ack-me' \
+                         AND acknowledged_at IS NULL",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(live, 0, "n={n}: no row of the batch left live");
+            }
+        }
+        // The control: one statement of 100 ids binds 101 and is refused.
+        let db = migrated_db();
+        db.set_limit(
+            rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER,
+            D1_MAX_BOUND_PARAMS as i32,
+        );
+        let e = db.prepare(&ack_delete_sql(100, 0)).unwrap_err();
+        assert!(e.to_string().contains("too many SQL variables"), "{e}");
     }
 
     /// Retention off ⇒ the delete SQL is the legacy statement byte-for-byte —
