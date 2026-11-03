@@ -63,9 +63,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 use worker::{
-    console_log, console_warn, kv::KvStore, Date, Delay, Env, Headers, Method, Request,
-    RequestInit, Response, Result,
+    console_debug, console_log, console_warn, kv::KvStore, Date, Delay, Env, Headers, Method,
+    ObjectNamespace, Request, RequestInit, Response, Result,
 };
+
+use crate::session_lane::{attach_line, AttachEnd, LineLevel, ATTACH_ANSWER_DEADLINE_MS};
 
 use crate::engineio::auth::{
     build_outbound_general, decode_event_payload, encode_event_payload, handle_auth_message,
@@ -344,12 +346,30 @@ pub async fn load_auth_state_public(env: &Env, sid: &str) -> SessionAuthState {
 // Polling-POST entry: decodes the polling batch and handles each packet.
 // ===========================================================================
 
-pub async fn handle_polling_post(body: &str, env: &Env, sid: &str) -> Result<Response> {
-    let received_at_ms = Date::now().as_millis();
-    let kv = auth_kv(env)?;
+pub async fn handle_polling_post(
+    body: &str,
+    env: &Env,
+    sid: &str,
+    received_at_ms: u64,
+) -> Result<Response> {
+    // message box #44: a POST this entry cannot take writes the Worker's line
+    // (`SOCKET_ENTRY_LINE`), timed from the request's arrival at the Worker.
+    let refused = |outcome: &str, reason: &str| {
+        let elapsed = Date::now().as_millis().saturating_sub(received_at_ms);
+        let (_, line) = entry_line(outcome, "polling", sid, reason, elapsed);
+        console_warn!("{line}");
+    };
+    let kv = match auth_kv(env) {
+        Ok(kv) => kv,
+        Err(e) => {
+            refused("dropped", "kv-binding");
+            return Err(e);
+        }
+    };
     let ttl = sio_ttl(env);
 
     if is_closed(&kv, sid).await {
+        refused("dropped", "session-closed");
         return public_polling_text_response("ok", 200);
     }
 
@@ -360,7 +380,7 @@ pub async fn handle_polling_post(body: &str, env: &Env, sid: &str) -> Result<Res
     let packets = match decode_polling_batch(body) {
         Ok(p) => p,
         Err(e) => {
-            console_log!("SIOW: polling-POST decode error sid={sid}: {e}");
+            refused("refused", "undecoded.polling-batch");
             return Response::error(format!("bad polling body: {e}"), 400);
         }
     };
@@ -413,8 +433,16 @@ async fn handle_socketio_in_worker(
     let ttl = sio_ttl(env);
     let pkt = match SocketIoPacket::decode(payload) {
         Ok(p) => p,
-        Err(e) => {
-            console_log!("SIOW: socket.io decode error sid={sid}: {e}");
+        Err(_) => {
+            // message box #44: it may have been an attach.
+            let elapsed = Date::now().as_millis().saturating_sub(received_at_ms);
+            let (_, line) = attach_line(
+                &AttachEnd::Dropped("undecoded.socketio"),
+                None,
+                sid,
+                elapsed,
+            );
+            console_warn!("{line}");
             return;
         }
     };
@@ -458,7 +486,15 @@ async fn handle_socketio_event(
     let event_name = match data.first().and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => {
-            console_log!("SIOW: empty EVENT data sid={sid}");
+            // message box #44: it may have been an attach.
+            let elapsed = Date::now().as_millis().saturating_sub(received_at_ms);
+            let (_, line) = attach_line(
+                &AttachEnd::Dropped("undecoded.event-name"),
+                None,
+                sid,
+                elapsed,
+            );
+            console_warn!("{line}");
             return;
         }
     };
@@ -475,25 +511,26 @@ async fn handle_socketio_event(
     // legacy DO drops these silently — we match that behaviour.
     let auth = load_auth_state(kv, sid).await;
     // message box #44: the attach is answered only on the WebSocket (the
-    // `EngineIoSession` DO); one that rides polling is never answered here
-    // (dropped unauthenticated; forwarded to the hub, which knows no such
-    // event, when authenticated), so it leaves its line. The wire is unchanged.
-    if event_name == crate::session_lane::ATTACH_EVENT {
-        let reason = if auth.is_authenticated() {
-            "polling-authenticated"
-        } else {
-            "polling-unauthenticated"
-        };
-        let seat = data.get(1).and_then(crate::session_lane::attach_seat);
+    // `EngineIoSession` DO); one that rides polling is never answered here. An
+    // unauthenticated one is dropped (nothing sent); an authenticated one is
+    // forwarded to the hub, which knows no such event, and the client gets
+    // what the hub answered (`messageFailed`): its line is written after the
+    // forward, naming what was enqueued, so `ms` covers the forward. The wire
+    // is unchanged.
+    let is_attach = event_name == crate::session_lane::ATTACH_EVENT;
+    let attach_seat = data.get(1).and_then(crate::session_lane::attach_seat);
+    let attach_end_line = |end: AttachEnd| {
         let elapsed = Date::now().as_millis().saturating_sub(received_at_ms);
-        if let Some(line) = crate::session_lane::attach_line(
-            &crate::session_lane::AttachEnd::Dropped(reason),
-            seat.as_deref(),
-            sid,
-            elapsed,
-        ) {
-            console_warn!("{line}");
+        let (level, line) = attach_line(&end, attach_seat.as_deref(), sid, elapsed);
+        match level {
+            LineLevel::Warn => console_warn!("{line}"),
+            LineLevel::Info => console_log!("{line}"),
+            LineLevel::Debug => console_debug!("{line}"),
         }
+    };
+    if is_attach && !auth.is_authenticated() {
+        attach_end_line(AttachEnd::Dropped("polling-unauthenticated"));
+        return;
     }
     if !auth.is_authenticated() {
         console_log!("SIOW: dropping non-auth event '{event_name}' on unauthenticated sid={sid}");
@@ -505,40 +542,371 @@ async fn handle_socketio_event(
 
     // Forward to MessageHub. Returned outbound events are wrapped as
     // signed Generals and enqueued for polling-GET drain.
+    let enqueued = forward_and_enqueue(env, kv, sid, &auth, &event_name, data, ttl).await;
+    if is_attach {
+        attach_end_line(polling_attach_end(&enqueued));
+    }
+}
+
+/// What a forwarded attach on polling got, named by what was enqueued for the
+/// client (message box #44). PURE.
+fn polling_attach_end(enqueued: &[String]) -> AttachEnd {
+    match enqueued.first() {
+        None => AttachEnd::Dropped("polling-authenticated.nothing-enqueued"),
+        Some(_) if enqueued.iter().any(|n| n == "messageFailed") => {
+            AttachEnd::Refused("polling-authenticated.messageFailed".into())
+        }
+        Some(n) => AttachEnd::Refused(format!("polling-authenticated.{n}")),
+    }
+}
+
+/// Forward one event to the identity's MessageHub and enqueue its outbound
+/// events as signed Generals for the polling GET; the names enqueued.
+async fn forward_and_enqueue(
+    env: &Env,
+    kv: &KvStore,
+    sid: &str,
+    auth: &SessionAuthState,
+    event_name: &str,
+    data: &[Value],
+    ttl: u64,
+) -> Vec<String> {
+    let mut enqueued = Vec::new();
     let identity = match auth.verified_identity_key() {
         Some(s) => s.to_string(),
-        None => return,
+        None => return enqueued,
     };
     let event_data = data.get(1).cloned().unwrap_or(Value::Null);
-    let outbound =
-        forward_event_to_message_hub(env, &identity, sid, &event_name, &event_data).await;
+    let outbound = forward_event_to_message_hub(env, &identity, sid, event_name, &event_data).await;
 
     let server_key = match env.secret("SERVER_PRIVATE_KEY") {
         Ok(s) => s.to_string(),
         Err(e) => {
             console_log!("SIOW: SERVER_PRIVATE_KEY sid={sid}: {e}");
-            return;
+            return enqueued;
         }
     };
     let wallet = match make_wallet(&server_key) {
         Ok(w) => w,
         Err(e) => {
             console_log!("SIOW: make_wallet sid={sid}: {e}");
-            return;
+            return enqueued;
         }
     };
     for (out_name, out_data) in outbound {
         let final_name = authsocket_event_name(&out_name, &out_data);
         let payload = encode_event_payload(&final_name, &out_data);
-        match build_outbound_general(payload, &auth, &wallet) {
+        match build_outbound_general(payload, auth, &wallet) {
             Ok(general) => {
                 let frame = encode_outbound_authmessage(&general);
                 append_to_queue(kv, sid, frame, ttl).await;
+                enqueued.push(out_name.clone());
             }
             Err(e) => {
                 console_log!("SIOW: build General '{out_name}' sid={sid}: {e}");
             }
         }
+    }
+    enqueued
+}
+
+// ===========================================================================
+// message box #44: the Worker's socket entry line.
+// ===========================================================================
+//
+// The earliest point the relay sees an attach is the Worker: the WS upgrade
+// GET (forwarded to the sid's `EngineIoSession` DO; after it the frames go to
+// the DO directly) and the polling POST (handled here). A request this entry
+// cannot take, that the DO refuses, or that the DO leaves unanswered at the
+// client's attach wait (`ATTACH_ANSWER_DEADLINE_MS`) writes one warn line,
+// `SOCKET_ENTRY_LINE outcome= late= transport= sid= reason= ms=`, timed from
+// the request's arrival at the Worker. What happens before the Worker runs
+// (the edge, the isolate's start) is outside what the relay can see.
+
+/// The Worker's entry line and its level. PURE.
+pub(crate) fn entry_line(
+    outcome: &str,
+    transport: &str,
+    sid: &str,
+    reason: &str,
+    elapsed_ms: u64,
+) -> (LineLevel, String) {
+    let late = elapsed_ms >= ATTACH_ANSWER_DEADLINE_MS;
+    let level = match outcome {
+        "answered" if late => LineLevel::Warn,
+        "answered" if elapsed_ms >= crate::session_lane::ATTACH_SLOW_INFO_MS => LineLevel::Info,
+        "answered" => LineLevel::Debug,
+        _ => LineLevel::Warn,
+    };
+    (
+        level,
+        format!(
+            "SOCKET_ENTRY_LINE outcome={outcome} late={late} transport={} sid={} reason={} ms={elapsed_ms}",
+            crate::session_lane::bounded_reason(transport),
+            crate::session_lane::bounded_reason(sid),
+            crate::session_lane::bounded_reason(reason)
+        ),
+    )
+}
+
+fn write_line(level: LineLevel, line: &str) {
+    match level {
+        LineLevel::Warn => console_warn!("{line}"),
+        LineLevel::Info => console_log!("{line}"),
+        LineLevel::Debug => console_debug!("{line}"),
+    }
+}
+
+/// Which entry request a line is for, and when it reached the Worker.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EntryAt<'a> {
+    pub transport: &'a str,
+    pub sid: &'a str,
+    pub started_ms: u64,
+}
+
+/// Await the DO's answer to an entry request and write its one line: at the
+/// deadline if the DO has not answered by then (`outcome=late`, warn; the
+/// request keeps waiting and its later end is debug only), else at the end
+/// (`answered` / `refused` when `refusal` names one / `dropped` on a fault).
+pub(crate) async fn watch_entry<T, F, D>(
+    op: F,
+    deadline: D,
+    now: impl Fn() -> u64,
+    at: EntryAt<'_>,
+    refusal: impl Fn(&T) -> Option<String>,
+    write: impl Fn(LineLevel, &str),
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+    D: std::future::Future<Output = ()>,
+{
+    use std::task::Poll;
+    let mut op = std::pin::pin!(op);
+    let mut deadline = std::pin::pin!(deadline);
+    let mut warned = false;
+    let r = std::future::poll_fn(|cx| {
+        if let Poll::Ready(r) = op.as_mut().poll(cx) {
+            return Poll::Ready(r);
+        }
+        if !warned && deadline.as_mut().poll(cx).is_ready() {
+            warned = true;
+            let elapsed = now().saturating_sub(at.started_ms);
+            let (_, line) = entry_line(
+                "late",
+                at.transport,
+                at.sid,
+                "no-answer-by-deadline",
+                elapsed,
+            );
+            write(LineLevel::Warn, &line);
+        }
+        Poll::Pending
+    })
+    .await;
+    let elapsed = now().saturating_sub(at.started_ms);
+    let refused = r.as_ref().ok().and_then(&refusal);
+    let (outcome, reason) = match (&r, refused) {
+        (Err(_), _) => ("dropped", "do-fetch".to_string()),
+        (Ok(_), Some(reason)) => ("refused", reason),
+        (Ok(_), None) => ("answered", "ok".to_string()),
+    };
+    let (level, line) = entry_line(outcome, at.transport, at.sid, &reason, elapsed);
+    write(if warned { LineLevel::Debug } else { level }, &line);
+    r
+}
+
+/// The `ENGINEIO_SESSION` binding could not be read: the request ends here.
+pub fn entry_binding_fault(transport: &str, sid: &str, received_at_ms: u64) {
+    let elapsed = Date::now().as_millis().saturating_sub(received_at_ms);
+    let (_, line) = entry_line("dropped", transport, sid, "do-binding", elapsed);
+    console_warn!("{line}");
+}
+
+/// The WS upgrade (or any non-polling request with a sid) forwarded to the
+/// sid's `EngineIoSession` DO, with its entry line.
+pub async fn forward_to_session(
+    namespace: &ObjectNamespace,
+    req: Request,
+    sid: &str,
+    transport: &str,
+    received_at_ms: u64,
+) -> Result<Response> {
+    let stub = match namespace.id_from_name(sid).and_then(|id| id.get_stub()) {
+        Ok(stub) => stub,
+        Err(e) => {
+            let elapsed = Date::now().as_millis().saturating_sub(received_at_ms);
+            let (_, line) = entry_line("dropped", transport, sid, "do-binding", elapsed);
+            console_warn!("{line}");
+            return Err(e);
+        }
+    };
+    let upgrade = transport == "websocket";
+    watch_entry(
+        stub.fetch_with_request(req),
+        Delay::from(Duration::from_millis(
+            ATTACH_ANSWER_DEADLINE_MS
+                .saturating_sub(Date::now().as_millis().saturating_sub(received_at_ms)),
+        )),
+        || Date::now().as_millis(),
+        EntryAt {
+            transport,
+            sid,
+            started_ms: received_at_ms,
+        },
+        |res: &Response| {
+            let code = res.status_code();
+            let taken = if upgrade {
+                code == 101
+            } else {
+                (200..300).contains(&code)
+            };
+            (!taken).then(|| format!("do-status-{code}"))
+        },
+        write_line,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod entry_line_witness {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    struct Clock(Cell<u64>);
+
+    /// A request whose DO never answers inside the deadline: one warn line at
+    /// the deadline, with the sid, the reason and `ms`; nothing else above debug.
+    #[test]
+    fn a_request_the_do_never_answers_writes_one_warn_line_at_the_deadline() {
+        let clock = Clock(Cell::new(50_000));
+        let lines: RefCell<Vec<(LineLevel, String)>> = RefCell::new(Vec::new());
+        let deadline_fired = Cell::new(false);
+        let deadline = std::future::poll_fn(|_| {
+            if deadline_fired.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        });
+        let fut = watch_entry(
+            std::future::pending::<Result<u16>>(),
+            deadline,
+            || clock.0.get(),
+            EntryAt {
+                transport: "websocket",
+                sid: "sidQ",
+                started_ms: 50_000,
+            },
+            |_: &u16| None,
+            |level, line: &str| {
+                println!("{level:?} {line}");
+                lines.borrow_mut().push((level, line.to_string()))
+            },
+        );
+        let mut fut = std::pin::pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+        clock.0.set(50_900);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert!(lines.borrow().is_empty(), "nothing before the deadline");
+        clock.0.set(51_500);
+        deadline_fired.set(true);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        clock.0.set(53_000);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            *lines.borrow(),
+            vec![(
+                LineLevel::Warn,
+                "SOCKET_ENTRY_LINE outcome=late late=true transport=websocket sid=sidQ reason=no-answer-by-deadline ms=1500".to_string()
+            )],
+            "one line, at the deadline"
+        );
+    }
+
+    fn run(op: Result<u16>, elapsed: u64, upgrade_refusal: bool) -> Vec<(LineLevel, String)> {
+        let lines: RefCell<Vec<(LineLevel, String)>> = RefCell::new(Vec::new());
+        let fut = watch_entry(
+            std::future::ready(op),
+            std::future::pending::<()>(),
+            || 1_000 + elapsed,
+            EntryAt {
+                transport: "websocket",
+                sid: "sidR",
+                started_ms: 1_000,
+            },
+            |code: &u16| (upgrade_refusal && *code != 101).then(|| format!("do-status-{code}")),
+            |level, line: &str| {
+                println!("{level:?} {line}");
+                lines.borrow_mut().push((level, line.to_string()))
+            },
+        );
+        {
+            let mut fut = std::pin::pin!(fut);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(fut.as_mut().poll(&mut cx).is_ready());
+        }
+        lines.into_inner()
+    }
+
+    #[test]
+    fn a_do_that_refuses_or_faults_is_one_warn_line_and_a_timely_upgrade_is_debug() {
+        assert_eq!(
+            run(Ok(400), 12, true),
+            vec![(
+                LineLevel::Warn,
+                "SOCKET_ENTRY_LINE outcome=refused late=false transport=websocket sid=sidR reason=do-status-400 ms=12".to_string()
+            )]
+        );
+        assert_eq!(
+            run(Err(worker::Error::RustError("boom".into())), 30, true),
+            vec![(
+                LineLevel::Warn,
+                "SOCKET_ENTRY_LINE outcome=dropped late=false transport=websocket sid=sidR reason=do-fetch ms=30".to_string()
+            )]
+        );
+        let ok = run(Ok(101), 80, true);
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].0, LineLevel::Debug, "{}", ok[0].1);
+        assert!(ok[0].1.ends_with(" reason=ok ms=80"));
+        let slow = run(Ok(101), 700, true);
+        assert_eq!(
+            slow[0].0,
+            LineLevel::Info,
+            "a slow timely upgrade is readable at info"
+        );
+        let late = run(Ok(101), 1_600, true);
+        assert_eq!(late[0].0, LineLevel::Warn);
+        assert!(
+            late[0].1.contains("outcome=answered late=true "),
+            "{}",
+            late[0].1
+        );
+    }
+
+    #[test]
+    fn a_polling_attach_is_named_by_what_the_client_got() {
+        assert_eq!(
+            polling_attach_end(&["messageFailed".to_string()]),
+            AttachEnd::Refused("polling-authenticated.messageFailed".into())
+        );
+        assert_eq!(
+            polling_attach_end(&[]),
+            AttachEnd::Dropped("polling-authenticated.nothing-enqueued")
+        );
+        let (level, line) = attach_line(
+            &polling_attach_end(&["messageFailed".to_string()]),
+            None,
+            "sidP",
+            61,
+        );
+        assert_eq!(level, LineLevel::Warn);
+        assert_eq!(
+            line,
+            "ATTACH_LINE outcome=refused late=false seat=- room=- sid=sidP reason=polling-authenticated.messageFailed ms=61"
+        );
     }
 }
 

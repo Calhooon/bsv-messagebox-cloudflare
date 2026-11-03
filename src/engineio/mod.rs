@@ -14,6 +14,7 @@
 //! See `codec.rs` for the wire format, `auth.rs` for the BRC-103
 //! driver, and `session.rs` for the per-sid Durable Object.
 
+pub(crate) mod attach;
 pub mod auth;
 pub mod codec;
 pub mod session;

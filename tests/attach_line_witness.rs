@@ -1,88 +1,121 @@
-//! message box #44: a socket attach that is refused, dropped or late leaves one
-//! relay-side line; one answered in time writes nothing above debug.
+//! message box #44: every exit of the attach reaches the line.
 //!
-//! This is the source half of the witness: it reads the relay's text only, so it
-//! also runs over a tree that predates the fix (copy this file into it and run
-//! `cargo test --test attach_line_witness`). The behaviour half, the line itself
-//! per plant, is `session_lane::attach_line_tests`.
+//! The source half of the witness. It holds the rule, not the wording: every
+//! exit of the exchange returns its end (`attach_exchange` has no bare return),
+//! the DO writes that end through `run_attach` at its level, the frames the DO
+//! cannot read and the Worker's attach and entry exits each write a line. It
+//! reads the files at run time, so it also runs over a tree that predates the
+//! fix (copy this file into it and run `cargo test --test attach_line_witness`;
+//! there it fails). The behaviour half, the value at each exit per cause, is
+//! `engineio::attach::attach_path_witness` (the exchange the DO runs, a stubbed
+//! hub) and `socketio_worker::entry_line_witness` (the Worker's line).
 
-const SESSION: &str = include_str!("../src/engineio/session.rs");
-const WORKER: &str = include_str!("../src/socketio_worker.rs");
+fn src(path: &str) -> String {
+    // The tree under test at RUN time (cargo sets it for the test binary), so
+    // a binary built over another tree in a shared target never reads that tree.
+    let root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+    let p = format!("{root}/src/{path}");
+    std::fs::read_to_string(&p).unwrap_or_else(|_| panic!("{p}: the attach's seam is absent"))
+}
 
-/// The attach's handler text, from its entry to the next handler.
-fn attach_handler() -> &'static str {
-    let a = SESSION
-        .find("async fn dispatch_session_attach(")
-        .expect("the attach's handler");
-    let rest = &SESSION[a..];
-    let b = rest
-        .find("/// bsv-low W-B (D10): a `sessionMessage` from the client.")
-        .expect("the handler after it");
-    &rest[..b]
+/// The text of the fn starting at `head`, to the next line that closes it.
+fn body<'a>(text: &'a str, head: &str, close: &str) -> &'a str {
+    let a = text
+        .find(head)
+        .unwrap_or_else(|| panic!("`{head}` is absent"));
+    let rest = &text[a..];
+    &rest[..rest.find(close).unwrap_or(rest.len())]
 }
 
 #[test]
-fn a_refused_attach_writes_one_warn_line_with_its_reason_and_elapsed() {
-    let h = attach_handler();
+fn every_exit_of_the_exchange_returns_its_end() {
+    let attach = src("engineio/attach.rs");
+    let x = body(&attach, "pub(crate) async fn attach_exchange<", "\n}\n");
     assert!(
-        h.contains("console_warn!(\"{line}\")"),
-        "a refused attach writes no warn-level line"
-    );
-    assert!(
-        h.contains("crate::session_lane::attach_line(&end, seat.as_deref(), &sid, elapsed)"),
-        "the attach's end is not written through the one line (seat, sid, reason, elapsed)"
-    );
-    assert!(
-        !h.contains("console_log!(\"TRACE_SESSION attach refused"),
-        "a refusal still writes its own info line beside the one line"
-    );
-}
-
-#[test]
-fn every_exit_of_the_attach_ends_in_an_attach_end() {
-    let h = attach_handler();
-    let x = h
-        .find("async fn attach_exchange(")
-        .expect("the attach's exits are not typed: a bare return leaves no line");
-    let body = &h[x..];
-    assert!(
-        body.contains(") -> AttachEnd {"),
+        x.contains(") -> AttachEnd {"),
         "the exchange returns its end"
     );
+    assert!(!x.contains("return;"), "an exit returns without its end");
+    let returns = x.matches("return ").count();
+    let ended = x.matches("return refuse(").count() + x.matches("return AttachEnd::").count();
+    assert!(returns >= 10, "the exits enumerated: {returns}");
+    assert_eq!(returns, ended, "every return is a refusal or a named end");
     assert!(
-        !body.contains("return;"),
-        "an exit of the attach returns without its end"
+        x.trim_end().ends_with("AttachEnd::Answered"),
+        "the answered exit"
     );
+    let run = body(&attach, "pub(crate) async fn run_attach<", "\n}\n");
+    assert!(run.contains("attach_exchange(p, arg).await"));
+    assert!(run.contains("attach_line(&end, seat.as_deref(), &p.sid(), elapsed)"));
 }
 
 #[test]
-fn an_attach_answered_in_time_writes_nothing_above_debug() {
-    let h = attach_handler();
-    let ok = h
-        .find("\"TRACE_SESSION attached identity=")
-        .expect("the attached trace");
-    let before = &h[..ok];
-    let mac = before.rfind('!').expect("the macro");
-    let open = before[..mac].rfind(char::is_whitespace).unwrap() + 1;
-    assert_eq!(
-        &before[open..mac],
-        "console_debug",
-        "a timely attach writes above debug"
-    );
+fn the_do_writes_the_end_at_its_level() {
+    let session = src("engineio/session.rs");
+    let d = body(&session, "async fn dispatch_session_attach(", "\n    }\n");
+    assert!(d.contains("crate::engineio::attach::run_attach(&port, arg, started).await"));
+    for arm in [
+        "LineLevel::Warn => console_warn!(\"{line}\")",
+        "LineLevel::Info => console_log!(\"{line}\")",
+        "LineLevel::Debug => console_debug!(\"{line}\")",
+    ] {
+        assert!(d.contains(arm), "the level arm `{arm}`");
+    }
 }
 
 #[test]
-fn an_attach_that_rides_polling_is_dropped_with_its_line() {
-    let a = WORKER
-        .find("async fn handle_socketio_event(")
-        .expect("the Worker's event handler");
-    let h = &WORKER[a..WORKER[a..].find("\nasync fn auth_round_in_do(").unwrap() + a];
-    let attach = h
-        .find("event_name == crate::session_lane::ATTACH_EVENT")
-        .expect("an attach over polling is dropped with no line");
-    let gate = h
-        .find("if !auth.is_authenticated() {")
-        .expect("the Worker's auth gate");
-    assert!(attach < gate, "the line is written before the drop");
-    assert!(h[attach..gate].contains("console_warn!(\"{line}\")"));
+fn a_frame_the_do_cannot_read_leaves_the_line() {
+    let session = src("engineio/session.rs");
+    let ws = body(&session, "    async fn websocket_message(", "\n    }\n");
+    for reason in [
+        "undecoded.no-attachment",
+        "undecoded.attachment-unreadable",
+        "undecoded.binary",
+        "undecoded.engineio",
+    ] {
+        assert!(
+            ws.contains(&format!("self.undecoded_line(\"{reason}\"")),
+            "`{reason}` leaves no line"
+        );
+    }
+    let sio = body(&session, "    async fn dispatch_socketio(", "\n    }\n");
+    for reason in ["undecoded.socketio", "undecoded.event-name"] {
+        assert!(sio.contains(&format!("self.undecoded_line(\"{reason}\"")));
+    }
+}
+
+#[test]
+fn the_worker_s_attach_and_entry_exits_leave_their_line() {
+    let worker = src("socketio_worker.rs");
+    let ev = body(&worker, "async fn handle_socketio_event(", "\n}\n");
+    let unauth = ev
+        .find("if is_attach && !auth.is_authenticated() {")
+        .expect("an attach over polling, unauthenticated");
+    assert!(
+        ev[unauth..].contains("attach_end_line(AttachEnd::Dropped(\"polling-unauthenticated\"));")
+    );
+    let fwd = ev
+        .find("forward_and_enqueue(")
+        .expect("the authenticated forward");
+    let after = ev
+        .find("attach_end_line(polling_attach_end(&enqueued));")
+        .expect("the forwarded attach's line");
+    assert!(
+        fwd < after,
+        "the line follows the forward, so `ms` covers it"
+    );
+    let post = body(&worker, "pub async fn handle_polling_post(", "\n}\n");
+    for reason in ["kv-binding", "session-closed", "undecoded.polling-batch"] {
+        assert!(
+            post.contains(&format!("\"{reason}\")")),
+            "`{reason}` leaves no line"
+        );
+    }
+    let fwd = body(&worker, "pub async fn forward_to_session(", "\n}\n");
+    assert!(fwd.contains("\"do-binding\""));
+    assert!(fwd.contains("watch_entry("));
+    let lib = src("lib.rs");
+    let route = body(&lib, "async fn route_socketio_request(", "\n}\n");
+    assert!(route.contains("socketio_worker::forward_to_session("));
+    assert!(route.contains("socketio_worker::entry_binding_fault("));
 }
