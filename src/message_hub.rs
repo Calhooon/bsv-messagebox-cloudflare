@@ -355,10 +355,11 @@ struct SocketAttachment {
     /// entry here is owned by `identity_key`.
     #[serde(default)]
     joined_rooms: Vec<String>,
-    /// Message box #45: the rooms this socket left by `leaveRoom` inside the
-    /// last `LEFT_BEFORE_CLOSE_MS`, walked by its close (`close_walk`).
+    /// Message box #45: the rooms this socket left by `leaveRoom` and has not
+    /// rejoined, in the order left, walked by its close (`close_walk`). Bounded by
+    /// the record's bytes (`bound_left_rooms`).
     #[serde(default)]
-    left_rooms: Vec<LeftRoom>,
+    left_rooms: Vec<String>,
 }
 
 /// Inbound event envelope: `{ "event": "<name>", "data": { ... } }`.
@@ -534,10 +535,12 @@ pub(crate) struct SocketIoRegistryEntry {
     // bounded: a millisecond stamp
     #[serde(default)]
     expires_at_ms: Option<u64>,
-    /// Message box #45: the rooms this session left by `leaveRoom` inside
-    /// the last `LEFT_BEFORE_CLOSE_MS`, walked by its close (`close_walk`).
+    /// Message box #45: the rooms this session left by `leaveRoom` and has
+    /// not rejoined, in the order left, walked by its close (`close_walk`) and by
+    /// its lease's lapse (`lapsed_departures`). Bounded by the record's bytes
+    /// (`bound_left_rooms`).
     #[serde(default)]
-    left_rooms: Vec<LeftRoom>,
+    left_rooms: Vec<String>,
 }
 
 /// 0.6.2: the bound on one session's answer in the hub's socket.io leg
@@ -792,7 +795,8 @@ fn lapsed_departures(
             .unwrap_or(0)
             .saturating_sub(SOCKETIO_SUB_LEASE_MS)
             .max(entry.registered_at_ms);
-        for room in &entry.joined_rooms {
+        // #45: a lapse is a close the relay infers; it walks what a close walks.
+        for room in &close_walk(&entry.joined_rooms, &entry.left_rooms) {
             let held =
                 raw_rooms.contains(room) || live.iter().any(|e| e.joined_rooms.contains(room));
             let Some(leaver) = room_identity(room) else {
@@ -824,28 +828,6 @@ fn fresh_socketio_entry(sid: &str, now_ms: u64) -> SocketIoRegistryEntry {
         expires_at_ms: None,
         left_rooms: Vec::new(),
     }
-}
-
-/// A socket.io `joinRoom` on the sid's registry entry.
-fn socketio_join(entry: &mut SocketIoRegistryEntry, room: &str) {
-    if !entry.joined_rooms.iter().any(|r| r == room) {
-        entry.joined_rooms.push(room.to_string());
-    }
-    entry.left_rooms.retain(|l| l.room != room);
-}
-
-/// A socket.io `leaveRoom` on the sid's registry entry.
-fn socketio_leave(entry: &mut SocketIoRegistryEntry, room: &str, now_ms: u64) {
-    let before = entry.joined_rooms.len();
-    entry.joined_rooms.retain(|r| r != room);
-    if entry.joined_rooms.len() != before {
-        note_left_room(&mut entry.left_rooms, room, now_ms);
-    }
-}
-
-/// The rooms a socket.io close walks (`handle_socketio_unregister`).
-fn socketio_close_walk(entry: &SocketIoRegistryEntry, now_ms: u64) -> Vec<String> {
-    close_walk(&entry.joined_rooms, &entry.left_rooms, now_ms)
 }
 
 /// A live session renews its entry's lease (0.6.2): the register route with
@@ -1449,13 +1431,8 @@ impl MessageHub {
                     self.notify_broadcast_registry(&attachment.identity_key)
                         .await;
                 }
-                let left_before = attachment.left_rooms.len();
-                attachment.left_rooms.retain(|l| l.room != room_id);
-                let rejoined = attachment.left_rooms.len() != left_before;
-                if !attachment.joined_rooms.iter().any(|r| r == &room_id) {
-                    attachment.joined_rooms.push(room_id.clone());
-                    ws.serialize_attachment(&*attachment)?;
-                } else if rejoined {
+                if let Some(dropped) = record_join(&mut *attachment, &room_id) {
+                    warn_left_rooms_dropped(&attachment.identity_key, &dropped);
                     ws.serialize_attachment(&*attachment)?;
                 }
                 // Advisory heartbeat: a join is a high-signal room touch.
@@ -1512,20 +1489,15 @@ impl MessageHub {
                     let _ = emit_leave_failed(ws, &reason);
                     return Ok(());
                 }
-                let before = attachment.joined_rooms.len();
-                attachment.joined_rooms.retain(|r| r != &room_id);
-                if attachment.joined_rooms.len() != before {
-                    // #45: a close soon after still walks this room.
-                    note_left_room(
-                        &mut attachment.left_rooms,
-                        &room_id,
-                        Date::now().as_millis(),
-                    );
+                if let Some(dropped) = record_leave(&mut *attachment, &room_id) {
+                    warn_left_rooms_dropped(&attachment.identity_key, &dropped);
                     ws.serialize_attachment(&*attachment)?;
                 }
                 emit_left_room(ws, &room_id)?;
-                // #40: an explicit leave is a deliberate departure — if this
-                // was the identity's last seat in the room, tell the peer.
+                // A leave tells the room nothing (0.3.15: `departure_signals`
+                // is false for a leave, so this call arms and stamps nothing);
+                // the room stays in the socket's `left_rooms` and its close
+                // walks it (#45).
                 self.maybe_notify_peer_left(
                     &attachment.identity_key,
                     std::slice::from_ref(&room_id),
@@ -1751,8 +1723,12 @@ impl MessageHub {
                 // so `handle_internal_push` filters fan-out by joined
                 // rooms — same semantics as the raw-WS path's
                 // `SocketAttachment.joined_rooms`.
-                self.update_socketio_rooms(&sid, |entry, _| socketio_join(entry, &room_id))
-                    .await;
+                let mut dropped = Vec::new();
+                self.update_socketio_rooms(&sid, |entry| {
+                    dropped = record_join(entry, &room_id).unwrap_or_default();
+                })
+                .await;
+                warn_left_rooms_dropped(&identity_key, &dropped);
                 // Advisory heartbeat: a join is a high-signal room touch.
                 self.stamp_last_seen(&room_id).await;
                 // LOW #85: clear the OWN-room confirmed-gone marker on join (as the
@@ -1796,14 +1772,16 @@ impl MessageHub {
                         json!({ "reason": reason }),
                     )];
                 }
-                self.update_socketio_rooms(&sid, |entry, now_ms| {
-                    socketio_leave(entry, &room_id, now_ms)
+                let mut dropped = Vec::new();
+                self.update_socketio_rooms(&sid, |entry| {
+                    dropped = record_leave(entry, &room_id).unwrap_or_default();
                 })
                 .await;
-                // #40: explicit leave over the socket.io bridge — if this was
-                // the identity's last seat in the room, tell the peer. The
-                // registry entry was just updated, so the occupancy scan
-                // already excludes this membership; skip the sid anyway.
+                warn_left_rooms_dropped(&identity_key, &dropped);
+                // A leave tells the room nothing (0.3.15: `departure_signals`
+                // is false for a leave, so this call arms and stamps nothing);
+                // the room stays in the session's `leftRooms` and its close
+                // walks it (#45).
                 self.maybe_notify_peer_left(
                     &identity_key,
                     std::slice::from_ref(&room_id),
@@ -2212,7 +2190,7 @@ impl MessageHub {
     /// directed to registered sids.
     async fn update_socketio_rooms<F>(&self, sid: &str, mutate: F)
     where
-        F: FnOnce(&mut SocketIoRegistryEntry, u64),
+        F: FnOnce(&mut SocketIoRegistryEntry),
     {
         if sid.is_empty() {
             return;
@@ -2242,7 +2220,7 @@ impl MessageHub {
         };
         let before: Vec<String> = entry.joined_rooms.clone();
         let now_ms = Date::now().as_millis();
-        mutate(&mut entry, now_ms);
+        mutate(&mut entry);
         // 0.6.2: a room mutation is the session speaking; it renews the lease.
         entry.expires_at_ms = Some(now_ms + SOCKETIO_SUB_LEASE_MS);
         let added: Vec<String> = entry
@@ -2283,7 +2261,7 @@ impl MessageHub {
             self.revoke_session_mirror(id).await;
         }
         if let Some(entry) = departing {
-            let rooms = socketio_close_walk(&entry, Date::now().as_millis());
+            let rooms = close_walk(&entry.joined_rooms, &entry.left_rooms);
             if !rooms.is_empty() {
                 if let Some(leaver) = room_identity(&rooms[0]).map(str::to_string) {
                     self.maybe_notify_peer_left(
@@ -2482,9 +2460,7 @@ impl MessageHub {
     /// Best-effort throughout: presence never fails a lifecycle handler.
     async fn teardown_departed_socket(&self, ws: &WebSocket) {
         let attachment: Option<SocketAttachment> = ws.deserialize_attachment().ok().flatten();
-        let now_ms = Date::now().as_millis();
-        let Some((latched, rooms, leaver)) = attachment.and_then(|a| split_departure(a, now_ms))
-        else {
+        let Some((latched, rooms, leaver)) = attachment.and_then(split_departure) else {
             return; // no attachment, no rooms, or already latched by the other handler
         };
         // Write the latch BEFORE the async notify. If the write fails
@@ -3597,50 +3573,116 @@ fn presence_answer(
     }
 }
 
-/// Message box #45: a room a socket left by `leaveRoom`, and when.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct LeftRoom {
-    room: String,
-    // bounded: a millisecond stamp
-    at_ms: u64,
+/// Message box #45: the bytes a session's record of its rooms (a raw
+/// socket's `SocketAttachment`, a socket.io session's
+/// `SocketIoRegistryEntry`) may take, read as its JSON. The cap of a
+/// hibernatable socket's attachment (`serialize_attachment`) is 2,048 bytes;
+/// the registry entry lives in DO storage, which has no such cap, and is held
+/// to the same figure so the two legs keep the same record.
+pub(crate) const ROOM_RECORD_MAX_BYTES: usize = 2_048;
+
+/// Message box #45: a session's record of its rooms. Every room it holds
+/// (`joined`) and every room it left by `leaveRoom` and has not rejoined
+/// (`left`, in the order left). The two never share a room: a leave moves a room
+/// from `joined` to `left`, a join moves it back.
+trait RoomRecord: Serialize {
+    fn rooms(&mut self) -> (&mut Vec<String>, &mut Vec<String>);
 }
 
-/// Message box #45: how long before its socket's close a `leaveRoom` still
-/// counts as the close's own departure. LOW's `TableClient` tears its socket
-/// down with `leaveRoom(<game box>)` then `disconnectWebSocket()` (`stop()`,
-/// and the watchdog's `resetSocket()`); a leave arms nothing
-/// (`departure_signals`), so the close walked the rooms still joined and the
-/// game room was never pushed (LOW's fold, 2026-11-03: `peerLeft` reached
-/// hello and events, the game room answered `null` for 75 s). The departure
-/// debounce's own window: a hop that rejoins inside it pushes nothing either
-/// way (the alarm's occupancy re-check), and a leave older than it stays the
-/// clean leave 0.3.15 made it.
-pub(crate) const LEFT_BEFORE_CLOSE_MS: u64 = PEER_LEFT_DEBOUNCE_MS;
-
-/// PURE (#45): record a `leaveRoom` of `room` at `now_ms`, dropping the
-/// entries the window has passed (so the list holds a few seconds of leaves,
-/// never a session's history). A waiting host's lobby room is never kept: its
-/// clean leave is a match or a cancel and never fans a `host-left` (full18
-/// run 2, P6).
-fn note_left_room(left: &mut Vec<LeftRoom>, room: &str, now_ms: u64) {
-    left.retain(|l| l.room != room && now_ms.saturating_sub(l.at_ms) <= LEFT_BEFORE_CLOSE_MS);
-    if !crate::is_lobby_room(room) {
-        left.push(LeftRoom {
-            room: room.to_string(),
-            at_ms: now_ms,
-        });
+impl RoomRecord for SocketAttachment {
+    fn rooms(&mut self) -> (&mut Vec<String>, &mut Vec<String>) {
+        (&mut self.joined_rooms, &mut self.left_rooms)
     }
 }
 
-/// PURE (#45): the rooms a socket's close walks: every room it holds, then
-/// every room it left inside `LEFT_BEFORE_CLOSE_MS` of `now_ms` and did not
-/// rejoin. The walk arms each one the same way (`maybe_notify_peer_left`).
-fn close_walk(joined: &[String], left: &[LeftRoom], now_ms: u64) -> Vec<String> {
+impl RoomRecord for SocketIoRegistryEntry {
+    fn rooms(&mut self) -> (&mut Vec<String>, &mut Vec<String>) {
+        (&mut self.joined_rooms, &mut self.left_rooms)
+    }
+}
+
+/// PURE (#45): a `joinRoom` of `room`, the core of the raw `/ws` join and the
+/// socket.io join alike. The room is held again and is no longer a left
+/// room, so a leave then a rejoin on one session leaves nothing for its
+/// close to report (the 0.3.15 room hop). `None` when the record is
+/// unchanged; else the left rooms dropped to keep it under
+/// `ROOM_RECORD_MAX_BYTES`.
+fn record_join<R: RoomRecord>(record: &mut R, room: &str) -> Option<Vec<String>> {
+    let (joined, left) = record.rooms();
+    let before = left.len();
+    left.retain(|l| l != room);
+    let mut changed = left.len() != before;
+    if !joined.iter().any(|r| r == room) {
+        joined.push(room.to_string());
+        changed = true;
+    }
+    changed.then(|| bound_left_rooms(record))
+}
+
+/// PURE (#45): a `leaveRoom` of `room`, the core of the raw `/ws` leave and
+/// the socket.io leave alike. A held room moves to the left rooms, where it
+/// stays until the session closes or rejoins it; no time ends it. LOW's
+/// `TableClient` tears its socket down with `leaveRoom(<game box>)` then
+/// `disconnectWebSocket()` (`stop()`, and the watchdog's `resetSocket()`),
+/// and the relay may see that close at once or only at the heartbeat's
+/// timeout; either way the close walks the game room. A waiting host's lobby
+/// room is never kept: its clean leave is a match or a cancel and never fans
+/// a `host-left` (full18 run 2, P6). `None` when the room was not held; else
+/// the left rooms dropped to keep the record under `ROOM_RECORD_MAX_BYTES`.
+fn record_leave<R: RoomRecord>(record: &mut R, room: &str) -> Option<Vec<String>> {
+    let (joined, left) = record.rooms();
+    let before = joined.len();
+    joined.retain(|r| r != room);
+    if joined.len() == before {
+        return None;
+    }
+    if !crate::is_lobby_room(room) {
+        left.retain(|l| l != room);
+        left.push(room.to_string());
+    }
+    Some(bound_left_rooms(record))
+}
+
+/// PURE (#45): the left rooms dropped, the oldest each time, until the record's JSON
+/// is at most `ROOM_RECORD_MAX_BYTES`. The held rooms are never dropped; a
+/// record over the cap on its held rooms alone keeps no left room.
+fn bound_left_rooms<R: RoomRecord>(record: &mut R) -> Vec<String> {
+    let mut dropped = Vec::new();
+    while room_record_bytes(record) > ROOM_RECORD_MAX_BYTES {
+        let (_, left) = record.rooms();
+        if left.is_empty() {
+            break;
+        }
+        dropped.push(left.remove(0));
+    }
+    dropped
+}
+
+/// The bytes of a record's JSON (`ROOM_RECORD_MAX_BYTES`).
+fn room_record_bytes<R: Serialize>(record: &R) -> usize {
+    serde_json::to_vec(record).map_or(usize::MAX, |v| v.len())
+}
+
+/// The warn line for left rooms a record dropped at its cap: their seat's
+/// close will not reach them.
+fn warn_left_rooms_dropped(identity_key: &str, dropped: &[String]) {
+    for room in dropped {
+        console_warn!(
+            "MessageHub: #45 left room dropped at the {ROOM_RECORD_MAX_BYTES}-byte record cap \
+             (identity={identity_key} room={room}); its close will not walk it"
+        );
+    }
+}
+
+/// PURE (#45): the rooms a session's close walks (and its lease's lapse):
+/// every room it holds, then every room it left and did not rejoin. The walk
+/// arms each one the same way (`maybe_notify_peer_left`), and the debounce's
+/// occupancy re-check pushes nothing to a room another session holds.
+fn close_walk(joined: &[String], left: &[String]) -> Vec<String> {
     let mut rooms = joined.to_vec();
     for l in left {
-        if now_ms.saturating_sub(l.at_ms) <= LEFT_BEFORE_CLOSE_MS && !rooms.contains(&l.room) {
-            rooms.push(l.room.clone());
+        if !rooms.contains(l) {
+            rooms.push(l.clone());
         }
     }
     rooms
@@ -3655,12 +3697,9 @@ fn close_walk(joined: &[String], left: &[LeftRoom], now_ms: u64) -> Vec<String> 
 /// leaver identity. The runtime can fire BOTH `websocket_close` and
 /// `websocket_error` for one socket; writing the latched attachment
 /// after the first makes the second a no-op.
-fn split_departure(
-    mut a: SocketAttachment,
-    now_ms: u64,
-) -> Option<(SocketAttachment, Vec<String>, String)> {
-    // #45: the rooms left just before the close are the close's too.
-    let rooms = close_walk(&a.joined_rooms, &a.left_rooms, now_ms);
+fn split_departure(mut a: SocketAttachment) -> Option<(SocketAttachment, Vec<String>, String)> {
+    // #45: the rooms the socket left and did not rejoin are the close's too.
+    let rooms = close_walk(&a.joined_rooms, &a.left_rooms);
     a.joined_rooms.clear();
     a.left_rooms.clear();
     if rooms.is_empty() {
@@ -4617,7 +4656,7 @@ mod tests {
             joined_rooms: vec![room_a.clone(), room_b.clone()],
             left_rooms: Vec::new(),
         };
-        let (latched, rooms, leaver) = split_departure(a, 0).expect("departure due");
+        let (latched, rooms, leaver) = split_departure(a).expect("departure due");
         assert_eq!(leaver, ID_A);
         assert_eq!(rooms, vec![room_a, room_b]);
         // The latch is the SAME attachment minus rooms — identity and
@@ -4639,7 +4678,7 @@ mod tests {
             joined_rooms: Vec::new(),
             left_rooms: Vec::new(),
         };
-        assert!(split_departure(a, 0).is_none());
+        assert!(split_departure(a).is_none());
     }
 
     #[test]
@@ -4651,19 +4690,16 @@ mod tests {
             identity_key: ID_A.to_string(),
             connected_at_ms: 2,
             joined_rooms: vec![format!("{ID_A}-low_game_x")],
-            left_rooms: vec![LeftRoom {
-                room: format!("{ID_A}-low_events"),
-                at_ms: 0,
-            }],
+            left_rooms: vec![format!("{ID_A}-low_events")],
         };
-        let (latched, rooms, _) = split_departure(a, 0).expect("first pass notifies");
+        let (latched, rooms, _) = split_departure(a).expect("first pass notifies");
         assert_eq!(
             rooms.len(),
             2,
-            "the joined room and the room left just before"
+            "the joined room and the room left and not rejoined"
         );
         assert!(
-            split_departure(latched, 0).is_none(),
+            split_departure(latched).is_none(),
             "second lifecycle event must find nothing to depart"
         );
     }
@@ -6390,8 +6426,10 @@ mod decouple_hub_tests {
 /// `leaveRoom(<game box>)` then `disconnectWebSocket()` (`stop()`, and the
 /// watchdog's `resetSocket()`). No harness here reaches a DO close, so the
 /// witness drives the hub at its function level: the registry entry through
-/// the join, leave and close-walk cores `dispatch_socketio_event` and
-/// `handle_socketio_unregister` call, then the departure debounce
+/// the join, leave and close-walk cores (`record_join`, `record_leave`,
+/// `close_walk`) that `dispatch_socketio_event`, `dispatch_event` (raw `/ws`)
+/// and `handle_socketio_unregister` call, the lease lapse
+/// (`lapsed_departures`), then the departure debounce
 /// (`arm_departure_debounce`, `split_due_pending`, `departure_push_due`) and
 /// the presence verdict (`presence_answer`) over what they leave.
 #[cfg(test)]
@@ -6410,6 +6448,9 @@ mod peer_left_every_room_tests {
     fn game() -> String {
         room(&format!("{}{GID}", crate::GAME_ROOM_PREFIX))
     }
+    fn game_n(n: usize) -> String {
+        room(&format!("{}{:064x}", crate::GAME_ROOM_PREFIX, n))
+    }
     fn events() -> String {
         room(crate::EVENTS_BOX)
     }
@@ -6417,12 +6458,16 @@ mod peer_left_every_room_tests {
         room(&format!("low_hello_{GID}"))
     }
 
-    /// The hub's view of one identity's socket.io sessions and its debounce.
+    /// The hub's view of one identity's socket.io sessions and its debounce,
+    /// with the pushes it sends in order: `peerJoined` on every join
+    /// (`push_peer_joined`), `peerLeft` when an alarm tick finds a room due
+    /// and empty.
     struct Hub {
         live: Vec<SocketIoRegistryEntry>,
         pending: BTreeMap<String, PendingPeerLeft>,
         confirmed: BTreeMap<String, ToldPresence>,
         last_seen: BTreeMap<String, u64>,
+        pushes: Vec<(&'static str, String)>,
     }
 
     impl Hub {
@@ -6432,6 +6477,7 @@ mod peer_left_every_room_tests {
                 pending: BTreeMap::new(),
                 confirmed: BTreeMap::new(),
                 last_seen: BTreeMap::new(),
+                pushes: Vec::new(),
             }
         }
         fn entry(&mut self, sid: &str, now_ms: u64) -> &mut SocketIoRegistryEntry {
@@ -6446,23 +6492,19 @@ mod peer_left_every_room_tests {
                 .any(|e| e.joined_rooms.iter().any(|r| r == room))
         }
         fn join(&mut self, sid: &str, room: &str, now_ms: u64) {
-            socketio_join(self.entry(sid, now_ms), room);
+            record_join(self.entry(sid, now_ms), room);
             self.last_seen.insert(room.to_string(), now_ms);
             self.confirmed
                 .insert(room.to_string(), ToldPresence::Present);
+            self.pushes.push(("peerJoined", room.to_string()));
         }
         fn leave(&mut self, sid: &str, room: &str, now_ms: u64) {
-            socketio_leave(self.entry(sid, now_ms), room, now_ms);
+            record_leave(self.entry(sid, now_ms), room);
             // A leaveRoom arms nothing (`departure_signals(room, false)`).
             assert!(!departure_signals(room, false));
         }
-        /// `handle_socketio_unregister` then `maybe_notify_peer_left`: the
-        /// walked rooms, each armed when no other session holds it.
-        fn close(&mut self, sid: &str, now_ms: u64) -> Vec<String> {
-            let at = self.live.iter().position(|e| e.sid == sid).unwrap();
-            let entry = self.live.remove(at);
-            let walked = socketio_close_walk(&entry, now_ms);
-            for r in &walked {
+        fn arm(&mut self, rooms: &[String], now_ms: u64) {
+            for r in rooms {
                 assert!(departure_signals(r, true));
                 self.last_seen.insert(r.clone(), now_ms);
                 if !self.occupied(r) {
@@ -6470,7 +6512,27 @@ mod peer_left_every_room_tests {
                         .insert(r.clone(), arm_departure_debounce(&seat(), now_ms));
                 }
             }
+        }
+        /// `handle_socketio_unregister` then `maybe_notify_peer_left`: the
+        /// walked rooms, each armed when no other session holds it.
+        fn close(&mut self, sid: &str, now_ms: u64) -> Vec<String> {
+            let at = self.live.iter().position(|e| e.sid == sid).unwrap();
+            let entry = self.live.remove(at);
+            let walked = close_walk(&entry.joined_rooms, &entry.left_rooms);
+            self.arm(&walked, now_ms);
             walked
+        }
+        /// The session's lease lapses with no close
+        /// (`arm_lapsed_departures`): the rooms armed.
+        fn lapse(&mut self, sid: &str, now_ms: u64) -> Vec<String> {
+            let at = self.live.iter().position(|e| e.sid == sid).unwrap();
+            let entry = self.live.remove(at);
+            let rooms: Vec<String> = lapsed_departures(&[entry], &self.live, &[])
+                .into_iter()
+                .map(|d| d.room)
+                .collect();
+            self.arm(&rooms, now_ms);
+            rooms
         }
         /// One alarm tick (`run_departure_debounce_alarm`): the rooms pushed.
         fn alarm(&mut self, now_ms: u64) -> Vec<String> {
@@ -6485,6 +6547,9 @@ mod peer_left_every_room_tests {
                 }
             }
             pushed.sort();
+            for r in &pushed {
+                self.pushes.push(("peerLeft", r.clone()));
+            }
             pushed
         }
         /// `handle_presence` for `room`.
@@ -6498,6 +6563,14 @@ mod peer_left_every_room_tests {
                 now_ms,
             )
         }
+        /// The pushes `room` received, in order, from the `from`th on.
+        fn pushes_to(&self, room: &str, from: usize) -> Vec<&'static str> {
+            self.pushes[from..]
+                .iter()
+                .filter(|(_, r)| r == room)
+                .map(|(e, _)| *e)
+                .collect()
+        }
     }
 
     fn sorted(mut v: Vec<String>) -> Vec<String> {
@@ -6505,14 +6578,13 @@ mod peer_left_every_room_tests {
         v
     }
 
-    /// The witness: LOW's seat joins its three rooms on one socket, its
-    /// `stop()` leaves the game box and closes the socket. All three rooms
-    /// are pushed in the one alarm tick, and the game room's presence
+    /// LOW's `stop()`: the seat joins its three rooms on one session, leaves
+    /// the game box, and the session closes `close_after_ms` later. All three
+    /// rooms are pushed in the one alarm tick, and the game room's presence
     /// answers departed (`false`) on the next listen. On the base the close
     /// walks hello and events only: the game room is never pushed and its
     /// presence stays `null` (unknown) for the whole idle window.
-    #[test]
-    fn a_close_pushes_peer_left_to_every_room_the_seat_was_attached_to() {
+    fn stop_then_close(close_after_ms: u64) {
         let mut hub = Hub::new();
         let t0 = 1_000_000;
         hub.join("seat-sid", &game(), t0);
@@ -6520,7 +6592,7 @@ mod peer_left_every_room_tests {
         hub.join("seat-sid", &hello(), t0 + 20);
         let t_stop = t0 + 60_000;
         hub.leave("seat-sid", &game(), t_stop);
-        let t_close = t_stop + 30;
+        let t_close = t_stop + close_after_ms;
         let walked = sorted(hub.close("seat-sid", t_close));
         // One alarm tick, then the survivor's next listen of the game room.
         let tick = t_close + PEER_LEFT_DEBOUNCE_MS;
@@ -6535,17 +6607,93 @@ mod peer_left_every_room_tests {
         assert!(hub.pending.is_empty());
     }
 
-    /// A clean leave stays clean (0.3.15): a room left well before the
-    /// close (a room hop that never came back, a match) is not the close's.
+    /// The witness: the close 30 ms after the leave (LOW's `stop()`).
     #[test]
-    fn a_room_left_long_before_the_close_is_not_walked() {
+    fn a_close_pushes_peer_left_to_every_room_the_seat_was_attached_to() {
+        stop_then_close(30);
+    }
+
+    /// The slow close: the relay sees the close 10 s after the leave (a
+    /// dropped socket found by the heartbeat, not by a DISCONNECT). The game
+    /// room is still the close's: no time ends a left room. Red on 6a8aca8,
+    /// whose 4 s window had let the game room go.
+    #[test]
+    fn a_close_10_s_after_the_leave_still_pushes_peer_left_to_the_game_room() {
+        stop_then_close(10_000);
+    }
+
+    /// The heartbeat's own bound (`PING_INTERVAL_MS` 25,000 plus
+    /// `PING_TIMEOUT_MS` 20,000) and past it: the same.
+    #[test]
+    fn a_close_at_the_heartbeat_timeout_and_past_it_still_pushes_peer_left() {
+        stop_then_close(45_000);
+        stop_then_close(PRESENCE_IDLE_WINDOW_MS);
+    }
+
+    /// Sequence one: a leave then a rejoin on the same session, no close
+    /// between. The rejoin takes the room off the left rooms, so nothing is
+    /// armed and no `peerLeft` is ever pushed, however late the rejoin (the
+    /// 0.3.15 room hop); a later close walks the game room once, as held.
+    #[test]
+    fn a_leave_then_a_rejoin_on_the_same_session_pushes_no_peer_left() {
         let mut hub = Hub::new();
-        let t0 = 1_000_000;
-        hub.join("s", &game(), t0);
-        hub.join("s", &events(), t0);
-        hub.leave("s", &game(), t0 + 1_000);
-        let t_close = t0 + 1_000 + PEER_LEFT_DEBOUNCE_MS + 1;
-        assert_eq!(hub.close("s", t_close), vec![events()]);
+        hub.join("s", &game(), 1_000);
+        hub.join("s", &events(), 1_000);
+        let mark = hub.pushes.len();
+        hub.leave("s", &game(), 2_000);
+        hub.join("s", &game(), 2_000 + 10_000);
+        assert!(hub.live[0].left_rooms.is_empty());
+        assert!(hub.pending.is_empty());
+        assert!(hub.alarm(2_000 + 60_000).is_empty());
+        assert_eq!(hub.presence(&game(), 2_000 + 60_000), Some(true));
+        assert_eq!(hub.pushes_to(&game(), mark), vec!["peerJoined"]);
+        assert_eq!(
+            sorted(hub.close("s", 70_000)),
+            sorted(vec![game(), events()])
+        );
+    }
+
+    /// Sequence two: a leave then a close however late: `peerLeft` to the
+    /// left room (the two slow-close tests above, at 10 s, 45 s and the idle
+    /// window). Sequence three: a leave, a close, and a rejoin on a new
+    /// session after the debounce's tick: `peerLeft` then `peerJoined`, in
+    /// that order, which is that sequence's truth; never a `peerLeft` while
+    /// the seat holds the room.
+    #[test]
+    fn a_leave_a_close_and_a_rejoin_on_a_new_session_push_peer_left_then_peer_joined() {
+        let mut hub = Hub::new();
+        hub.join("old", &game(), 1_000);
+        hub.join("old", &events(), 1_000);
+        let mark = hub.pushes.len();
+        hub.leave("old", &game(), 5_000);
+        hub.close("old", 15_000);
+        let tick = 15_000 + PEER_LEFT_DEBOUNCE_MS;
+        assert_eq!(hub.alarm(tick), sorted(vec![game(), events()]));
+        assert_eq!(hub.presence(&game(), tick + 1), Some(false));
+        hub.join("new", &game(), tick + 1_000);
+        assert_eq!(hub.pushes_to(&game(), mark), vec!["peerLeft", "peerJoined"]);
+        assert_eq!(hub.presence(&game(), tick + 1_001), Some(true));
+        assert!(hub.alarm(tick + 60_000).is_empty());
+    }
+
+    /// The watchdog's `resetSocket()` at 980 ms: leave the game box, close
+    /// the socket, rejoin on a fresh sid inside the debounce. The game room
+    /// is walked and armed, and the rejoin suppresses the push: no false
+    /// departure.
+    #[test]
+    fn a_socket_reset_that_rejoins_inside_the_debounce_pushes_nothing_for_the_game_room() {
+        let mut hub = Hub::new();
+        hub.join("old", &game(), 1_000);
+        hub.join("old", &events(), 1_000);
+        let mark = hub.pushes.len();
+        hub.leave("old", &game(), 5_000);
+        let walked = hub.close("old", 5_020);
+        assert!(walked.contains(&game()));
+        hub.join("new", &game(), 6_000);
+        hub.join("new", &events(), 6_010);
+        assert!(hub.alarm(5_020 + PEER_LEFT_DEBOUNCE_MS).is_empty());
+        assert_eq!(hub.presence(&game(), 9_100), Some(true));
+        assert_eq!(hub.pushes_to(&game(), mark), vec!["peerJoined"]);
     }
 
     /// A waiting host's lobby room left by a match or a cancel never fans a
@@ -6560,41 +6708,131 @@ mod peer_left_every_room_tests {
         assert!(hub.close("s", 2_010).is_empty());
     }
 
-    /// The watchdog's `resetSocket()`: leave the game box, close the socket,
-    /// re-join on a fresh sid inside the debounce. The game room is walked
-    /// and armed, and the re-join suppresses the push: no false departure.
+    /// #52, the lease's half: a session that leaves the game box and then
+    /// dies without a close lapses; the lapse walks what a close walks, so
+    /// the game room is pushed too.
     #[test]
-    fn a_socket_reset_that_rejoins_inside_the_debounce_pushes_nothing_for_the_game_room() {
+    fn a_lease_lapse_after_a_leave_pushes_peer_left_to_the_left_room() {
         let mut hub = Hub::new();
-        hub.join("old", &game(), 1_000);
-        hub.join("old", &events(), 1_000);
-        hub.leave("old", &game(), 5_000);
-        let walked = hub.close("old", 5_020);
-        assert!(walked.contains(&game()));
-        hub.join("new", &game(), 6_000);
-        hub.join("new", &events(), 6_010);
-        assert!(hub.alarm(5_020 + PEER_LEFT_DEBOUNCE_MS).is_empty());
-        assert_eq!(hub.presence(&game(), 9_100), Some(true));
+        hub.join("s", &game(), 1_000);
+        hub.join("s", &events(), 1_000);
+        hub.leave("s", &game(), 2_000);
+        let armed = sorted(hub.lapse("s", 2_000 + SOCKETIO_SUB_LEASE_MS));
+        assert_eq!(armed, sorted(vec![game(), events()]));
+        let tick = 2_000 + SOCKETIO_SUB_LEASE_MS + PEER_LEFT_DEBOUNCE_MS;
+        assert_eq!(hub.alarm(tick), sorted(vec![game(), events()]));
     }
 
-    /// The raw `/ws` leg keeps the same rule on its attachment: a room left
-    /// just before the close is the close's (`split_departure`), and the
+    /// One sequence on a record through the shared cores: join the three
+    /// rooms, leave the game box, rejoin it, leave it again. The record
+    /// holds hello and events, and the game room as left, once.
+    fn drive<R: RoomRecord>(record: &mut R) {
+        for r in [game(), events(), hello()] {
+            assert_eq!(record_join(record, &r), Some(Vec::new()));
+        }
+        assert_eq!(
+            record_join(record, &events()),
+            None,
+            "a held room: unchanged"
+        );
+        assert_eq!(record_leave(record, &game()), Some(Vec::new()));
+        assert_eq!(record_leave(record, &game()), None, "not held: unchanged");
+        assert_eq!(record_join(record, &game()), Some(Vec::new()));
+        let (joined, left) = record.rooms();
+        assert!(
+            left.is_empty(),
+            "the rejoin takes the room off the left rooms"
+        );
+        assert_eq!(joined.len(), 3);
+        assert_eq!(record_leave(record, &game()), Some(Vec::new()));
+        let (joined, left) = record.rooms();
+        assert_eq!(sorted(joined.clone()), sorted(vec![events(), hello()]));
+        assert_eq!(left.clone(), vec![game()]);
+    }
+
+    /// #52: the raw `/ws` join and leave (`dispatch_event`) run the same
+    /// cores, and its close (`split_departure`) walks the left room; the
     /// latch clears both lists so a close and an error depart once.
     #[test]
-    fn a_raw_socket_close_walks_the_room_it_left_just_before() {
+    fn the_raw_ws_join_and_leave_run_the_shared_cores() {
         let mut a = SocketAttachment {
             identity_key: seat(),
             connected_at_ms: 1,
-            joined_rooms: vec![game(), events(), hello()],
+            joined_rooms: Vec::new(),
             left_rooms: Vec::new(),
         };
-        a.joined_rooms.retain(|r| r != &game());
-        note_left_room(&mut a.left_rooms, &game(), 5_000);
-        let (latched, rooms, leaver) = split_departure(a, 5_030).expect("a departure");
+        drive(&mut a);
+        let (latched, rooms, leaver) = split_departure(a).expect("a departure");
         assert_eq!(leaver, seat());
         assert_eq!(sorted(rooms), sorted(vec![game(), events(), hello()]));
         assert!(latched.joined_rooms.is_empty() && latched.left_rooms.is_empty());
-        assert!(split_departure(latched, 5_031).is_none());
+        assert!(split_departure(latched).is_none());
+    }
+
+    /// The socket.io join and leave (`dispatch_socketio_event`) run the same
+    /// cores, and its close (`handle_socketio_unregister`) walks the left
+    /// room.
+    #[test]
+    fn the_socketio_join_and_leave_run_the_shared_cores() {
+        let mut e = fresh_socketio_entry("s", 1);
+        drive(&mut e);
+        assert_eq!(
+            sorted(close_walk(&e.joined_rooms, &e.left_rooms)),
+            sorted(vec![game(), events(), hello()])
+        );
+    }
+
+    /// The record's bound, at the witness's largest case: LOW's three rooms
+    /// held, then a hop through 40 game rooms (join, leave) on one session.
+    /// The left rooms stay a set of rooms the session joined, the record's
+    /// JSON never passes `ROOM_RECORD_MAX_BYTES`, and the oldest left room
+    /// is the one dropped. Run with `--nocapture` for the figures.
+    fn bound_case<R: RoomRecord>(record: &mut R, leg: &str) {
+        for r in [game(), events(), hello()] {
+            record_join(record, &r);
+        }
+        let mut dropped_all = Vec::new();
+        let mut max_bytes = 0;
+        let hops = 40;
+        for n in 0..hops {
+            let g = game_n(n);
+            dropped_all.extend(record_join(record, &g).unwrap());
+            max_bytes = max_bytes.max(room_record_bytes(record));
+            dropped_all.extend(record_leave(record, &g).unwrap());
+            max_bytes = max_bytes.max(room_record_bytes(record));
+            assert!(room_record_bytes(record) <= ROOM_RECORD_MAX_BYTES);
+        }
+        let held_left = record.rooms().1.clone();
+        let mut set = held_left.clone();
+        set.sort();
+        set.dedup();
+        assert_eq!(set.len(), held_left.len(), "the left rooms are a set");
+        // The oldest is dropped each time: the dropped are hops 0.., the held the rest.
+        let expect_dropped: Vec<String> = (0..dropped_all.len()).map(game_n).collect();
+        assert_eq!(dropped_all, expect_dropped);
+        let expect_held: Vec<String> = (dropped_all.len()..hops).map(game_n).collect();
+        assert_eq!(held_left, expect_held);
+        eprintln!(
+            "#45 bound [{leg}]: room id {} B; record at most {max_bytes} B of {ROOM_RECORD_MAX_BYTES}; \
+             {} left rooms held, {} dropped over {hops} hops",
+            game_n(0).len(),
+            held_left.len(),
+            dropped_all.len(),
+        );
+    }
+
+    #[test]
+    fn the_left_rooms_are_bounded_by_the_record_cap() {
+        let mut a = SocketAttachment {
+            identity_key: seat(),
+            connected_at_ms: 1_762_000_000_000,
+            joined_rooms: Vec::new(),
+            left_rooms: Vec::new(),
+        };
+        bound_case(&mut a, "raw /ws attachment");
+        let mut e = fresh_socketio_entry(&"s".repeat(20), 1_762_000_000_000);
+        e.expires_at_ms = Some(1_762_000_000_000 + SOCKETIO_SUB_LEASE_MS);
+        bound_case(&mut e, "socket.io registry entry");
     }
 
     /// An entry or an attachment stored before #45 (no `leftRooms` /
@@ -6608,16 +6846,5 @@ mod peer_left_every_room_tests {
             serde_json::from_str(r#"{"identity_key":"k","connected_at_ms":1,"joined_rooms":[]}"#)
                 .unwrap();
         assert!(a.left_rooms.is_empty());
-    }
-
-    /// A leave and a re-join on the same socket (the felt's room hop), then
-    /// the close: the game room is walked once, as a joined room.
-    #[test]
-    fn a_room_hop_then_a_close_walks_the_game_room_once() {
-        let mut hub = Hub::new();
-        hub.join("s", &game(), 1_000);
-        hub.leave("s", &game(), 2_000);
-        hub.join("s", &game(), 2_500);
-        assert_eq!(hub.close("s", 2_600), vec![game()]);
     }
 }
