@@ -1309,6 +1309,169 @@ pub fn attach_ack_mac(hub_key_hex: &str, d_text: &str) -> Option<String> {
     Some(hex::encode(sha256_hmac(&key, &msg)))
 }
 
+// ── message box #44: an attach that is refused, dropped or late leaves one line ──
+//
+// LOW's loop of 2026-11-03 read two attaches unanswered for the client's whole
+// `ATTACH_WAIT_MS` and then a reference handshake that timed out, with no line
+// in the relay's log for either. Every attach now ends in an `AttachEnd`, and
+// the end is written once: a refusal, a drop, or any end past the client's wait
+// is one warn line `ATTACH_LINE outcome= late= seat= room=- sid= reason= ms=`;
+// an attach answered inside the wait is a debug line only. The seat is the
+// identity the frame names (66 hex) or `-`; never the hub key, the MAC, the
+// nonce or the lane id. An attach names no room (the join is a later frame),
+// so the room is `-`. `ms` runs from the frame's arrival at the relay.
+
+/// The client's wait for an attach's answer (`relaySession.ts ATTACH_WAIT_MS`):
+/// an end at or past it is late, whatever the outcome.
+pub const ATTACH_ANSWER_DEADLINE_MS: u64 = 1_500;
+const _: () = assert!(ATTACH_HUB_TIMEOUT_MS < ATTACH_ANSWER_DEADLINE_MS);
+
+/// How an attach ended at the relay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachEnd {
+    /// `sessionAttached` was sent.
+    Answered,
+    /// `sessionAttachRefused {reason}` was sent.
+    Refused(String),
+    /// Nothing was sent: the client waits out its `ATTACH_WAIT_MS`.
+    Dropped(&'static str),
+}
+
+/// The seat an attach frame names: its `identity` when it is 66 hex, else none. PURE.
+pub fn attach_seat(arg: &serde_json::Value) -> Option<String> {
+    let id = arg.get("identity")?.as_str()?;
+    (id.len() == 66 && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_ascii_lowercase())
+}
+
+/// The attach's one line, or `None` for an attach answered inside the client's
+/// wait (that one is debug only). The reason is bounded to 64 characters of
+/// `[A-Za-z0-9_.-]` (a hub's reason is the hub's text). PURE.
+pub fn attach_line(
+    end: &AttachEnd,
+    seat: Option<&str>,
+    sid: &str,
+    elapsed_ms: u64,
+) -> Option<String> {
+    let late = elapsed_ms >= ATTACH_ANSWER_DEADLINE_MS;
+    let (outcome, reason) = match end {
+        AttachEnd::Answered if !late => return None,
+        AttachEnd::Answered => ("answered", "answered-past-the-client-wait"),
+        AttachEnd::Refused(r) => ("refused", r.as_str()),
+        AttachEnd::Dropped(r) => ("dropped", *r),
+    };
+    let reason: String = reason
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Some(format!(
+        "ATTACH_LINE outcome={outcome} late={late} seat={} room=- sid={sid} reason={reason} ms={elapsed_ms}",
+        seat.unwrap_or("-")
+    ))
+}
+
+#[cfg(test)]
+mod attach_line_tests {
+    use super::*;
+
+    const SEAT: &str = "02cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
+    /// The plants, one per cause the relay can tell: a bad token (a malformed
+    /// frame; a hub that does not know the lane), a slow authentication (the hub
+    /// ask past its bound, an answer past the client's wait), a drop; and the
+    /// attach answered in time, which writes nothing at warn.
+    #[test]
+    fn every_refused_dropped_or_late_attach_names_its_reason_and_elapsed_and_a_timely_one_none() {
+        let bad = attach_line(&AttachEnd::Refused("malformed".into()), None, "sidA", 3).unwrap();
+        assert_eq!(
+            bad,
+            "ATTACH_LINE outcome=refused late=false seat=- room=- sid=sidA reason=malformed ms=3"
+        );
+        let unknown = attach_line(
+            &AttachEnd::Refused("unknown-session".into()),
+            Some(SEAT),
+            "sidB",
+            41,
+        )
+        .unwrap();
+        assert!(
+            unknown.contains(&format!("seat={SEAT} "))
+                && unknown.ends_with("reason=unknown-session ms=41")
+        );
+        let slow = attach_line(
+            &AttachEnd::Refused("hub-unavailable".into()),
+            Some(SEAT),
+            "sidC",
+            ATTACH_HUB_TIMEOUT_MS + 7,
+        )
+        .unwrap();
+        assert!(
+            slow.contains("outcome=refused late=false")
+                && slow.ends_with("reason=hub-unavailable ms=1207")
+        );
+        let late = attach_line(&AttachEnd::Answered, Some(SEAT), "sidD", 1_500).unwrap();
+        assert!(
+            late.contains("outcome=answered late=true")
+                && late.ends_with("reason=answered-past-the-client-wait ms=1500")
+        );
+        let late_refusal = attach_line(
+            &AttachEnd::Refused("hub-unavailable".into()),
+            Some(SEAT),
+            "sidE",
+            2_300,
+        )
+        .unwrap();
+        assert!(late_refusal.contains("outcome=refused late=true"));
+        let dropped =
+            attach_line(&AttachEnd::Dropped("no-session"), Some(SEAT), "sidF", 0).unwrap();
+        assert!(
+            dropped.contains("outcome=dropped late=false")
+                && dropped.ends_with("reason=no-session ms=0")
+        );
+        assert_eq!(
+            attach_line(&AttachEnd::Answered, Some(SEAT), "sidG", 1_499),
+            None
+        );
+        assert_eq!(
+            attach_line(&AttachEnd::Answered, Some(SEAT), "sidH", 0),
+            None
+        );
+    }
+
+    #[test]
+    fn the_line_names_the_seat_never_a_secret_and_bounds_the_hub_s_reason() {
+        let frame = serde_json::json!({ "s": "ab".repeat(32), "identity": SEAT.to_ascii_uppercase(), "n": 5, "mac": "ef".repeat(32), "nonce": "01".repeat(32) });
+        assert_eq!(attach_seat(&frame).as_deref(), Some(SEAT));
+        assert_eq!(
+            attach_seat(&serde_json::json!({ "identity": "02ab" })),
+            None
+        );
+        assert_eq!(attach_seat(&serde_json::Value::Null), None);
+        let line = attach_line(
+            &AttachEnd::Refused("bad mac\nx=1".into()),
+            attach_seat(&frame).as_deref(),
+            "s",
+            9,
+        )
+        .unwrap();
+        assert!(line.contains("reason=bad_mac_x_1 "), "{line}");
+        for secret in ["ab".repeat(32), "ef".repeat(32), "01".repeat(32)] {
+            assert!(
+                !line.contains(&secret),
+                "no lane id, MAC or nonce in the line"
+            );
+        }
+        let long = attach_line(&AttachEnd::Refused("r".repeat(200)), None, "s", 1).unwrap();
+        assert!(long.contains(&format!("reason={} ", "r".repeat(64))));
+    }
+}
+
 #[cfg(test)]
 mod attach_tests {
     use super::*;

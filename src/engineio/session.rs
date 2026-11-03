@@ -56,7 +56,9 @@ use crate::engineio::auth::{
 use crate::engineio::codec::{
     decode_polling_batch, encode_polling_batch, EngineIoPacket, SocketIoPacket,
 };
-use crate::session_lane::{Frame as LaneFrame, MirrorUpdate, Refusal as LaneRefusal, SessionLane};
+use crate::session_lane::{
+    AttachEnd, Frame as LaneFrame, MirrorUpdate, Refusal as LaneRefusal, SessionLane,
+};
 
 /// How long a polling GET waits for the queue to fill before returning
 /// with whatever (possibly nothing) is buffered. socket.io clients
@@ -422,6 +424,9 @@ pub struct EngineIoSession {
     /// Node server behavior: a server restart drops live sessions and
     /// the client reconnects with a fresh sid.
     inner: RefCell<Option<SessionState>>,
+    /// When the inbound frame now being handled reached this DO (message box
+    /// #44: an attach's line counts its milliseconds from here).
+    frame_at_ms: std::cell::Cell<Option<u64>>,
 }
 
 /// What the server heartbeat does on one alarm tick for one upgraded socket.
@@ -680,6 +685,7 @@ impl DurableObject for EngineIoSession {
             state,
             env,
             inner: RefCell::new(None),
+            frame_at_ms: std::cell::Cell::new(None),
         }
     }
 
@@ -758,6 +764,8 @@ impl DurableObject for EngineIoSession {
         ws: WebSocket,
         message: WebSocketIncomingMessage,
     ) -> Result<()> {
+        // message box #44: an attach's elapsed time runs from here.
+        self.frame_at_ms.set(Some(Date::now().as_millis()));
         // Recover the full persisted session state from the WS
         // attachment so we can re-hydrate after a hibernation wake.
         // M10 #61 Bug 1: previously we only pulled `sid` and rebuilt a
@@ -1151,6 +1159,7 @@ impl EngineIoSession {
     /// dispatch each one. The response body is the literal `"ok"` per
     /// the socket.io reference server.
     async fn handle_polling_post(&self, req: &mut Request) -> Result<Response> {
+        self.frame_at_ms.set(Some(Date::now().as_millis()));
         let body = req.text().await.unwrap_or_default();
         match decode_polling_batch(&body) {
             Ok(pkts) => {
@@ -1896,6 +1905,38 @@ impl EngineIoSession {
         nsp: &str,
         ws_for_response: Option<&WebSocket>,
     ) {
+        // message box #44: every exit of the attach is an `AttachEnd`, written
+        // here ONCE (a refusal, a drop or a late end at warn; a timely answer at
+        // debug), timed from the frame's arrival at this DO.
+        let started = self
+            .frame_at_ms
+            .get()
+            .unwrap_or_else(|| Date::now().as_millis());
+        let seat = crate::session_lane::attach_seat(arg);
+        let end = self.attach_exchange(arg, nsp, ws_for_response).await;
+        let elapsed = Date::now().as_millis().saturating_sub(started);
+        let sid = self
+            .inner
+            .borrow()
+            .as_ref()
+            .map(|s| s.sid.clone())
+            .unwrap_or_else(|| "-".into());
+        match crate::session_lane::attach_line(&end, seat.as_deref(), &sid, elapsed) {
+            Some(line) => console_warn!("{line}"),
+            None => console_debug!(
+                "ATTACH_LINE outcome=answered late=false seat={} room=- sid={sid} ms={elapsed}",
+                seat.as_deref().unwrap_or("-")
+            ),
+        }
+    }
+
+    /// The attach itself (`dispatch_session_attach` writes its end).
+    async fn attach_exchange(
+        &self,
+        arg: &Value,
+        nsp: &str,
+        ws_for_response: Option<&WebSocket>,
+    ) -> AttachEnd {
         let refuse = |reason: &str| {
             let evt = SocketIoPacket::Event {
                 nsp: nsp.to_string(),
@@ -1906,11 +1947,10 @@ impl EngineIoSession {
                 ],
             };
             self.send_or_enqueue(EngineIoPacket::Message(evt.encode()), ws_for_response);
-            console_log!("TRACE_SESSION attach refused reason={reason}");
+            AttachEnd::Refused(reason.to_string())
         };
         let Some(frame) = crate::session_lane::parse_attach_frame(arg) else {
-            refuse(LaneRefusal::Malformed.as_str());
-            return;
+            return refuse(LaneRefusal::Malformed.as_str());
         };
         // One attach per socket (L1), judged and spent in ONE borrow with the
         // authenticated check, before the hub is asked.
@@ -1927,12 +1967,9 @@ impl EngineIoSession {
             }
         };
         match gate {
-            None => return,
+            None => return AttachEnd::Dropped("no-session"),
             Some("") => {}
-            Some(reason) => {
-                refuse(reason);
-                return;
-            }
+            Some(reason) => return refuse(reason),
         }
         self.persist_to_ws_attachment();
         // The hub: the identity's own DO, asked with the HTTP-lane verify body.
@@ -1959,12 +1996,11 @@ impl EngineIoSession {
         let verdict = match answer {
             Ok(v) => v,
             Err(e) => {
-                console_log!(
+                console_debug!(
                     "TRACE_SESSION attach hub-unavailable identity={} err={e}",
                     frame.identity
                 );
-                refuse("hub-unavailable");
-                return;
+                return refuse("hub-unavailable");
             }
         };
         if verdict.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -1973,8 +2009,7 @@ impl EngineIoSession {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown-session")
                 .to_string();
-            refuse(&reason);
-            return;
+            return refuse(&reason);
         }
         // The identity the HUB holds the mirror for, and the mirror's key for the ack.
         let identity = verdict
@@ -1988,14 +2023,12 @@ impl EngineIoSession {
             .unwrap_or_default()
             .to_string();
         if identity.is_empty() || identity != frame.identity || hub_key.is_empty() {
-            refuse(LaneRefusal::UnknownSession.as_str());
-            return;
+            return refuse(LaneRefusal::UnknownSession.as_str());
         }
         let mut random = [0u8; 32];
         if let Err(e) = getrandom::getrandom(&mut random) {
             console_error!("EngineIoSession: attach: no randomness ({e})");
-            refuse("no-randomness");
-            return;
+            return refuse("no-randomness");
         }
         let server_session_nonce = hex::encode(random);
         let state = SessionAuthState::Authenticated {
@@ -2004,8 +2037,7 @@ impl EngineIoSession {
             peer_identity_key: identity.clone(),
         };
         let Some((lane, offer)) = self.mint_lane_pure(&state, &identity, &frame.nonce) else {
-            refuse("mint-failed");
-            return;
+            return refuse("mint-failed");
         };
         // Compare-and-set (M2): the hub was asked across an await, and a
         // handshake that completed meanwhile owns this socket. Authenticated
@@ -2025,19 +2057,15 @@ impl EngineIoSession {
         };
         match cas {
             Some(true) => {}
-            Some(false) => {
-                refuse("already-authenticated");
-                return;
-            }
-            None => return,
+            Some(false) => return refuse("already-authenticated"),
+            None => return AttachEnd::Dropped("no-session"),
         }
         self.persist_to_ws_attachment();
         let d =
             json!({ "session": offer, "serverNonce": server_session_nonce, "nonce": frame.nonce })
                 .to_string();
         let Some(m) = crate::session_lane::attach_ack_mac(&hub_key, &d) else {
-            refuse("mint-failed");
-            return;
+            return refuse("mint-failed");
         };
         let evt = SocketIoPacket::Event {
             nsp: nsp.to_string(),
@@ -2048,12 +2076,13 @@ impl EngineIoSession {
             ],
         };
         self.send_or_enqueue(EngineIoPacket::Message(evt.encode()), ws_for_response);
-        console_log!(
+        console_debug!(
             "TRACE_SESSION attached identity={} hub_lane={}… socket_lane={}…",
             identity,
             &frame.s[..12],
             &offer.id[..12]
         );
+        AttachEnd::Answered
     }
 
     /// bsv-low W-B (D10): a `sessionMessage` from the client. Verified by the
