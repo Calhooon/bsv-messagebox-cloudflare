@@ -1357,8 +1357,9 @@ pub fn attach_seat(arg: &serde_json::Value) -> Option<String> {
     (id.len() == 66 && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_ascii_lowercase())
 }
 
-/// A reason bounded to 64 characters of `[A-Za-z0-9_.-]` (a hub's reason is
-/// the hub's text). PURE.
+/// A field bounded to 64 characters of `[A-Za-z0-9_.-]`: a hub's reason is
+/// the hub's text, and on the polling path the sid is the client's query
+/// string, so neither may carry a space or a newline into the line. PURE.
 pub fn bounded_reason(reason: &str) -> String {
     reason
         .chars()
@@ -1395,8 +1396,9 @@ pub fn attach_line(
     (
         level,
         format!(
-            "ATTACH_LINE outcome={outcome} late={late} seat={} room=- sid={sid} reason={} ms={elapsed_ms}",
+            "ATTACH_LINE outcome={outcome} late={late} seat={} room=- sid={} reason={} ms={elapsed_ms}",
             seat.unwrap_or("-"),
+            bounded_reason(sid),
             bounded_reason(reason)
         ),
     )
@@ -1510,6 +1512,21 @@ mod attach_line_tests {
         }
         let (_, long) = attach_line(&AttachEnd::Refused("r".repeat(200)), None, "s", 1);
         assert!(long.contains(&format!("reason={} ", "r".repeat(64))));
+    }
+
+    /// The sid is the client's own text on the polling path: a space or a
+    /// newline in it never forges a field or a second line, and it is bounded
+    /// like the reason.
+    #[test]
+    fn the_sid_is_bounded_and_cannot_forge_a_field_or_a_line() {
+        let forged = "abc outcome=answered\nATTACH_LINE outcome=answered late=false";
+        let (_, line) = attach_line(&AttachEnd::Refused("malformed".into()), None, forged, 3);
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(line.contains("sid=abc_outcome_answered_ATTACH_LINE_outcome_answered_late_false "), "{line}");
+        assert_eq!(line.matches("outcome=").count(), 1 + 2, "the forged words are inert text inside one field: {line}");
+        assert!(line.starts_with("ATTACH_LINE outcome=refused "), "{line}");
+        let (_, long) = attach_line(&AttachEnd::Answered, None, &"s".repeat(200), 1);
+        assert!(long.contains(&format!("sid={} ", "s".repeat(64))), "{long}");
     }
 }
 
