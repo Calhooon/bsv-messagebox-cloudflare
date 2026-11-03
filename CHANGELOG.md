@@ -8,7 +8,7 @@ the `scrub` check (`tools/scrub.sh`) now holds that rule on every pull request.
 
 ## [Unreleased]
 
-- **An acknowledgment of any batch size is served (message box #43).** `/acknowledgeMessage` built one D1 statement binding every id, so a batch of 100 ids or more passed D1's 100 bound parameters per query and its refusal (`too many SQL variables`) was answered as the transient 503 `ERR_D1_UNAVAILABLE`; the ids are now chunked inside that limit (`retention::D1_MAX_BOUND_PARAMS`, cited from Cloudflare's D1 limits page) and run as one D1 batch, and that refusal is never classed transient again. Nothing changes for a client under the limit.
+- **An acknowledgment of any batch size is served (message box #43).** `/acknowledgeMessage` built one D1 statement binding every id, so a batch of more ids than one statement can bind (100 with no retained prefix, 100 less the prefix count with prefixes) passed D1's 100 bound parameters per query and its refusal (`too many SQL variables`) was answered as the transient 503 `ERR_D1_UNAVAILABLE`; the ids are now chunked inside that limit (`retention::D1_MAX_BOUND_PARAMS`, cited from Cloudflare's D1 limits page) and run as one D1 batch, and that refusal is never classed transient again. Nothing changes for a client under the limit.
 
 ## [0.8.2] - 2026-10-26
 
