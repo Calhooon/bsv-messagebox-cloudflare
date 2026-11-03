@@ -6,7 +6,7 @@ tag publishes the release. Before 0.5.5 releases were cut from a private canonic
 repository with a release script that scrubbed every Cloudflare resource identifier;
 the `scrub` check (`tools/scrub.sh`) now holds that rule on every pull request.
 
-## [Unreleased]
+## [0.8.3] - 2026-11-03
 
 - **An acknowledgment of any batch size is served (message box #43).** `/acknowledgeMessage` built one D1 statement binding every id, so a batch of more ids than one statement can bind (100 with no retained prefix, 100 less the prefix count with prefixes) passed D1's 100 bound parameters per query and its refusal (`too many SQL variables`) was answered as the transient 503 `ERR_D1_UNAVAILABLE`; the ids are now chunked inside that limit (`retention::D1_MAX_BOUND_PARAMS`, cited from Cloudflare's D1 limits page) and run as one D1 batch, and that refusal is never classed transient again. Nothing changes for a client under the limit.
 
