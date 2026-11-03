@@ -1035,7 +1035,7 @@ mod tests {
     /// The ack's statements for 1, 99, 100, 101 and 1,000 ids, retention off
     /// and on: every statement's placeholders equal its binds and sit at or
     /// under `D1_MAX_BOUND_PARAMS`; each half covers every id exactly once, in
-    /// the request's order; each statement binds the recipient first and the
+    /// the request's order; each statement binds the recipient at its head and the
     /// patterns last.
     #[test]
     fn ack_statements_stay_inside_d1s_bound_parameter_limit() {
