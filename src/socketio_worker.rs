@@ -63,8 +63,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 use worker::{
-    console_log, kv::KvStore, Date, Delay, Env, Headers, Method, Request, RequestInit, Response,
-    Result,
+    console_log, console_warn, kv::KvStore, Date, Delay, Env, Headers, Method, Request,
+    RequestInit, Response, Result,
 };
 
 use crate::engineio::auth::{
@@ -345,6 +345,7 @@ pub async fn load_auth_state_public(env: &Env, sid: &str) -> SessionAuthState {
 // ===========================================================================
 
 pub async fn handle_polling_post(body: &str, env: &Env, sid: &str) -> Result<Response> {
+    let received_at_ms = Date::now().as_millis();
     let kv = auth_kv(env)?;
     let ttl = sio_ttl(env);
 
@@ -386,7 +387,7 @@ pub async fn handle_polling_post(body: &str, env: &Env, sid: &str) -> Result<Res
                 // Bare heartbeat ack — nothing to do.
             }
             EngineIoPacket::Message(payload) => {
-                handle_socketio_in_worker(&payload, env, &kv, sid).await;
+                handle_socketio_in_worker(&payload, env, &kv, sid, received_at_ms).await;
             }
             EngineIoPacket::Upgrade | EngineIoPacket::Noop => {
                 // Upgrade `5` is sent over the new WS, not via polling.
@@ -402,7 +403,13 @@ pub async fn handle_polling_post(body: &str, env: &Env, sid: &str) -> Result<Res
 // Socket.IO packet dispatch (inside an Engine.IO Message).
 // ===========================================================================
 
-async fn handle_socketio_in_worker(payload: &str, env: &Env, kv: &KvStore, sid: &str) {
+async fn handle_socketio_in_worker(
+    payload: &str,
+    env: &Env,
+    kv: &KvStore,
+    sid: &str,
+    received_at_ms: u64,
+) {
     let ttl = sio_ttl(env);
     let pkt = match SocketIoPacket::decode(payload) {
         Ok(p) => p,
@@ -430,7 +437,7 @@ async fn handle_socketio_in_worker(payload: &str, env: &Env, kv: &KvStore, sid: 
             ack_id: _,
             data,
         } => {
-            handle_socketio_event(env, kv, sid, &nsp, &data).await;
+            handle_socketio_event(env, kv, sid, &nsp, &data, received_at_ms).await;
         }
         SocketIoPacket::Ack { .. } | SocketIoPacket::ConnectError { .. } => {
             // Server-side ACKs / errors aren't sent by the client in
@@ -439,7 +446,14 @@ async fn handle_socketio_in_worker(payload: &str, env: &Env, kv: &KvStore, sid: 
     }
 }
 
-async fn handle_socketio_event(env: &Env, kv: &KvStore, sid: &str, nsp: &str, data: &[Value]) {
+async fn handle_socketio_event(
+    env: &Env,
+    kv: &KvStore,
+    sid: &str,
+    nsp: &str,
+    data: &[Value],
+    received_at_ms: u64,
+) {
     let ttl = sio_ttl(env);
     let event_name = match data.first().and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
@@ -460,6 +474,27 @@ async fn handle_socketio_event(env: &Env, kv: &KvStore, sid: &str, nsp: &str, da
     // Non-authMessage events require an authenticated session. The
     // legacy DO drops these silently — we match that behaviour.
     let auth = load_auth_state(kv, sid).await;
+    // message box #44: the attach is answered only on the WebSocket (the
+    // `EngineIoSession` DO); one that rides polling is never answered here
+    // (dropped unauthenticated; forwarded to the hub, which knows no such
+    // event, when authenticated), so it leaves its line. The wire is unchanged.
+    if event_name == crate::session_lane::ATTACH_EVENT {
+        let reason = if auth.is_authenticated() {
+            "polling-authenticated"
+        } else {
+            "polling-unauthenticated"
+        };
+        let seat = data.get(1).and_then(crate::session_lane::attach_seat);
+        let elapsed = Date::now().as_millis().saturating_sub(received_at_ms);
+        if let Some(line) = crate::session_lane::attach_line(
+            &crate::session_lane::AttachEnd::Dropped(reason),
+            seat.as_deref(),
+            sid,
+            elapsed,
+        ) {
+            console_warn!("{line}");
+        }
+    }
     if !auth.is_authenticated() {
         console_log!("SIOW: dropping non-auth event '{event_name}' on unauthenticated sid={sid}");
         return;
