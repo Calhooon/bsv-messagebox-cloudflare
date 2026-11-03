@@ -1522,8 +1522,15 @@ mod attach_line_tests {
         let forged = "abc outcome=answered\nATTACH_LINE outcome=answered late=false";
         let (_, line) = attach_line(&AttachEnd::Refused("malformed".into()), None, forged, 3);
         assert_eq!(line.lines().count(), 1, "{line}");
-        assert!(line.contains("sid=abc_outcome_answered_ATTACH_LINE_outcome_answered_late_false "), "{line}");
-        assert_eq!(line.matches("outcome=").count(), 1, "the forged field never survives the bounding: {line}");
+        assert!(
+            line.contains("sid=abc_outcome_answered_ATTACH_LINE_outcome_answered_late_false "),
+            "{line}"
+        );
+        assert_eq!(
+            line.matches("outcome=").count(),
+            1,
+            "the forged field never survives the bounding: {line}"
+        );
         assert!(line.starts_with("ATTACH_LINE outcome=refused "), "{line}");
         let (_, long) = attach_line(&AttachEnd::Answered, None, &"s".repeat(200), 1);
         assert!(long.contains(&format!("sid={} ", "s".repeat(64))), "{long}");
