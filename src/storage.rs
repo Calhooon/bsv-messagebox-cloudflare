@@ -804,39 +804,32 @@ impl<'a> Storage<'a> {
         // report 0 changes, our own earlier (timed-out, dropped-but-landed)
         // attempt already applied them, so report the requested ids as
         // acknowledged rather than a spurious "Message not found".
-        let n_prefixes = retention.prefix_count();
+        //
+        // The ids are chunked inside D1's bound-parameter limit (message box
+        // #43, `retention::ack_statements`): the retained half MARKS delivered,
+        // never a delete (the stage-E pin); the delete half takes everything
+        // outside the retained class (with retention off, the whole request,
+        // the legacy statement per chunk). One D1 `batch()`, all or none: one
+        // query against the invocation's budget whatever the batch's size.
         let patterns = retention.like_patterns();
-        let mut total_changes = 0usize;
-        let mut any_retried = false;
-
-        if n_prefixes > 0 {
-            // Retained half: MARK delivered — never a delete (the stage-E pin).
-            let sql = crate::retention::ack_update_sql(message_ids.len(), n_prefixes);
-            let mut q = Query::new(&sql).bind(identity_key);
-            for id in message_ids {
-                q = q.bind(id.as_str());
+        let plan = crate::retention::ack_statements(identity_key, message_ids, &patterns);
+        let (total_changes, any_retried) = with_d1_write_retry(|| async {
+            let mut stmts = Vec::with_capacity(plan.len());
+            for s in &plan {
+                let js: Vec<wasm_bindgen::JsValue> = s
+                    .binds
+                    .iter()
+                    .map(|b| crate::d1::QVal::from(b.as_str()).to_js())
+                    .collect();
+                stmts.push(self.db.prepare(&s.sql).bind(&js)?);
             }
-            for p in &patterns {
-                q = q.bind(p.as_str());
+            let mut changes = 0usize;
+            for r in self.db.batch(stmts).await? {
+                changes += r.meta()?.and_then(|m| m.changes).unwrap_or(0);
             }
-            let (meta, retried) = with_d1_write_retry(|| q.execute(self.db)).await?;
-            total_changes += meta.changes;
-            any_retried |= retried;
-        }
-
-        // Delete half: everything OUTSIDE the retained class (with retention
-        // off this is the whole request — the legacy statement).
-        let sql = crate::retention::ack_delete_sql(message_ids.len(), n_prefixes);
-        let mut q = Query::new(&sql).bind(identity_key);
-        for id in message_ids {
-            q = q.bind(id.as_str());
-        }
-        for p in &patterns {
-            q = q.bind(p.as_str());
-        }
-        let (meta, retried) = with_d1_write_retry(|| q.execute(self.db)).await?;
-        total_changes += meta.changes;
-        any_retried |= retried;
+            Ok(changes)
+        })
+        .await?;
 
         if total_changes > 0 {
             return Ok(total_changes);
@@ -1252,6 +1245,15 @@ impl<'a> Storage<'a> {
 /// auth/validation short-circuit upstream in `lib.rs`), so they cannot be
 /// mis-retried here and keep returning their correct status.
 pub(crate) fn is_transient_d1_error(e: &worker::Error) -> bool {
+    // A statement past D1's bound-parameter limit is the request's own shape,
+    // refused the same way every time: never a fault of the store to retry
+    // or answer 503 (message box #43).
+    // A D1 error's text is a debug print of its JS cause, so its cause's
+    // message is read too.
+    let past_limit = |s: String| s.to_ascii_lowercase().contains("too many sql variables");
+    if past_limit(e.to_string()) || matches!(e, worker::Error::D1(d) if past_limit(d.cause())) {
+        return false;
+    }
     // Every D1-layer failure surfaces as `Error::D1(_)` — the worker crate tags
     // any JS error whose message starts with "D1". Our read queries are static
     // and well-formed, so a D1-layer error on them is infra, not a query bug.
@@ -1564,6 +1566,22 @@ mod retry_tests {
             "Invalid messageBox".into(),
             400
         ))));
+    }
+
+    /// Message box #43: a statement past D1's bound-parameter limit is the
+    /// request's own shape, never the transient class (no retry, no 503),
+    /// though D1's text carries the `D1_ERROR` marker.
+    #[test]
+    fn too_many_sql_variables_is_not_transient() {
+        let past = "D1_ERROR: too many SQL variables at offset 412: SQLITE_ERROR";
+        assert!(!is_transient_d1_error(&worker::Error::RustError(
+            past.into()
+        )));
+        assert!(!is_transient_d1_error(&worker::Error::JsError(past.into())));
+        assert_eq!(
+            d1_retry_backoff(0, &worker::Error::RustError(past.into())),
+            None
+        );
     }
 
     #[test]
