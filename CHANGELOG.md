@@ -6,6 +6,14 @@ tag publishes the release. Before 0.5.5 releases were cut from a private canonic
 repository with a release script that scrubbed every Cloudflare resource identifier;
 the `scrub` check (`tools/scrub.sh`) now holds that rule on every pull request.
 
+## [0.8.6] - 2026-11-17
+
+bsv-rs's floor moves from `0.8.11` to `0.8.12`, the release that closes GHSA-33fm-jcm5-4m3m. The requirement keeps its form (a caret) and its features (`auth`, `wallet`, `transaction`, `wasm`); no other requirement moves, and no line of the relay's code.
+
+- **What moved.** `Cargo.toml`: `bsv-rs = "0.8.12"`. `Cargo.lock` moves bsv-rs alone (0.8.12 requires no dependency differently). The version guard (`tests/middleware_version_guard.rs`) asserts the lock's one bsv-rs at `0.8.12`. The load generator's own lock (`tests/load_gen/Cargo.lock`) moves bsv-rs from `0.8.11` to `0.8.12` and nothing else; its manifest is unchanged.
+- **What 0.8.12 changes.** The BEEF linker alone (`src/transaction/beef.rs`, `beef/link.rs`, the new `beef/link_limits.rs`; every other file of the crate is byte for byte 0.8.11's): beside the wire bound, a heap bound on linking (`BeefLinkLimits::max_link_heap_bytes`, 56 MiB by default), past which a link is refused with `Error::BeefResourceLimit`. The linker is reached through `Transaction::from_beef`, `from_atomic_beef` (and their `_with_limits` forms) and `Beef::find_atomic_transaction*`.
+- **What a client sees differently: nothing.** The relay reads a stranger's BEEF with the streaming reader (`StreamVerifier::new`, `structure_only` and `resume`, `beef_door.rs`; the cursor is still `BSC3`) and bsv-middleware-rs 0.6.2's `verify_payment_output_only` (the streaming `BeefDecoder`, `Transaction::from_binary` for a raw transaction). `beef_stream.rs` is unchanged, and nothing in the relay or in the middleware's code the relay runs links a BEEF, so the new heap bound refuses nothing the relay accepts today.
+
 ## [0.8.5] - 2026-11-17
 
 bsv-rs's floor moves from `0.8.2` to `0.8.11`, the newest patched 0.8 release on the crates.io index at this commit (message box #58). The requirement keeps its form (a caret) and its features (`auth`, `wallet`, `transaction`, `wasm`); no other requirement moves, and no line of the relay's code.
