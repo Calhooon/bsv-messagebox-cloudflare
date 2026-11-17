@@ -1,6 +1,6 @@
 [package]
 name = "bsv-messagebox-cloudflare"
-version = "0.8.5"
+version = "0.8.6"
 description = "A BSV messaging relay on Cloudflare Workers: BRC-31 authentication, delivery permissions, paid delivery, D1 storage and hibernatable WebSockets."
 license = "MIT"
 repository = "https://github.com/Calhooon/bsv-messagebox-cloudflare"
@@ -78,7 +78,9 @@ bsv-middleware-core = "=0.4.1"
 # typed transport fault of a bare 5xx, a connection error or a timeout,
 # additive; nothing of the wire or the cursor moves. 0.8.11 (0.8.5 of the
 # relay): the floor at the newest patched 0.8; the cursor is still `BSC3`.
-bsv-rs = { version = "0.8.11", features = ["auth", "wallet", "transaction", "wasm"] }
+# 0.8.12 (0.8.6 of the relay): the heap bound on BEEF linking
+# (GHSA-33fm-jcm5-4m3m); the cursor is still `BSC3`.
+bsv-rs = { version = "0.8.12", features = ["auth", "wallet", "transaction", "wasm"] }
 # The shared payment check (P0-3): the six-word verdict, the BRC-29 script and
 # the header service as a trait. 0.6.1 refuses a reused derivation prefix
 # (M14); 0.6.2 asks bsv-rs ^0.8, so it is built on the relay's 0.8.1
