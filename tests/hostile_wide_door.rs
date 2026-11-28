@@ -702,7 +702,30 @@ fn push(data: &[u8], out: &mut Vec<u8>) {
 
 /// A raw transaction of `inputs` (outpoint, unlocking script) and `outputs`.
 fn raw(inputs: &[([u8; 32], u32, Vec<u8>)], outputs: &[(u64, Vec<u8>)]) -> Vec<u8> {
-    let mut t = 1u32.to_le_bytes().to_vec();
+    raw_at(1, inputs, outputs)
+}
+
+/// A signature with the CHRONICLE bit is legal in the default mode only at a
+/// transaction version above 1 (the reference's `isRelaxed()`), so a
+/// transaction signed with it is written at version 2.
+const CHRONICLE_VERSION: i32 = 2;
+
+/// The version a transaction signed under `scope` is written at.
+fn version_for(scope: u32) -> i32 {
+    if scope & SIGHASH_CHRONICLE != 0 {
+        CHRONICLE_VERSION
+    } else {
+        1
+    }
+}
+
+/// [`raw`] at transaction `version`.
+fn raw_at(
+    version: i32,
+    inputs: &[([u8; 32], u32, Vec<u8>)],
+    outputs: &[(u64, Vec<u8>)],
+) -> Vec<u8> {
+    let mut t = version.to_le_bytes().to_vec();
     varint(inputs.len() as u64, &mut t);
     for (txid, vout, unlock) in inputs {
         t.extend_from_slice(txid);
@@ -726,8 +749,10 @@ fn raw(inputs: &[([u8; 32], u32, Vec<u8>)], outputs: &[(u64, Vec<u8>)]) -> Vec<u
 /// box. Under `ALL | FORKID` a signature's digest is BIP-143's, from the
 /// transaction's midstates (one set per transaction at 0.4.4); with the
 /// CHRONICLE bit it is the original digest, which serializes every input
-/// for every signature (bsv-rs 0.4.4's named risk).
+/// for every signature (bsv-rs 0.4.4's named risk), and the subject is
+/// written at version 2 ([`version_for`]).
 fn signed_wide(n: usize, scope: u32) -> (Vec<u8>, String) {
+    let version = version_for(scope);
     let key = PrivateKey::from_bytes(&[0x11; 32]).unwrap();
     let mut lock = vec![0x76, 0xa9, 0x14];
     lock.extend_from_slice(&key.public_key().hash160());
@@ -735,7 +760,7 @@ fn signed_wide(n: usize, scope: u32) -> (Vec<u8>, String) {
     let parent = raw(&[([0x11; 32], 0, vec![])], &vec![(1_000, lock.clone()); n]);
     let prev = hash(&parent);
     let cache = TxSighashCache::new(
-        1,
+        version,
         (0..n as u32)
             .map(|vout| TxInput {
                 txid: prev,
@@ -760,7 +785,7 @@ fn signed_wide(n: usize, scope: u32) -> (Vec<u8>, String) {
             (prev, i as u32, unlock)
         })
         .collect();
-    let subject = raw(&inputs, &[(FEE, server_script())]);
+    let subject = raw_at(version, &inputs, &[(FEE, server_script())]);
     frame(&parent, &subject)
 }
 
@@ -877,8 +902,9 @@ fn single_input_work_measured(k: usize, padding: usize) -> (Vec<u8>, String, u64
     data.resize(padding + 1, 0);
     let outputs = vec![(FEE, server_script()), (0, data)];
     let scope = SIGHASH_ALL | SIGHASH_FORKID | SIGHASH_CHRONICLE;
+    let version = version_for(scope);
     let cache = TxSighashCache::new(
-        1,
+        version,
         vec![TxInput {
             txid: prev,
             output_index: 0,
@@ -896,13 +922,13 @@ fn single_input_work_measured(k: usize, padding: usize) -> (Vec<u8>, String, u64
     );
     // With no code separators, the original preimage is this serialization
     // with the locking script substituted, plus the four-byte scope.
-    let per_check = raw(&[(prev, 0, lock.clone())], &outputs).len() as u64 + 4 + 32;
+    let per_check = raw_at(version, &[(prev, 0, lock.clone())], &outputs).len() as u64 + 4 + 32;
     let work = k as u64 * (per_check + 3) + 3; // 3 opcodes/check, push + DROP TRUE
     let digest = cache.sighash_dispatched_for_signing(0, &lock, 1_000, scope);
     let sig = TransactionSignature::new(key.sign(&digest).unwrap(), scope).to_low_s();
     let mut unlock = Vec::new();
     push(&sig.to_checksig_format(), &mut unlock);
-    let (beef, root) = frame(&parent, &raw(&[(prev, 0, unlock)], &outputs));
+    let (beef, root) = frame(&parent, &raw_at(version, &[(prev, 0, unlock)], &outputs));
     (beef, root, work)
 }
 
