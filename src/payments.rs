@@ -18,7 +18,7 @@ use worker::Env;
 use crate::beef_door::{
     inline_spool_key, judge_output_inline, structure_inline, verify_inline, AtRest, BeefStore,
     Carrier, DoorError, DoorVerdict, Pending, Slice, Slices, Terms, ROOT_LOOKUPS_PER_PASS,
-    SCRIPT_INPUTS_PER_PASS, SCRIPT_WEIGHT_PER_PASS, VERIFY_SLICE_MILLIS,
+    SCRIPT_INPUTS_PER_PASS, SCRIPT_WEIGHT_PER_PASS, STACK_MEMORY_BYTES, VERIFY_SLICE_MILLIS,
 };
 
 use crate::handoff::{
@@ -911,9 +911,11 @@ pub fn delivery_answer(verdict: PaymentVerdict) -> Result<u64, RouteResult> {
             }),
             422,
         )),
-        // The memory budget (`beef_door::STACK_MEMORY_BYTES`): the same road
-        // as the work budget, a 422 naming the resource, the budget and the
-        // bytes the input asked for.
+        // Every other resource decline: the memory budget
+        // (`beef_door::STACK_MEMORY_BYTES`) reached, or memory for a script's
+        // step declined. The same road as the work budget: a 422 naming the
+        // resource, the relay's own budget (always the constant) and the bytes
+        // the input asked for.
         PaymentVerdict::Unverifiable(UnverifiableReason::SpendRefused {
             offset,
             txid,
@@ -923,12 +925,12 @@ pub fn delivery_answer(verdict: PaymentVerdict) -> Result<u64, RouteResult> {
             json!({
                 "status": "error",
                 "code": "ERR_PAYMENT_MEMORY",
-                "description": "The local evaluator declined this input at its memory budget; payment validity is undetermined.",
+                "description": "The local evaluator declined this input at its memory budget, or declined memory for a script's step; payment validity is undetermined.",
                 "resource": format!("{:?}", limit.resource),
                 "offset": offset,
                 "txid": txid,
                 "input": input,
-                "budget": limit.limit,
+                "budget": STACK_MEMORY_BYTES,
                 "attempted": limit.attempted,
             }),
             422,
@@ -2223,6 +2225,45 @@ mod tests {
             status, 400,
             "within the bound the bytes are read, and refused as bytes"
         );
+    }
+
+    /// A memory decline names the relay's own budget, `STACK_MEMORY_BYTES`,
+    /// for every resource and whatever limit the evaluator reported, and
+    /// keeps the resource and the fields from the sender's bytes.
+    #[test]
+    fn a_memory_decline_names_the_relays_own_budget() {
+        for resource in [
+            ScriptResource::Stack,
+            ScriptResource::AltStack,
+            ScriptResource::ElementSize,
+        ] {
+            for reported in [STACK_MEMORY_BYTES as u64, 4_096] {
+                let verdict = PaymentVerdict::Unverifiable(UnverifiableReason::SpendRefused {
+                    offset: 77,
+                    txid: "ab".repeat(32),
+                    input: Some(0),
+                    why: SpendRefusal::Resource(bsv_rs::script::ScriptResourceLimit {
+                        resource,
+                        limit: reported,
+                        attempted: 1_200_000,
+                        work_spent: None,
+                    }),
+                });
+                let (body, status) = delivery_answer(verdict).expect_err("a memory decline");
+                assert_eq!(status, 422, "{body}");
+                assert_eq!(body["code"], "ERR_PAYMENT_MEMORY", "{body}");
+                assert_eq!(body["resource"], format!("{resource:?}"), "{body}");
+                assert_eq!(
+                    body["budget"].as_u64(),
+                    Some(STACK_MEMORY_BYTES as u64),
+                    "{body}"
+                );
+                assert_eq!(body["attempted"], 1_200_000, "{body}");
+                assert_eq!(body["input"], 0, "{body}");
+                assert_eq!(body["offset"], 77, "{body}");
+                assert_eq!(body["txid"], "ab".repeat(32), "{body}");
+            }
+        }
     }
 
     #[test]

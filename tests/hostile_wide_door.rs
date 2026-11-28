@@ -1087,8 +1087,8 @@ const PAST_THE_BUDGET: usize = rust_message_box::beef_door::STACK_MEMORY_BYTES /
 const UNDER_THE_BUDGET: usize = rust_message_box::beef_door::STACK_MEMORY_BYTES / 2 - 100_000;
 
 /// The memory decline's answer: 422 `ERR_PAYMENT_MEMORY`, the resource word
-/// in `resource` and `kind`, the budget the constant, input 0, and no root
-/// asked.
+/// in `resource` and `kind`, `budget` the relay's own constant, input 0, and
+/// no root asked.
 fn declined_at_the_memory_budget(run: &Run, path: &str) {
     eprintln!(
         "stack budget {path}: {:?}, pending {}",
@@ -1124,8 +1124,8 @@ fn declined_at_the_memory_budget(run: &Run, path: &str) {
 }
 
 #[test]
-fn the_stack_memory_budget_is_a_sixteenth_of_a_128_mb_isolate() {
-    assert_eq!(rust_message_box::beef_door::STACK_MEMORY_BYTES, 8_000_000);
+fn the_stack_memory_budget_is_one_million_bytes() {
+    assert_eq!(rust_message_box::beef_door::STACK_MEMORY_BYTES, 1_000_000);
 }
 
 #[test]

@@ -121,18 +121,24 @@ pub const DEFAULT_WORK_UNITS: u64 = 10_000_000;
 
 /// LOCAL memory budget per input, in bytes per stack (bsv-rs 0.8.14
 /// `StreamVerifier::set_memory_limit`): the most an unproven input's scripts
-/// may hold on one stack while the door runs them. A sixteenth of a 128 MB
-/// isolate, the guidance of bsv-rs's GHSA-7vx5-cf5p-5c48: the heaviest
-/// arithmetic step holds about thirteen times its stack, so a sixteenth keeps
-/// that step within the isolate with room for the rest of the request. The
-/// door runs in the Worker and in the `MessageHub` object, which keeps its
-/// sockets with the runtime and its state in storage, so no lower figure is
-/// asked of it. An input whose stack would pass it is declined as a resource
-/// bound (`SpendRefusal::Resource`): the payment is unverifiable, answered
-/// 422 `ERR_PAYMENT_MEMORY` as a work decline is, and is never valid.
-/// Honest scripts hold far less. Like the work budget, it is not cursor
-/// state and is set on every reader, a resumed one included.
-pub const STACK_MEMORY_BYTES: usize = 8_000_000;
+/// may hold on one stack while the door runs them. One million bytes. bsv-rs's
+/// GHSA-7vx5-cf5p-5c48 asks a host for a budget at or below a sixteenth of its
+/// memory ceiling (8,000,000 bytes for a 128 MB isolate), because the
+/// interpreter's heaviest step works in a multiple of the budget. The door
+/// runs in the Worker and in the `MessageHub` object, and the isolate holds
+/// the request and the relay's own state beside the verifier: a
+/// `/sendMessage` body of up to `SEND_BODY_BYTES` is held whole by the BRC-31
+/// layer, and the relay holds at most two more of its size while it reads it
+/// (`validation.rs`, an estimate on the host of under 40 MiB for the three).
+/// So the door names a figure well under that ceiling. An ordinary payment's
+/// scripts hold well under a kilobyte of stack, so no ordinary payment is near
+/// it; a host that needs another figure names it here. An input whose stack
+/// would pass it, or whose script's step is declined memory, is declined as a
+/// resource bound (`SpendRefusal::Resource`): the payment is unverifiable,
+/// answered 422 `ERR_PAYMENT_MEMORY` as a work decline is, and is not
+/// accepted. Like the work budget, it is not cursor state and is set on every
+/// reader, a resumed one included.
+pub const STACK_MEMORY_BYTES: usize = 1_000_000;
 
 mod configured_limits {
     include!(concat!(env!("OUT_DIR"), "/work_limit.rs"));
