@@ -1144,9 +1144,9 @@ const UNDER_THE_BUDGET: usize = rust_message_box::beef_door::STACK_MEMORY_BYTES 
 
 /// The memory decline's answer: 422 `ERR_PAYMENT_MEMORY`, the resource word
 /// in `resource` and `kind`, `budget` the relay's own constant, `txid` and
-/// `input` the transaction and input whose script passed the budget, a
-/// description that reads "not judged" and gives the way out, and no root
-/// asked.
+/// `input` the transaction and input whose script passed the budget, the
+/// description the one sentence that reads "not judged" and gives the way
+/// out, word for word, and no root asked.
 fn declined_at_the_memory_budget(run: &Run, path: &str, ran: &[u8], input: u32) {
     eprintln!(
         "stack budget {path}: {:?}, pending {}",
@@ -1170,20 +1170,17 @@ fn declined_at_the_memory_budget(run: &Run, path: &str, ran: &[u8], input: u32) 
     assert_eq!(body["kind"], resource, "{path}: {body}");
     assert_eq!(body["input"], input, "{path}: {body}");
     assert_eq!(body["txid"], txid_of(ran), "{path}: {body}");
-    let description = body["description"].as_str().unwrap_or_default();
-    for said in [
-        "Not judged: ",
-        "this host's memory bound",
-        "not a rule of the chain",
-        &format!("input {input} of transaction {}", txid_of(ran)),
-        "Pay with coins whose ancestry is proven, or present this payment again once transaction",
-    ] {
-        assert!(description.contains(said), "{path}: {said}: {body}");
-    }
-    assert!(
-        !description.to_lowercase().contains("invalid"),
+    // The description on the wire is the one sentence alone; the offset and
+    // the kind are fields of the body.
+    let txid = txid_of(ran);
+    assert_eq!(
+        body["description"],
+        format!(
+            "Not judged: this host declined memory for the script of input {input} of transaction {txid}, an unproven transaction in this payment's BEEF (the payment itself or one of its ancestors). This host's memory bound is 1000000 bytes per stack: a bound of this host, not a rule of the chain, and no verdict on the payment. Present this payment again once transaction {txid} has its proof, or pay with other coins."
+        ),
         "{path}: {body}"
     );
+    assert!(body["offset"].is_u64(), "{path}: {body}");
     assert_eq!(
         body["budget"].as_u64(),
         Some(rust_message_box::beef_door::STACK_MEMORY_BYTES as u64),
@@ -1201,6 +1198,8 @@ fn the_stack_memory_budget_is_one_million_bytes() {
     assert_eq!(rust_message_box::beef_door::STACK_MEMORY_BYTES, 1_000_000);
 }
 
+/// The script past the budget runs at the payment's own input 0: the
+/// answer names the payment itself and that input.
 #[test]
 fn a_stack_past_the_memory_budget_is_declined_with_the_resource_word() {
     let (beef, root) = stack_frame(PAST_THE_BUDGET);
@@ -1211,6 +1210,51 @@ fn a_stack_past_the_memory_budget_is_declined_with_the_resource_word() {
     ] {
         declined_at_the_memory_budget(&run, path, &subject, 0);
         assert_eq!(run.pending, 0, "{path}: one reading");
+        let (_, body) = run.answer.clone().unwrap_err();
+        // The Atomic BEEF's header names the subject at bytes 4..36.
+        let named: String = hex::encode(beef[4..36].iter().rev().copied().collect::<Vec<u8>>());
+        assert_eq!(body["txid"], named, "{path}: {body}");
+    }
+}
+
+/// `stack_frame`'s parent and payment, both proven by one BUMP of two leaves
+/// at `HEIGHT`: the frame and the root the header service gives.
+fn proven_stack_frame(element: usize) -> (Vec<u8>, String) {
+    let parent = hash(&stack_parent(element));
+    let subject = stack_subject(element);
+    let paid = hash(&subject);
+    let mut b = 0x0101_0101u32.to_le_bytes().to_vec();
+    b.extend_from_slice(&paid);
+    b.extend_from_slice(&0xEFBE_0002u32.to_le_bytes());
+    b.push(1);
+    b.push(0xfe);
+    b.extend_from_slice(&HEIGHT.to_le_bytes());
+    b.extend_from_slice(&[1, 2, 0, 2]); // tree height 1, two leaves, offset 0, a txid
+    b.extend_from_slice(&parent);
+    b.extend_from_slice(&[1, 2]); // offset 1, a txid
+    b.extend_from_slice(&paid);
+    b.push(2);
+    b.extend_from_slice(&[1, 0]);
+    b.extend_from_slice(&stack_parent(element));
+    b.extend_from_slice(&[1, 0]);
+    b.extend_from_slice(&subject);
+    let proven = hash(&[parent, paid].concat());
+    let root = hex::encode(proven.iter().rev().copied().collect::<Vec<u8>>());
+    (b, root)
+}
+
+/// The way out: the same payment whose script passes the budget, once it
+/// carries its own proof, is not run by the door (bsv-rs runs the scripts
+/// of a transaction only when it has no BUMP), and is accepted at its root.
+#[test]
+fn the_same_payment_with_its_proof_is_not_run_and_is_accepted() {
+    let (beef, root) = proven_stack_frame(PAST_THE_BUDGET);
+    for (path, run) in [
+        ("at rest", at_rest(&beef, &root, u64::MAX)),
+        ("inline", inline(&beef, &root)),
+    ] {
+        assert_eq!(run.answer, Ok(FEE), "{path}");
+        assert_eq!(run.asked, 1, "{path}");
     }
 }
 

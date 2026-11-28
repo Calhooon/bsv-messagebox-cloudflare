@@ -840,17 +840,20 @@ fn pending_answer(pending: &Pending) -> RouteResult {
 }
 
 /// The door's verdict to the route's answer: `delivery_answer` on the word,
-/// and a refusal of the bytes carries the offset and the kind it names, in
-/// the text and as fields.
+/// and a refusal of the bytes carries the offset and the kind it names as
+/// fields, and in the text of every answer but a memory decline's, whose
+/// description is its one sentence alone.
 pub fn door_answer(verdict: DoorVerdict) -> Result<u64, RouteResult> {
     let DoorVerdict { word, named, .. } = verdict;
     delivery_answer(word).map_err(|(mut body, status)| {
         if let Some(named) = named {
-            let text = body["description"].as_str().unwrap_or_default();
-            body["description"] = json!(format!(
-                "{} ({} at offset {})",
-                text, named.kind, named.offset
-            ));
+            if body["code"] != "ERR_PAYMENT_MEMORY" {
+                let text = body["description"].as_str().unwrap_or_default();
+                body["description"] = json!(format!(
+                    "{} ({} at offset {})",
+                    text, named.kind, named.offset
+                ));
+            }
             body["offset"] = json!(named.offset);
             body["kind"] = json!(named.kind);
         }
@@ -923,9 +926,10 @@ pub fn delivery_answer(verdict: PaymentVerdict) -> Result<u64, RouteResult> {
         // step declined. The same road as the work budget: a 422 naming the
         // resource, the relay's own budget (always the constant) and the bytes
         // the input asked for. The payment is not judged: `txid` and `input`
-        // name the unproven transaction of the payment's BEEF whose input's
-        // script was running (bsv-rs `Verdict::SpendRefused`), and the
-        // description gives the way out.
+        // name the unproven transaction of the payment's BEEF, the payment
+        // itself or one of its ancestors, whose input's script was running
+        // (bsv-rs `Verdict::SpendRefused`), and the description gives the
+        // way out.
         PaymentVerdict::Unverifiable(UnverifiableReason::SpendRefused {
             offset,
             txid,
@@ -956,23 +960,27 @@ pub fn delivery_answer(verdict: PaymentVerdict) -> Result<u64, RouteResult> {
     }
 }
 
-/// The sentence of a memory decline: the payment is not judged; the bound
-/// passed is this host's, not a rule of the chain; the unproven transaction
-/// and input whose script passed it; and the way out.
+/// The sentence of a memory decline, the same at every door: the host
+/// declined memory for a script of an unproven transaction in the payment's
+/// BEEF (the payment itself or one of its ancestors); the bound is this
+/// host's, not a rule of the chain, and no verdict on the payment; and the
+/// way out, the free one first. bsv-rs runs the scripts of a transaction
+/// only when it carries no proof of its own, so once that transaction has
+/// its proof they are not run.
 pub fn memory_description(txid: &str, input: Option<u32>) -> String {
     let script = match input {
-        Some(input) => format!("the script of input {input} of transaction {txid}"),
-        None => format!("a script of transaction {txid}"),
+        Some(input) => format!("for the script of input {input} of transaction {txid}"),
+        None => format!("for a script of transaction {txid}"),
     };
     format!(
-        "Not judged: {script}, an unproven transaction in this payment's BEEF, passed this host's memory bound of {STACK_MEMORY_BYTES} bytes per stack. The bound is this host's, not a rule of the chain. Pay with coins whose ancestry is proven, or present this payment again once transaction {txid} has its proof."
+        "Not judged: this host declined memory {script}, an unproven transaction in this payment's BEEF (the payment itself or one of its ancestors). This host's memory bound is {STACK_MEMORY_BYTES} bytes per stack: a bound of this host, not a rule of the chain, and no verdict on the payment. Present this payment again once transaction {txid} has its proof, or pay with other coins."
     )
 }
 
 /// The operator's record of a payment the door did not judge (a work or a
 /// memory decline, 422 `ERR_PAYMENT_WORK` or `ERR_PAYMENT_MEMORY`): one
 /// `AUDIT payment.not_judged` line with the code, the resource, the
-/// transaction and input whose script passed the bound, and the sender's
+/// transaction and input whose script the bound stopped, and the sender's
 /// public identity key. `None` for every other answer.
 pub fn not_judged_line(body: &Value, sender: &str) -> Option<String> {
     let code = body["code"].as_str()?;
@@ -2318,8 +2326,9 @@ mod tests {
     }
 
     /// A memory decline reads "not judged": a host's bound, not a rule of the
-    /// chain, the transaction and input whose script passed it, and the way
-    /// out; no word of it reads as a verdict on the payment.
+    /// chain, the transaction and input whose script was declined memory, and
+    /// the way out, the free one first; no word of it reads as a verdict on
+    /// the payment.
     #[test]
     fn a_memory_decline_reads_not_judged_and_gives_the_way_out() {
         let txid = "cd".repeat(32);
@@ -2327,7 +2336,13 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "Not judged: the script of input 3 of transaction {txid}, an unproven transaction in this payment's BEEF, passed this host's memory bound of 1000000 bytes per stack. The bound is this host's, not a rule of the chain. Pay with coins whose ancestry is proven, or present this payment again once transaction {txid} has its proof."
+                "Not judged: this host declined memory for the script of input 3 of transaction {txid}, an unproven transaction in this payment's BEEF (the payment itself or one of its ancestors). This host's memory bound is 1000000 bytes per stack: a bound of this host, not a rule of the chain, and no verdict on the payment. Present this payment again once transaction {txid} has its proof, or pay with other coins."
+            )
+        );
+        assert_eq!(
+            memory_description(&txid, None),
+            format!(
+                "Not judged: this host declined memory for a script of transaction {txid}, an unproven transaction in this payment's BEEF (the payment itself or one of its ancestors). This host's memory bound is 1000000 bytes per stack: a bound of this host, not a rule of the chain, and no verdict on the payment. Present this payment again once transaction {txid} has its proof, or pay with other coins."
             )
         );
         let lower = text.to_lowercase();
@@ -2338,7 +2353,7 @@ mod tests {
 
     /// One `AUDIT payment.not_judged` line for each memory or work decline,
     /// with the code, the resource, the transaction and input whose script
-    /// passed the bound, and the sender's public identity key; none for any
+    /// the bound stopped, and the sender's public identity key; none for any
     /// other answer.
     #[test]
     fn a_decline_not_judged_leaves_one_audit_line() {
