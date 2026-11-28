@@ -55,6 +55,7 @@ is no verdict on the payment: the payment is not judged.
 |---|---|---|
 | 400 | `ERR_INVALID_PAYMENT` | Invalid bytes, spend, output or merkle-root refusal; byte errors name offset and kind. |
 | 400 | `ERR_INSUFFICIENT_PAYMENT` | The delivery output pays less than the fee. |
+| 413 | `ERR_PAYMENT_SIZE` | Not judged: the payment's bytes (its BEEF as bytes, inline in any shape of `tx` or uploaded) are over this host's bound of 1,048,576 bytes (`budget`; `size` the payment's bytes). Refused from the encoding's or the stored length before any of it is read; the door reads and keeps nothing of it. A bound of this host, not a rule of the chain, and no verdict on the payment: pay with other coins. The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then. Each refusal is logged for the operator (`AUDIT payment.not_judged`). |
 | 422 | `ERR_PAYMENT_WORK` | Local work budget exhausted; validity remains undetermined. |
 | 422 | `ERR_PAYMENT_MEMORY` | Not judged: this host declined memory for a script of an unproven transaction in the payment's BEEF, the payment itself or one of its ancestors, at its stack-memory bound (1,000,000 bytes per stack, named in `budget`) or for a step. The bound is this host's, not a rule of the chain, and the answer is no verdict on the payment. `txid` and `input` name that transaction and input; the `description` is one sentence that says so. The way out, the free one first: present the payment again once that transaction has its proof (a transaction with its own proof is not run), or pay with other coins. Each decline is logged for the operator (`AUDIT payment.not_judged`). |
 | 500 | `ERR_SERVER_MISCONFIGURED` | No header service is configured. |
@@ -67,6 +68,11 @@ this relay answers a local work or memory decline with 422, because the same byt
 would be declined again. A memory decline's way out, the free one first, is the payment
 presented again once the transaction it names has its proof, or other coins: a decline keeps
 no state of the reading, so the next presentation is read afresh.
+
+A payment's bytes are held to 1,048,576 at both of its doors, the inline `payment.tx`
+of a `/sendMessage` and an upload named by `payment.beefR2Key`; the rest of the body keeps
+its own bound (12 MiB). A Worker's isolate is memory-limited, and a door bounds what it reads.
+The reference's servers run under a process with no isolate ceiling and name no such figure; this host differs on purpose.
 
 `/sendMessage` also carries a per-identity send budget
 ([src/send_budget.rs](src/send_budget.rs)): past it the answer is 429

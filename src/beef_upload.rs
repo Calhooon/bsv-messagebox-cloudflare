@@ -1,6 +1,8 @@
 //! `/beef/upload-url` endpoint: hand the caller a presigned R2 PUT URL so
-//! they can upload a BEEF larger than the 100 MB Cloudflare Workers body
-//! cap directly to R2.
+//! they can upload a payment's BEEF directly to R2 and send its key. The
+//! relay does not take the upload's bytes itself; it reads an uploaded
+//! payment of at most `payments::PAYMENT_BUDGET_BYTES`, held by the object's
+//! stored length before a byte of it is read (step 5).
 //!
 //! The key is scoped to the caller's identity key:
 //!     `<identity_key>/<uuid>.beef`
@@ -11,15 +13,17 @@
 //! Flow:
 //!   1. Client POSTs `/beef/upload-url` (auth'd via BRC-31).
 //!   2. Server returns `{ url, key, expiresAt }`.
-//!   3. Client PUTs BEEF bytes to `url` (direct to R2, up to 5 TB).
+//!   3. Client PUTs BEEF bytes to `url` (direct to R2).
 //!   4. Client POSTs `/sendMessage` with `payment.beefR2Key = key`.
 //!   5. Server verifies the object as a stream from R2, internalizes,
 //!      deletes the object.
 //!
-//! Step 5 lives in `payments.rs` and `beef_door.rs` (0.4.0: the object is
-//! never refused for its size and never held whole while it is verified; a
-//! verification one request cannot finish saves its cursor beside the object
-//! and the same request again continues). This module covers steps 1–2 AND
+//! Step 5 lives in `payments.rs` and `beef_door.rs`: an object over
+//! `payments::PAYMENT_BUDGET_BYTES` is refused 413 `ERR_PAYMENT_SIZE` from its
+//! stored length (`beef_door::verify_at_rest_within`); one within it is never
+//! held whole while it is verified, and a verification one request cannot
+//! finish saves its cursor beside the object and the same request again
+//! continues. This module covers steps 1–2 AND
 //! the R2 side of step 5: the door's store, the spool and the cleanup.
 
 use crate::beef_door::{BeefStore, Chunks, Stamp};
@@ -31,8 +35,8 @@ use worker::Env;
 /// R2 bucket binding name (matches `[[r2_buckets]] binding` in wrangler.toml).
 const R2_BINDING: &str = "BEEF_BLOBS";
 
-/// URL lifetime. 10 minutes is long enough for a ~200 Mbps uploader to push
-/// a 5 GB BEEF, short enough that leaked URLs can't be re-used later.
+/// URL lifetime. 10 minutes is long enough for a slow upload, short enough
+/// that leaked URLs can't be re-used later.
 const URL_EXPIRES_SECS: u32 = 600;
 
 /// Format a timestamp as AWS amz-date (YYYYMMDDTHHMMSSZ) — matches the

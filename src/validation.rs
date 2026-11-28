@@ -31,8 +31,9 @@ pub struct ValidatedSendMessage {
 /// MiB and the rest of the isolate is the Worker's and the reading's. An
 /// estimate on the host, not measured in wasm32. Through 0.4.3 the bound was
 /// the platform's 100 MB, and a byte array of about 15 MB exhausted the
-/// isolate in parsing alone. A larger payment goes by upload
-/// (`/beef/upload-url`), which has no bound.
+/// isolate in parsing alone. The payment inside the body has its own bound
+/// (`payments::PAYMENT_BUDGET_BYTES`), by upload (`/beef/upload-url`) or
+/// inline.
 pub const SEND_BODY_BYTES: usize = 12 * 1024 * 1024;
 
 /// The `/sendMessage` body as a `Value`, read so that no `payment.tx` is
@@ -50,7 +51,7 @@ pub fn read_send_body(raw: &[u8]) -> ValResult<Value> {
             413,
             "ERR_BODY_TOO_LARGE",
             &format!(
-                "The send is {} bytes and the relay reads at most {} in one request. Upload the payment's BEEF (/beef/upload-url) and send its key (payment.beefR2Key): an upload has no bound.",
+                "The send is {} bytes and the relay reads at most {} in one request.",
                 raw.len(),
                 SEND_BODY_BYTES
             ),

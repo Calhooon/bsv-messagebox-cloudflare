@@ -17,7 +17,7 @@ use worker::Env;
 
 use crate::beef_door::{
     inline_spool_key, judge_output_inline, structure_inline, verify_inline, AtRest, BeefStore,
-    Carrier, DoorError, DoorVerdict, Pending, Slice, Slices, Terms, ROOT_LOOKUPS_PER_PASS,
+    Carrier, DoorError, DoorVerdict, Pending, Slice, Slices, Terms, Within, ROOT_LOOKUPS_PER_PASS,
     SCRIPT_INPUTS_PER_PASS, SCRIPT_WEIGHT_PER_PASS, STACK_MEMORY_BYTES, VERIFY_SLICE_MILLIS,
 };
 
@@ -56,9 +56,13 @@ pub struct Judged {
 /// owns (`beef_upload::decide_r2_fetch`); the payment's BEEF is then read
 /// from R2 and `payment.tx` is not looked at.
 ///
-/// No payment is refused for its size or its counts (0.4.0): the BEEF is read
-/// as a stream, one element in hand (`beef_door`), and a refusal names the
-/// offset and the kind of the bytes that are wrong. The delivery output is
+/// A payment's bytes are held to `PAYMENT_BUDGET_BYTES` (0.8.9) before any of
+/// them is read: an inline `payment.tx` by its encoding's length
+/// (`check_payment_size`), an object at rest by its stored length
+/// (`judge_payment_at_rest`, `check_unjudged_at_rest`); over it the answer is
+/// 413 `ERR_PAYMENT_SIZE`. Within it no payment is refused for its counts: the
+/// BEEF is read as a stream, one element in hand (`beef_door`), and a refusal
+/// names the offset and the kind of the bytes that are wrong. The delivery output is
 /// verified against the header service the `HEADER_SERVICE` binding or
 /// `HEADER_SERVICE_URL` names (0.3.29, 0.3.30); a deployment that names none
 /// refuses every payment that owes a delivery fee. An object at rest that one
@@ -87,6 +91,22 @@ pub async fn process_payment(
         .get("outputs")
         .and_then(|v| v.as_array())
         .ok_or_else(missing_tx)?;
+
+    // A payment the door did not judge leaves one line for the operator.
+    let counted = |refused: RouteResult| {
+        if let Some(line) = not_judged_line(&refused.0, sender_key) {
+            worker::console_log!("{line}");
+        }
+        refused
+    };
+    // The inline payment's bytes, held to the budget by their encoding's
+    // length before any of them is decoded: every inline path below (spooled,
+    // read in the request, or kept unjudged) reads only what passed here.
+    if r2_key.is_none() {
+        if let Some(tx) = payment.get("tx") {
+            check_payment_size(tx).map_err(counted)?;
+        }
+    }
 
     // The reader every object of the payment names: the relay, the recipient
     // of the delivery fee (`handoff::READER_METADATA`).
@@ -135,15 +155,8 @@ pub async fn process_payment(
             weight: SCRIPT_WEIGHT_PER_PASS,
             work_units: crate::beef_door::work_units_per_input(),
         };
-        // A payment the door did not judge leaves one line for the operator.
-        let counted = |refused: RouteResult| {
-            if let Some(line) = not_judged_line(&refused.0, sender_key) {
-                worker::console_log!("{line}");
-            }
-            refused
-        };
         let judged = match r2_key {
-            Some(key) => judge_delivery_at_rest(
+            Some(key) => judge_payment_at_rest(
                 &store,
                 key,
                 server_output,
@@ -208,7 +221,7 @@ pub async fn process_payment(
     // A body no delivery fee judges is kept in its row, never spooled (0.4.4,
     // bsv-low #591 M3): its structure is read and the row's bound holds it.
     if let (None, None, Some(_)) = (&judged, r2_key, payment.get("tx")) {
-        check_unjudged(payment).await?;
+        check_unjudged(payment).await.map_err(counted)?;
     }
 
     // Per-recipient output routing, before the hand-off: a payment whose
@@ -229,6 +242,16 @@ pub async fn process_payment(
             &outputs[..]
         };
         route_outputs_to_recipients(recipient_outputs, &fee_recipients)?
+    };
+
+    // An upload no delivery fee judges is named in its row and never read:
+    // its stored length is held to the budget all the same, and the hand-off
+    // names the object it measured and no other.
+    let measured = match (&judged, r2_key) {
+        (None, Some(key)) => check_unjudged_at_rest(&crate::beef_upload::R2Store::new(env), key)
+            .await
+            .map_err(counted)?,
+        _ => None,
     };
 
     // The hand-off (`handoff`). The verdict is in.
@@ -260,7 +283,8 @@ pub async fn process_payment(
             server_output: judged.as_ref().map(|(output, _)| *output),
             stamp: judged
                 .as_ref()
-                .and_then(|(_, judged)| judged.stamp.as_ref()),
+                .and_then(|(_, judged)| judged.stamp.as_ref())
+                .or(measured.as_ref()),
             txid: judged.as_ref().map(|(_, judged)| judged.txid.as_str()),
             rows: !fee_recipients.is_empty(),
             reader: &reader,
@@ -626,7 +650,9 @@ pub async fn check_delivery_at_rest(
     .map(|judged| judged.satoshis)
 }
 
-/// `check_delivery_at_rest`, with the subject's txid beside the satoshis.
+/// `check_delivery_at_rest`, with the subject's txid beside the satoshis: the
+/// reading itself, which names no size. The route reads an upload through
+/// `judge_payment_at_rest`.
 #[allow(clippy::too_many_arguments)]
 pub async fn judge_delivery_at_rest(
     store: &dyn BeefStore,
@@ -638,6 +664,63 @@ pub async fn judge_delivery_at_rest(
     header_service: Option<&dyn HeaderService>,
     slices: &Slices<'_>,
 ) -> Result<Judged, RouteResult> {
+    judge_at_rest_within(
+        store,
+        key,
+        server_output,
+        delivery_fee,
+        sender_key,
+        server_wallet,
+        header_service,
+        slices,
+        u64::MAX,
+    )
+    .await
+}
+
+/// The door on a payment uploaded to the relay's store (0.8.9): its stored
+/// length, from the stamp the reading uses, is held to
+/// `PAYMENT_BUDGET_BYTES` before the saved state is loaded or a byte of it is
+/// opened (`beef_door::verify_at_rest_within`), so an object stored before
+/// this release is bounded too; over it the answer is 413 `ERR_PAYMENT_SIZE`,
+/// and nothing of the reading is kept. Within it, `judge_delivery_at_rest`.
+#[allow(clippy::too_many_arguments)]
+pub async fn judge_payment_at_rest(
+    store: &dyn BeefStore,
+    key: &str,
+    server_output: &Value,
+    delivery_fee: u64,
+    sender_key: &str,
+    server_wallet: &ProtoWallet,
+    header_service: Option<&dyn HeaderService>,
+    slices: &Slices<'_>,
+) -> Result<Judged, RouteResult> {
+    judge_at_rest_within(
+        store,
+        key,
+        server_output,
+        delivery_fee,
+        sender_key,
+        server_wallet,
+        header_service,
+        slices,
+        PAYMENT_BUDGET_BYTES,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn judge_at_rest_within(
+    store: &dyn BeefStore,
+    key: &str,
+    server_output: &Value,
+    delivery_fee: u64,
+    sender_key: &str,
+    server_wallet: &ProtoWallet,
+    header_service: Option<&dyn HeaderService>,
+    slices: &Slices<'_>,
+    budget: u64,
+) -> Result<Judged, RouteResult> {
     let (output_index, prefix, suffix) = delivery_remittance(server_output, sender_key)?;
     let expected_script = delivery_script(server_wallet, prefix, suffix, sender_key)?;
     let terms = Terms {
@@ -645,20 +728,122 @@ pub async fn judge_delivery_at_rest(
         expected_script: &expected_script,
         required_satoshis: delivery_fee,
     };
-    match crate::beef_door::verify_at_rest_stamped(store, key, &terms, header_service, slices)
-        .await
-        .map_err(door_error)?
+    let read = match crate::beef_door::verify_at_rest_within(
+        store,
+        key,
+        &terms,
+        header_service,
+        slices,
+        budget,
+    )
+    .await
+    .map_err(door_error)?
     {
+        Within::Over(size) => return Err(payment_size_refusal(Some(size))),
+        Within::Read(answer, stamp) => (answer, stamp),
+    };
+    match read {
         (AtRest::Done(verdict), stamp) => {
             door_judged(verdict).map(|judged| Judged { stamp, ..judged })
         }
         (AtRest::Pending(pending), _) => Err(pending_answer(&pending)),
-        (AtRest::NotFound, _) => Err(err(
-            400,
-            "ERR_BEEF_KEY_NOT_FOUND",
-            "Could not fetch BEEF from R2: R2 object not found",
-        )),
+        (AtRest::NotFound, _) => Err(beef_key_not_found("R2 object not found")),
     }
+}
+
+fn beef_key_not_found(why: &str) -> RouteResult {
+    err(
+        400,
+        "ERR_BEEF_KEY_NOT_FOUND",
+        &format!("Could not fetch BEEF from R2: {}", why),
+    )
+}
+
+/// The most of a payment's bytes the relay reads (0.8.9): 1,048,576 bytes of
+/// the payment itself, its BEEF as bytes, whatever encoding carried it. A
+/// payment over it is refused 413 `ERR_PAYMENT_SIZE` before any of it is
+/// decoded, parsed or verified, before anything is put at rest for it and
+/// before it is handed to a wallet; the door reads and keeps nothing of it,
+/// and the same sender may present another payment at once. A request's
+/// other content keeps its own bounds (`validation::SEND_BODY_BYTES` for a
+/// `/sendMessage` body). A Worker's isolate is memory-limited, and a door
+/// bounds what it reads. The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then.
+pub const PAYMENT_BUDGET_BYTES: u64 = 1_048_576;
+
+/// The refusal of a payment over `PAYMENT_BUDGET_BYTES`, the same at every
+/// door: 413 `ERR_PAYMENT_SIZE`, the budget, the payment's size where the door
+/// knows it, and one sentence that says the payment is not judged.
+pub fn payment_size_refusal(size: Option<u64>) -> RouteResult {
+    let budget = PAYMENT_BUDGET_BYTES;
+    let description = match size {
+        Some(size) => format!(
+            "Not judged: this payment is {size} bytes, and this host reads at most {budget} bytes of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block."
+        ),
+        None => format!(
+            "Not judged: this payment is more than {budget} bytes, the most this host reads of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block."
+        ),
+    };
+    let mut body = json!({
+        "status": "error",
+        "code": "ERR_PAYMENT_SIZE",
+        "description": description,
+        "resource": "Size",
+        "budget": budget,
+    });
+    if let Some(size) = size {
+        body["size"] = json!(size);
+    }
+    (body, 413)
+}
+
+/// The bytes an inline `payment.tx` carries, from its encoding's length
+/// alone, with no byte decoded: a byte array's length, half a hex string's,
+/// three quarters of a base64 text's less its padding. `None` for a value
+/// that is none of the three shapes (refused as such by the door).
+pub fn sent_payment_bytes(tx: &Value) -> Option<u64> {
+    let bytes = match tx {
+        Value::Array(items) => items.len(),
+        Value::String(hex) => hex.len() / 2,
+        Value::Object(o) => {
+            let b64 = o.get("beef")?.as_str()?;
+            let padding = b64.bytes().rev().take(2).filter(|c| *c == b'=').count();
+            (b64.len() / 4 * 3).saturating_sub(padding)
+        }
+        _ => return None,
+    };
+    u64::try_from(bytes).ok()
+}
+
+/// The door's first word on an inline payment (0.8.9): its bytes held to
+/// `PAYMENT_BUDGET_BYTES` by their encoding's length
+/// (`sent_payment_bytes`), before any of them is decoded or parsed; 413
+/// `ERR_PAYMENT_SIZE` over it.
+pub fn check_payment_size(tx: &Value) -> Result<(), RouteResult> {
+    match sent_payment_bytes(tx) {
+        Some(size) if size > PAYMENT_BUDGET_BYTES => Err(payment_size_refusal(Some(size))),
+        _ => Ok(()),
+    }
+}
+
+/// An upload a box keeps unjudged (no delivery fee), held to
+/// `PAYMENT_BUDGET_BYTES` by its stored length (0.8.9): no byte of it is
+/// read, here or by the hand-off, which names the object measured here and
+/// no other. The stamp measured; 413 `ERR_PAYMENT_SIZE` over the budget; 400
+/// `ERR_BEEF_KEY_NOT_FOUND` when the store has no such object or cannot say,
+/// the hand-off's answer for the same.
+pub async fn check_unjudged_at_rest(
+    store: &dyn BeefStore,
+    key: &str,
+) -> Result<Option<crate::beef_door::Stamp>, RouteResult> {
+    let stamp = store
+        .stamp(key)
+        .await
+        .map_err(|e| beef_key_not_found(&e))?
+        .ok_or_else(|| beef_key_not_found("R2 object not found"))?;
+    if stamp.size > PAYMENT_BUDGET_BYTES {
+        return Err(payment_size_refusal(Some(stamp.size)));
+    }
+    Ok(Some(stamp))
 }
 
 /// A payment a box keeps unjudged (no delivery fee), held as 0.3.x held
@@ -671,6 +856,9 @@ pub async fn judge_delivery_at_rest(
 /// whole and refuses nothing for its size; this one judges nothing, so it
 /// keeps nothing larger than its row.
 pub async fn check_unjudged(payment: &Value) -> Result<(), RouteResult> {
+    if let Some(tx) = payment.get("tx") {
+        check_payment_size(tx)?;
+    }
     let carrier = payment
         .get("tx")
         .and_then(Carrier::of)
@@ -978,20 +1166,30 @@ pub fn memory_description(txid: &str, input: Option<u32>) -> String {
 }
 
 /// The operator's record of a payment the door did not judge (a work or a
-/// memory decline, 422 `ERR_PAYMENT_WORK` or `ERR_PAYMENT_MEMORY`): one
+/// memory decline, 422 `ERR_PAYMENT_WORK` or `ERR_PAYMENT_MEMORY`, or a
+/// payment over the byte budget, 413 `ERR_PAYMENT_SIZE`): one
 /// `AUDIT payment.not_judged` line with the code, the resource, the
-/// transaction and input whose script the bound stopped, and the sender's
-/// public identity key. `None` for every other answer.
+/// transaction and input whose script the bound stopped (for a size, the
+/// payment's bytes and the budget), and the sender's public identity key.
+/// `None` for every other answer.
 pub fn not_judged_line(body: &Value, sender: &str) -> Option<String> {
     let code = body["code"].as_str()?;
-    if code != "ERR_PAYMENT_MEMORY" && code != "ERR_PAYMENT_WORK" {
-        return None;
-    }
     let word = |field: &str| match &body[field] {
         Value::String(text) => text.clone(),
         Value::Null => "none".to_string(),
         other => other.to_string(),
     };
+    if code == "ERR_PAYMENT_SIZE" {
+        return Some(format!(
+            "AUDIT payment.not_judged code={code} resource={} size={} budget={} sender={sender}",
+            word("resource"),
+            word("size"),
+            word("budget"),
+        ));
+    }
+    if code != "ERR_PAYMENT_MEMORY" && code != "ERR_PAYMENT_WORK" {
+        return None;
+    }
     Some(format!(
         "AUDIT payment.not_judged code={code} resource={} txid={} input={} sender={sender}",
         word("resource"),
@@ -2100,7 +2298,8 @@ mod tests {
         }
     }
 
-    // ---- NL-4: no door by size or count (0.3.31: 413 ERR_BODY_TOO_LARGE) ----
+    // ---- NL-4: the reader names no size or count; the route's door holds a
+    // payment's bytes to PAYMENT_BUDGET_BYTES before the reader (below) ----
 
     const THE_OLD_DOOR: usize = 4 * 1024 * 1024;
 
@@ -2248,6 +2447,275 @@ mod tests {
             assert!(read.windows(2).all(|w| w[0] < w[1]));
             assert_eq!(read[2], bytes.len() as u64);
         }
+    }
+
+    // ---- 0.8.9: a payment's bytes held to PAYMENT_BUDGET_BYTES at both doors ----
+
+    const BUDGET: usize = PAYMENT_BUDGET_BYTES as usize;
+
+    /// A valid payment of exactly `bytes` bytes: output 0 pays `satoshis`,
+    /// and a second output of ballast nothing spends sets the length.
+    fn payment_of_exactly(bytes: usize, satoshis: u64) -> Vec<u8> {
+        let probe = 100_000;
+        let bare = atomic_beef(&[(satoshis, payer_script()), (0, vec![0x6a; probe])]).len() - probe;
+        let payment = atomic_beef(&[(satoshis, payer_script()), (0, vec![0x6a; bytes - bare])]);
+        assert_eq!(payment.len(), bytes);
+        payment
+    }
+
+    fn size_body(size: Option<u64>) -> Value {
+        let description = match size {
+            Some(size) => format!("Not judged: this payment is {size} bytes, and this host reads at most 1048576 bytes of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block."),
+            None => "Not judged: this payment is more than 1048576 bytes, the most this host reads of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block.".to_string(),
+        };
+        let mut body = json!({
+            "status": "error",
+            "code": "ERR_PAYMENT_SIZE",
+            "resource": "Size",
+            "budget": 1_048_576,
+            "description": description,
+        });
+        if let Some(size) = size {
+            body["size"] = json!(size);
+        }
+        body
+    }
+
+    #[test]
+    fn the_payment_budget_is_one_mebibyte() {
+        assert_eq!(PAYMENT_BUDGET_BYTES, 1_048_576);
+    }
+
+    #[test]
+    fn the_size_refusal_is_413_with_the_pinned_sentence() {
+        let (body, status) = payment_size_refusal(Some(1_048_577));
+        assert_eq!(status, 413);
+        assert_eq!(body, size_body(Some(1_048_577)));
+        assert_eq!(
+            body["description"],
+            "Not judged: this payment is 1048577 bytes, and this host reads at most 1048576 bytes of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block."
+        );
+        let (body, status) = payment_size_refusal(None);
+        assert_eq!(status, 413);
+        assert_eq!(body, size_body(None));
+        assert!(body.get("size").is_none(), "{body}");
+    }
+
+    #[test]
+    fn a_size_refusal_leaves_one_audit_line() {
+        let sender = "02".to_string() + &"11".repeat(32);
+        let (body, _) = payment_size_refusal(Some(1_048_577));
+        assert_eq!(
+            not_judged_line(&body, &sender),
+            Some(format!(
+                "AUDIT payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=1048577 budget=1048576 sender={sender}"
+            ))
+        );
+        let (body, _) = payment_size_refusal(None);
+        assert_eq!(
+            not_judged_line(&body, &sender),
+            Some(format!(
+                "AUDIT payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=none budget=1048576 sender={sender}"
+            ))
+        );
+    }
+
+    #[test]
+    fn the_inline_size_is_read_from_the_encodings_length_in_every_shape() {
+        for bytes in [0usize, 1, 2, 3, 4, 5, 1_000] {
+            for tx in shapes(&vec![7u8; bytes]) {
+                assert_eq!(sent_payment_bytes(&tx), Some(bytes as u64), "{tx}");
+            }
+        }
+        assert_eq!(sent_payment_bytes(&json!(false)), None);
+        assert_eq!(sent_payment_bytes(&json!({ "other": "AA==" })), None);
+    }
+
+    #[tokio::test]
+    async fn an_inline_payment_of_exactly_the_budget_is_judged_as_before_in_every_shape() {
+        let output = remittance(0, &sender_identity());
+        for tx in shapes(&payment_of_exactly(BUDGET, FEE)) {
+            assert_eq!(sent_payment_bytes(&tx), Some(PAYMENT_BUDGET_BYTES));
+            assert_eq!(check_payment_size(&tx), Ok(()));
+            assert_eq!(check(&tx, &output).await, Ok(FEE));
+        }
+        for tx in shapes(&payment_of_exactly(BUDGET, FEE - 1)) {
+            assert_eq!(check_payment_size(&tx), Ok(()));
+            assert_eq!(
+                refusal_code(check(&tx, &output).await),
+                (400, "ERR_INSUFFICIENT_PAYMENT".to_string())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inline_payment_one_byte_over_the_budget_is_refused_413_in_every_shape() {
+        let over = Some(PAYMENT_BUDGET_BYTES + 1);
+        for tx in shapes(&vec![0u8; BUDGET + 1]) {
+            assert_eq!(
+                check_payment_size(&tx),
+                Err((size_body(over), 413)),
+                "{}",
+                &tx.to_string()[..16]
+            );
+            // The door that keeps a payment unjudged answers the same.
+            assert_eq!(
+                check_unjudged(&json!({ "tx": tx })).await,
+                Err((size_body(over), 413))
+            );
+        }
+        // Refused from the length alone: none of these is decoded, and each
+        // would be refused as no payment if it were.
+        for tx in [
+            json!("zz".repeat(BUDGET + 1)),
+            json!(vec![999u32; BUDGET + 1]),
+            json!({ "beef": "!".repeat((BUDGET + 1) / 3 * 4 + 4) }),
+        ] {
+            let (body, status) = check_payment_size(&tx).expect_err("over the budget");
+            assert_eq!((status, &body["code"]), (413, &json!("ERR_PAYMENT_SIZE")));
+        }
+    }
+
+    /// A store whose objects have a stamp and nothing else: a door that loads
+    /// a state or opens a reader on it is counted, and gets no byte.
+    #[derive(Default)]
+    struct Sealed {
+        size: u64,
+        loads: std::cell::Cell<u32>,
+        opens: std::cell::Cell<u32>,
+        saves: std::cell::Cell<u32>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl BeefStore for Sealed {
+        async fn stamp(&self, _key: &str) -> Result<Option<crate::beef_door::Stamp>, String> {
+            Ok(Some(crate::beef_door::Stamp {
+                size: self.size,
+                etag: "v1".to_string(),
+            }))
+        }
+        async fn open(
+            &self,
+            _key: &str,
+            _from: u64,
+            _stamp: &crate::beef_door::Stamp,
+        ) -> Result<Box<dyn crate::beef_door::Chunks>, String> {
+            self.opens.set(self.opens.get() + 1);
+            Err("sealed".to_string())
+        }
+        async fn load(&self, _key: &str) -> Result<Option<Vec<u8>>, String> {
+            self.loads.set(self.loads.get() + 1);
+            Ok(None)
+        }
+        async fn save(&self, _key: &str, _state: Vec<u8>) -> Result<(), String> {
+            self.saves.set(self.saves.get() + 1);
+            Ok(())
+        }
+        async fn clear(&self, _key: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// The route's door on an upload (`judge_payment_at_rest`), in one pass.
+    async fn door_at_rest(store: &dyn BeefStore) -> Result<u64, RouteResult> {
+        let clock = || 0u64;
+        judge_payment_at_rest(
+            store,
+            R2_KEY,
+            &remittance(0, &sender_identity()),
+            FEE,
+            &sender_identity(),
+            &wallet(SERVER_KEY),
+            Some(&StubHeaders::honest()),
+            &Slices {
+                time: Slice {
+                    clock: &clock,
+                    millis: u64::MAX,
+                },
+                lookups: ROOT_LOOKUPS_PER_PASS,
+                inputs: u64::MAX,
+                weight: u64::MAX,
+                work_units: crate::beef_door::work_units_per_input(),
+            },
+        )
+        .await
+        .map(|judged| judged.satoshis)
+    }
+
+    #[tokio::test]
+    async fn an_upload_of_exactly_the_budget_is_judged_as_before() {
+        use crate::beef_door::tests::MemStore;
+        let paid = MemStore::with(R2_KEY, &payment_of_exactly(BUDGET, FEE));
+        assert_eq!(door_at_rest(&paid).await, Ok(FEE));
+        let under = MemStore::with(R2_KEY, &payment_of_exactly(BUDGET, FEE - 1));
+        assert_eq!(
+            refusal_code(door_at_rest(&under).await),
+            (400, "ERR_INSUFFICIENT_PAYMENT".to_string())
+        );
+        assert_eq!(
+            refusal_code(door_at_rest(&MemStore::default()).await),
+            (400, "ERR_BEEF_KEY_NOT_FOUND".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_one_byte_over_the_budget_is_refused_from_its_stored_length() {
+        let sealed = Sealed {
+            size: PAYMENT_BUDGET_BYTES + 1,
+            ..Sealed::default()
+        };
+        assert_eq!(
+            door_at_rest(&sealed).await,
+            Err((size_body(Some(PAYMENT_BUDGET_BYTES + 1)), 413))
+        );
+        // No state was loaded or saved, and no reader was constructed.
+        assert_eq!(
+            (sealed.loads.get(), sealed.opens.get(), sealed.saves.get()),
+            (0, 0, 0)
+        );
+        // At the budget the same store is read.
+        let at = Sealed {
+            size: PAYMENT_BUDGET_BYTES,
+            ..Sealed::default()
+        };
+        let _ = door_at_rest(&at).await;
+        assert!(at.opens.get() > 0, "a payment at the budget is read");
+        // The same sender presents another payment at once, and it is read.
+        let paid =
+            crate::beef_door::tests::MemStore::with(R2_KEY, &payment_of_exactly(BUDGET, FEE));
+        assert_eq!(door_at_rest(&paid).await, Ok(FEE));
+    }
+
+    #[tokio::test]
+    async fn an_unjudged_upload_is_held_to_the_budget_by_its_stored_length() {
+        let over = Sealed {
+            size: PAYMENT_BUDGET_BYTES + 1,
+            ..Sealed::default()
+        };
+        assert_eq!(
+            check_unjudged_at_rest(&over, R2_KEY).await,
+            Err((size_body(Some(PAYMENT_BUDGET_BYTES + 1)), 413))
+        );
+        assert_eq!((over.loads.get(), over.opens.get()), (0, 0));
+        let at = Sealed {
+            size: PAYMENT_BUDGET_BYTES,
+            ..Sealed::default()
+        };
+        assert_eq!(
+            check_unjudged_at_rest(&at, R2_KEY).await,
+            Ok(Some(crate::beef_door::Stamp {
+                size: PAYMENT_BUDGET_BYTES,
+                etag: "v1".to_string(),
+            }))
+        );
+        assert_eq!(
+            refusal_code(
+                check_unjudged_at_rest(&crate::beef_door::tests::MemStore::default(), R2_KEY)
+                    .await
+                    .map(|_| 0)
+            ),
+            (400, "ERR_BEEF_KEY_NOT_FOUND".to_string())
+        );
     }
 
     // ---- M3: a body no delivery fee judges ----
