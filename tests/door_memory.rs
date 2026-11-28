@@ -73,8 +73,9 @@ fn hash(raw: &[u8]) -> [u8; 32] {
 #[derive(Clone, Copy, PartialEq)]
 enum Ballast {
     None,
-    /// In output 0, the one the next link spends: a push of that many bytes,
-    /// dropped, then `OP_TRUE`.
+    /// In output 0, the one the next link spends: that many bytes in two
+    /// pushes, each dropped, then `OP_TRUE`. Each push fits the door's
+    /// stack-memory budget (`beef_door::STACK_MEMORY_BYTES`).
     Spent(usize),
     /// In a second output nothing spends.
     Unspent(usize),
@@ -105,12 +106,16 @@ fn raw_tx(prev: &[u8; 32], satoshis: u64, script: &[u8], ballast: Ballast) -> Ve
     t.extend_from_slice(&satoshis.to_le_bytes());
     match ballast {
         Ballast::Spent(bytes) => {
-            // OP_PUSHDATA4 <bytes> OP_DROP, then the script.
-            script_len(5 + bytes + 1 + script.len(), &mut t);
-            t.push(0x4e);
-            t.extend_from_slice(&(bytes as u32).to_le_bytes());
-            t.resize(t.len() + bytes, 0x6a);
-            t.push(0x75);
+            // OP_PUSHDATA4 <half> OP_DROP, twice, then the script.
+            let halves = [bytes / 2, bytes - bytes / 2];
+            script_len(2 * (5 + 1) + bytes + script.len(), &mut t);
+            for half in halves {
+                assert!(half <= rust_message_box::beef_door::STACK_MEMORY_BYTES);
+                t.push(0x4e);
+                t.extend_from_slice(&(half as u32).to_le_bytes());
+                t.resize(t.len() + half, 0x6a);
+                t.push(0x75);
+            }
             t.extend_from_slice(script);
         }
         _ => {
