@@ -74,7 +74,6 @@ use bsv_middleware_rs::{
 // whole payment the door never holds (bsv-low #591 H1).
 use bsv_rs::primitives::hash::Sha256;
 use bsv_rs::primitives::sha256d;
-use bsv_rs::script::ScriptResource;
 use bsv_rs::transaction::beef_stream::{display_hex, Hash32, SpendRefusal, Step};
 use bsv_rs::transaction::{
     BeefDecoder, Cursor, Element, Headers, Progress, StreamVerifier, Timed, Verdict,
@@ -119,6 +118,21 @@ pub const SCRIPT_WEIGHT_PER_PASS: u64 = 10_000_000_000;
 /// Default LOCAL work per input: reached opcodes plus bytes fed to hashes.
 /// This declines evaluation and says nothing about network validity.
 pub const DEFAULT_WORK_UNITS: u64 = 10_000_000;
+
+/// LOCAL memory budget per input, in bytes per stack (bsv-rs 0.8.14
+/// `StreamVerifier::set_memory_limit`): the most an unproven input's scripts
+/// may hold on one stack while the door runs them. A sixteenth of a 128 MB
+/// isolate, the guidance of bsv-rs's GHSA-7vx5-cf5p-5c48: the heaviest
+/// arithmetic step holds about thirteen times its stack, so a sixteenth keeps
+/// that step within the isolate with room for the rest of the request. The
+/// door runs in the Worker and in the `MessageHub` object, which keeps its
+/// sockets with the runtime and its state in storage, so no lower figure is
+/// asked of it. An input whose stack would pass it is declined as a resource
+/// bound (`SpendRefusal::Resource`): the payment is unverifiable, answered
+/// 422 `ERR_PAYMENT_MEMORY` as a work decline is, and is never valid.
+/// Honest scripts hold far less. Like the work budget, it is not cursor
+/// state and is set on every reader, a resumed one included.
+pub const STACK_MEMORY_BYTES: usize = 8_000_000;
 
 mod configured_limits {
     include!(concat!(env!("OUT_DIR"), "/work_limit.rs"));
@@ -429,11 +443,12 @@ async fn read(
         (None, Pass::Structure) => StreamVerifier::structure_only(feed.clone(), AskedAfter, None),
         (None, Pass::Scripts) => StreamVerifier::new(feed.clone(), AskedAfter, None),
     };
-    // The work budget is local configuration, absent from the cursor.
-    // Set it after every construction, including every resumed reader.
+    // The work and memory budgets are local configuration, absent from the
+    // cursor. Set them after every construction, every resumed reader too.
     verifier.set_work_limit(Some(
         slice.map_or_else(work_units_per_input, |since| since.work_units),
     ));
+    verifier.set_memory_limit(Some(STACK_MEMORY_BYTES));
     // Where the element in hand began, in the bytes handed over: an input
     // weighs what was fetched since.
     let element_from = Cell::new(0u64);
@@ -571,9 +586,11 @@ fn refusal_word(refused: Verdict) -> DoorVerdict {
             input,
             why,
         } => {
+            // A resource decline names its resource: `Work`, or a memory
+            // budget's (`Stack`, `AltStack`, `ElementSize`).
             let kind = match &why {
-                SpendRefusal::Resource(limit) if limit.resource == ScriptResource::Work => "Work",
-                _ => "SpendRefused",
+                SpendRefusal::Resource(limit) => format!("{:?}", limit.resource),
+                _ => "SpendRefused".to_string(),
             };
             (
                 UnverifiableReason::SpendRefused {
@@ -582,10 +599,7 @@ fn refusal_word(refused: Verdict) -> DoorVerdict {
                     input,
                     why,
                 },
-                Named {
-                    offset,
-                    kind: kind.to_string(),
-                },
+                Named { offset, kind },
             )
         }
         // bsv-rs 0.5.0: a mining check (finality, coinbase maturity) with no

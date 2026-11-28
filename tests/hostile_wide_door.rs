@@ -1047,3 +1047,126 @@ fn r404_h1_widest_single_input_at_the_budget() {
         }
     }
 }
+
+// The stack-memory budget (0.8.8): every unproven input's scripts run under
+// `beef_door::STACK_MEMORY_BYTES` bytes per stack (bsv-rs 0.8.14
+// `StreamVerifier::set_memory_limit`), and an input past it is declined as
+// a resource bound, the road a work decline takes.
+
+/// A script number, minimally encoded (positive, below 2^23).
+fn script_num(n: usize) -> Vec<u8> {
+    assert!(n > 0 && n < 1 << 23);
+    let mut out = Vec::new();
+    let mut v = n;
+    while v > 0 {
+        out.push((v & 0xff) as u8);
+        v >>= 8;
+    }
+    if out.last().unwrap() & 0x80 != 0 {
+        out.push(0);
+    }
+    out
+}
+
+/// The paid frame whose one unproven input holds `2 * element` bytes on its
+/// stack at once: a proven parent locked `OP_0 <element> OP_NUM2BIN OP_DUP
+/// OP_2DROP OP_1`, spent with an empty unlocking script by a subject paying
+/// the box.
+fn stack_frame(element: usize) -> (Vec<u8>, String) {
+    let mut lock = vec![0x00]; // OP_0
+    push(&script_num(element), &mut lock);
+    lock.extend_from_slice(&[0x80, 0x76, 0x6d, 0x51]); // NUM2BIN DUP 2DROP TRUE
+    let parent = raw(&[([0x11; 32], 0, vec![])], &[(1_000, lock)]);
+    let subject = raw(&[(hash(&parent), 0, vec![])], &[(FEE, server_script())]);
+    frame(&parent, &subject)
+}
+
+/// Each element of the stack frame: two of them together sit past the
+/// budget by 200,000 bytes, or under it by 200,000.
+const PAST_THE_BUDGET: usize = rust_message_box::beef_door::STACK_MEMORY_BYTES / 2 + 100_000;
+const UNDER_THE_BUDGET: usize = rust_message_box::beef_door::STACK_MEMORY_BYTES / 2 - 100_000;
+
+/// The memory decline's answer: 422 `ERR_PAYMENT_MEMORY`, the resource word
+/// in `resource` and `kind`, the budget the constant, input 0, and no root
+/// asked.
+fn declined_at_the_memory_budget(run: &Run, path: &str) {
+    eprintln!(
+        "stack budget {path}: {:?}, pending {}",
+        run.answer.as_ref().map_err(|(status, body)| (
+            status,
+            &body["code"],
+            &body["resource"],
+            &body["budget"],
+            &body["attempted"]
+        )),
+        run.pending
+    );
+    let (status, body) = run.answer.clone().expect_err("a memory decline");
+    assert_eq!(status, 422, "{path}: {body}");
+    assert_eq!(body["code"], "ERR_PAYMENT_MEMORY", "{path}: {body}");
+    let resource = body["resource"].as_str().unwrap_or_default();
+    assert!(
+        ["Stack", "AltStack", "ElementSize"].contains(&resource),
+        "{path}: {body}"
+    );
+    assert_eq!(body["kind"], resource, "{path}: {body}");
+    assert_eq!(body["input"], 0, "{path}: {body}");
+    assert_eq!(
+        body["budget"].as_u64(),
+        Some(rust_message_box::beef_door::STACK_MEMORY_BYTES as u64),
+        "{path}: {body}"
+    );
+    assert!(
+        body["attempted"].as_u64().unwrap() > body["budget"].as_u64().unwrap(),
+        "{path}: {body}"
+    );
+    assert_eq!(run.asked, 0, "{path}: declined before the root");
+}
+
+#[test]
+fn the_stack_memory_budget_is_a_sixteenth_of_a_128_mb_isolate() {
+    assert_eq!(rust_message_box::beef_door::STACK_MEMORY_BYTES, 8_000_000);
+}
+
+#[test]
+fn a_stack_past_the_memory_budget_is_declined_with_the_resource_word() {
+    let (beef, root) = stack_frame(PAST_THE_BUDGET);
+    for (path, run) in [
+        ("at rest", at_rest(&beef, &root, u64::MAX)),
+        ("inline", inline(&beef, &root)),
+    ] {
+        declined_at_the_memory_budget(&run, path);
+        assert_eq!(run.pending, 0, "{path}: one reading");
+    }
+}
+
+#[test]
+fn the_same_frame_under_the_memory_budget_keeps_its_verdict() {
+    let (beef, root) = stack_frame(UNDER_THE_BUDGET);
+    for (path, run) in [
+        ("at rest", at_rest(&beef, &root, u64::MAX)),
+        ("inline", inline(&beef, &root)),
+    ] {
+        assert_eq!(run.answer, Ok(FEE), "{path}");
+        assert_eq!(run.asked, 1, "{path}");
+    }
+}
+
+/// The budget is set on every reader the door builds: a fresh one, and one
+/// resumed from a saved cursor between requests (bsv-rs's budgets are not
+/// cursor state). The frame is valid under bsv-rs's own default budget of
+/// 32,000,000 bytes per stack, so the door's answer is a decline only while
+/// the door sets its own.
+#[test]
+fn the_memory_budget_is_set_on_every_reader_including_a_resumed_one() {
+    let (beef, root) = stack_frame(PAST_THE_BUDGET);
+    assert!(2 * PAST_THE_BUDGET < 32_000_000);
+    for path in [Path::AtRest, Path::Inline] {
+        let (run, pending, _) = paced(&beef, &root, path, Clock::Frozen, 0, u64::MAX, u64::MAX);
+        assert!(
+            pending.iter().any(|p| p["phase"] == "scripts"),
+            "{path:?}: the scripts were read by a resumed reader"
+        );
+        declined_at_the_memory_budget(&run, &format!("{path:?} resumed"));
+    }
+}

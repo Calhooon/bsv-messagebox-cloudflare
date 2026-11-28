@@ -6,6 +6,14 @@ tag publishes the release. Before 0.5.5 releases were cut from a private canonic
 repository with a release script that scrubbed every Cloudflare resource identifier;
 the `scrub` check (`tools/scrub.sh`) now holds that rule on every pull request.
 
+## [0.8.8] - 2026-11-28
+
+The relay's verifier runs under a stack-memory budget: every unproven input's scripts run with at most `STACK_MEMORY_BYTES` (8,000,000) bytes per stack, set on the door's one reader (`beef_door.rs`, `read`) beside the work budget, after every construction and every resume (bsv-rs 0.8.14 `StreamVerifier::set_memory_limit`). No requirement moves, and no wrangler setting.
+
+- **Why this figure.** bsv-rs's GHSA-7vx5-cf5p-5c48 asks a host that verifies a BEEF's scripts in a memory-limited isolate to set a per-stack budget at or below a sixteenth of the isolate's ceiling: 8,000,000 bytes for a 128 MB isolate. The door runs in the Worker and in the `MessageHub` object; neither keeps state in its own memory that asks for a lower figure.
+- **What a client sees.** An input whose stack would pass the budget is declined as a resource bound, the road a work decline takes: **422 `ERR_PAYMENT_MEMORY`**, `resource` and `kind` the resource (`Stack`, `AltStack` or `ElementSize`), `input`, `budget`, `attempted`, `offset`, `txid`. Payment validity is undetermined; the payment is not accepted and no root is asked. A work decline answers as before (422 `ERR_PAYMENT_WORK`). An honest payment, and every other verdict, status, code and message, answers as before.
+- **Tests.** `tests/hostile_wide_door.rs`: a frame whose stack passes the budget is declined on the at-rest and inline paths; the same frame under the budget is valid; the budget is set on a resumed reader too (the frame is valid under bsv-rs's default budget, so the test turns red if the door's budget is unset); the constant is 8,000,000.
+
 ## [0.8.7] - 2026-11-28
 
 bsv-rs's floor moves from `0.8.12` to `0.8.14`. The requirement keeps its form (a caret) and its features (`auth`, `wallet`, `transaction`, `wasm`). No other requirement moves, and no line of the relay's code changes.

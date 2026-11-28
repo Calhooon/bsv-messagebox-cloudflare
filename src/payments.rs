@@ -911,6 +911,28 @@ pub fn delivery_answer(verdict: PaymentVerdict) -> Result<u64, RouteResult> {
             }),
             422,
         )),
+        // The memory budget (`beef_door::STACK_MEMORY_BYTES`): the same road
+        // as the work budget, a 422 naming the resource, the budget and the
+        // bytes the input asked for.
+        PaymentVerdict::Unverifiable(UnverifiableReason::SpendRefused {
+            offset,
+            txid,
+            input,
+            why: SpendRefusal::Resource(limit),
+        }) => Err((
+            json!({
+                "status": "error",
+                "code": "ERR_PAYMENT_MEMORY",
+                "description": "The local evaluator declined this input at its memory budget; payment validity is undetermined.",
+                "resource": format!("{:?}", limit.resource),
+                "offset": offset,
+                "txid": txid,
+                "input": input,
+                "budget": limit.limit,
+                "attempted": limit.attempted,
+            }),
+            422,
+        )),
         PaymentVerdict::Unverifiable(reason) if reason.is_server_side() => {
             Err(err(503, "ERR_PAYMENT_UNAVAILABLE", &description))
         }
