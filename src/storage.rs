@@ -684,16 +684,30 @@ impl<'a> Storage<'a> {
         }
     }
 
-    /// Whether a row by this message id is stored (archived rows included):
-    /// the rows `INSERT_MESSAGE_SQL` ignores as a duplicate.
-    pub async fn holds_message_id(&self, message_id: &str) -> worker::Result<bool> {
+    /// Whether this sender's own send to this recipient's box is stored by
+    /// this message id (archived rows included): a row by the id that is
+    /// from `sender`, to `recipient` and in `message_box_id`. A row by the id
+    /// that is any other send's is not this send's, and answers `false`.
+    pub async fn holds_own_send(
+        &self,
+        message_id: &str,
+        sender: &str,
+        recipient: &str,
+        message_box_id: i64,
+    ) -> worker::Result<bool> {
         #[derive(Deserialize)]
         struct Held {
             #[allow(dead_code)]
             held: Option<i64>,
         }
-        let q = Query::new("SELECT 1 AS held FROM messages WHERE message_id = ? LIMIT 1")
-            .bind(message_id);
+        let q = Query::new(
+            "SELECT 1 AS held FROM messages \
+             WHERE message_id = ? AND sender = ? AND recipient = ? AND message_box_id = ? LIMIT 1",
+        )
+        .bind(message_id)
+        .bind(sender)
+        .bind(recipient)
+        .bind(message_box_id);
         let found: Option<Held> = with_d1_read_retry(|| q.fetch_optional(self.db)).await?;
         Ok(found.is_some())
     }

@@ -26,11 +26,17 @@ fn main() {
             .expect("[limits] work_units must be a u64")
     });
     let literal = work.map_or_else(|| "None".to_string(), |n| format!("Some({n})"));
-    // The payment's byte budget is passed as written: the relay reads it, and
-    // a value of zero or one that does not parse uses its default
+    // The payment's byte budget: a present value is a whole number of bytes
+    // above zero, or the build stops; an absent key uses the relay's default
     // (`payments::payment_budget_from`).
-    let payment = limit(&config, "payment_bytes")
-        .map_or_else(|| "None".to_string(), |raw| format!("Some({raw:?})"));
+    let payment = limit(&config, "payment_bytes").map(|value| {
+        value
+            .parse::<u64>()
+            .ok()
+            .filter(|bytes| *bytes > 0)
+            .expect("[limits] payment_bytes must be a whole number of bytes above zero")
+    });
+    let payment = payment.map_or_else(|| "None".to_string(), |n| format!("Some(\"{n}\")"));
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo build output directory"));
     // Compile only the budgets, never the rest of the deployment configuration.
     fs::write(

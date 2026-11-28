@@ -770,8 +770,10 @@ fn beef_key_not_found(why: &str) -> RouteResult {
 pub const DEFAULT_PAYMENT_BUDGET_BYTES: u64 = 614_400;
 
 /// The budget a `[limits] payment_bytes` value names: a whole number of
-/// bytes above zero; zero, a value that does not parse, or no value is
-/// `DEFAULT_PAYMENT_BUDGET_BYTES`, never no budget.
+/// bytes above zero. The build guarantees that a present value is one
+/// (`build.rs` stops on any other) and passes `None` for an absent key, which
+/// is `DEFAULT_PAYMENT_BUDGET_BYTES`. Any other value given here is also the
+/// default, never no budget.
 pub fn payment_budget_from(raw: Option<&str>) -> u64 {
     raw.and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|bytes| *bytes > 0)
@@ -2540,8 +2542,8 @@ mod tests {
         // A whole number of bytes above zero is the budget.
         assert_eq!(payment_budget_from(Some("2048")), 2048);
         assert_eq!(payment_budget_from(Some(" 4096 ")), 4096);
-        // No value, zero, or a value that does not parse is the default,
-        // never no budget.
+        // No value is the default. The build passes no other value; here any
+        // other is the default too, never no budget.
         for raw in [
             None,
             Some(""),
@@ -2560,10 +2562,11 @@ mod tests {
         }
     }
 
-    /// Another figure in force: the door follows it at both doors, in the
-    /// answer's `budget` and in its sentence.
+    /// The inner doors given another figure follow it, inline and at rest,
+    /// in the answer's `budget` and in its sentence. The figure in force is
+    /// the build's (`payment_budget_bytes`), pinned by the test above.
     #[tokio::test]
-    async fn the_door_follows_another_figure() {
+    async fn the_inner_doors_follow_the_figure_they_are_given() {
         use crate::beef_door::tests::MemStore;
         const OTHER: u64 = 2048;
         let output = remittance(0, &sender_identity());
