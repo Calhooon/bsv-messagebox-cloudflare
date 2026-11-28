@@ -1073,12 +1073,68 @@ fn script_num(n: usize) -> Vec<u8> {
 /// OP_2DROP OP_1`, spent with an empty unlocking script by a subject paying
 /// the box.
 fn stack_frame(element: usize) -> (Vec<u8>, String) {
+    frame(&stack_parent(element), &stack_subject(element))
+}
+
+/// The proven parent of `stack_frame`.
+fn stack_parent(element: usize) -> Vec<u8> {
+    raw(&[([0x11; 32], 0, vec![])], &[(1_000, stack_lock(element))])
+}
+
+/// The subject of `stack_frame`, the payment itself: its input 0 runs the
+/// parent's `stack_lock`.
+fn stack_subject(element: usize) -> Vec<u8> {
+    let parent = stack_parent(element);
+    raw(&[(hash(&parent), 0, vec![])], &[(FEE, server_script())])
+}
+
+/// `OP_0 <element> OP_NUM2BIN OP_DUP OP_2DROP OP_1`: `2 * element` bytes on
+/// the stack at once.
+fn stack_lock(element: usize) -> Vec<u8> {
     let mut lock = vec![0x00]; // OP_0
     push(&script_num(element), &mut lock);
     lock.extend_from_slice(&[0x80, 0x76, 0x6d, 0x51]); // NUM2BIN DUP 2DROP TRUE
-    let parent = raw(&[([0x11; 32], 0, vec![])], &[(1_000, lock)]);
-    let subject = raw(&[(hash(&parent), 0, vec![])], &[(FEE, server_script())]);
-    frame(&parent, &subject)
+    lock
+}
+
+/// A transaction's txid as the answer names it: hex in display order.
+fn txid_of(raw: &[u8]) -> String {
+    hex::encode(hash(raw).iter().rev().copied().collect::<Vec<u8>>())
+}
+
+/// The paid frame whose script past the budget runs in an unproven
+/// ancestor, at its input 1: a proven grandparent with an `OP_TRUE` output
+/// and a `stack_lock` output, an unproven ancestor spending both, and a
+/// subject spending the ancestor and paying the box. The frame, the root,
+/// and the ancestor's raw bytes.
+fn ancestor_frame(element: usize) -> (Vec<u8>, String, Vec<u8>) {
+    let grandparent = raw(
+        &[([0x11; 32], 0, vec![])],
+        &[(1_000, OP_TRUE.to_vec()), (1_000, stack_lock(element))],
+    );
+    let proven = hash(&grandparent);
+    let ancestor = raw(
+        &[(proven, 0, vec![]), (proven, 1, vec![])],
+        &[(1_500, OP_TRUE.to_vec())],
+    );
+    let subject = raw(&[(hash(&ancestor), 0, vec![])], &[(FEE, server_script())]);
+    let mut b = 0x0101_0101u32.to_le_bytes().to_vec();
+    b.extend_from_slice(&hash(&subject));
+    b.extend_from_slice(&0xEFBE_0002u32.to_le_bytes());
+    b.push(1);
+    b.push(0xfe);
+    b.extend_from_slice(&HEIGHT.to_le_bytes());
+    b.extend_from_slice(&[1, 1, 0, 2]);
+    b.extend_from_slice(&proven);
+    b.push(3);
+    b.extend_from_slice(&[1, 0]);
+    b.extend_from_slice(&grandparent);
+    b.push(0);
+    b.extend_from_slice(&ancestor);
+    b.push(0);
+    b.extend_from_slice(&subject);
+    let root = hex::encode(proven.iter().rev().copied().collect::<Vec<u8>>());
+    (b, root, ancestor)
 }
 
 /// Each element of the stack frame: two of them together sit past the
@@ -1087,9 +1143,11 @@ const PAST_THE_BUDGET: usize = rust_message_box::beef_door::STACK_MEMORY_BYTES /
 const UNDER_THE_BUDGET: usize = rust_message_box::beef_door::STACK_MEMORY_BYTES / 2 - 100_000;
 
 /// The memory decline's answer: 422 `ERR_PAYMENT_MEMORY`, the resource word
-/// in `resource` and `kind`, `budget` the relay's own constant, input 0, and
-/// no root asked.
-fn declined_at_the_memory_budget(run: &Run, path: &str) {
+/// in `resource` and `kind`, `budget` the relay's own constant, `txid` and
+/// `input` the transaction and input whose script passed the budget, a
+/// description that reads "not judged" and gives the way out, and no root
+/// asked.
+fn declined_at_the_memory_budget(run: &Run, path: &str, ran: &[u8], input: u32) {
     eprintln!(
         "stack budget {path}: {:?}, pending {}",
         run.answer.as_ref().map_err(|(status, body)| (
@@ -1110,7 +1168,22 @@ fn declined_at_the_memory_budget(run: &Run, path: &str) {
         "{path}: {body}"
     );
     assert_eq!(body["kind"], resource, "{path}: {body}");
-    assert_eq!(body["input"], 0, "{path}: {body}");
+    assert_eq!(body["input"], input, "{path}: {body}");
+    assert_eq!(body["txid"], txid_of(ran), "{path}: {body}");
+    let description = body["description"].as_str().unwrap_or_default();
+    for said in [
+        "Not judged: ",
+        "this host's memory bound",
+        "not a rule of the chain",
+        &format!("input {input} of transaction {}", txid_of(ran)),
+        "Pay with coins whose ancestry is proven, or present this payment again once transaction",
+    ] {
+        assert!(description.contains(said), "{path}: {said}: {body}");
+    }
+    assert!(
+        !description.to_lowercase().contains("invalid"),
+        "{path}: {body}"
+    );
     assert_eq!(
         body["budget"].as_u64(),
         Some(rust_message_box::beef_door::STACK_MEMORY_BYTES as u64),
@@ -1131,12 +1204,42 @@ fn the_stack_memory_budget_is_one_million_bytes() {
 #[test]
 fn a_stack_past_the_memory_budget_is_declined_with_the_resource_word() {
     let (beef, root) = stack_frame(PAST_THE_BUDGET);
+    let subject = stack_subject(PAST_THE_BUDGET);
     for (path, run) in [
         ("at rest", at_rest(&beef, &root, u64::MAX)),
         ("inline", inline(&beef, &root)),
     ] {
-        declined_at_the_memory_budget(&run, path);
+        declined_at_the_memory_budget(&run, path, &subject, 0);
         assert_eq!(run.pending, 0, "{path}: one reading");
+    }
+}
+
+/// The script past the budget runs in an unproven ancestor of the payment:
+/// the answer names that ancestor and its input, not the payment.
+#[test]
+fn a_memory_decline_names_the_unproven_ancestor_whose_script_ran() {
+    let (beef, root, ancestor) = ancestor_frame(PAST_THE_BUDGET);
+    for (path, run) in [
+        ("at rest", at_rest(&beef, &root, u64::MAX)),
+        ("inline", inline(&beef, &root)),
+    ] {
+        declined_at_the_memory_budget(&run, path, &ancestor, 1);
+        let (_, body) = run.answer.clone().unwrap_err();
+        // The Atomic BEEF's header names the subject at bytes 4..36.
+        let subject: String = hex::encode(beef[4..36].iter().rev().copied().collect::<Vec<u8>>());
+        assert_ne!(body["txid"], subject, "{path}: {body}");
+    }
+}
+
+#[test]
+fn the_same_ancestry_under_the_memory_budget_keeps_its_verdict() {
+    let (beef, root, _) = ancestor_frame(UNDER_THE_BUDGET);
+    for (path, run) in [
+        ("at rest", at_rest(&beef, &root, u64::MAX)),
+        ("inline", inline(&beef, &root)),
+    ] {
+        assert_eq!(run.answer, Ok(FEE), "{path}");
+        assert_eq!(run.asked, 1, "{path}");
     }
 }
 
@@ -1167,6 +1270,11 @@ fn the_memory_budget_is_set_on_every_reader_including_a_resumed_one() {
             pending.iter().any(|p| p["phase"] == "scripts"),
             "{path:?}: the scripts were read by a resumed reader"
         );
-        declined_at_the_memory_budget(&run, &format!("{path:?} resumed"));
+        declined_at_the_memory_budget(
+            &run,
+            &format!("{path:?} resumed"),
+            &stack_subject(PAST_THE_BUDGET),
+            0,
+        );
     }
 }
