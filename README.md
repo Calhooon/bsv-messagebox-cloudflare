@@ -56,11 +56,15 @@ is not a verdict that the payment is invalid.
 | 400 | `ERR_INVALID_PAYMENT` | Invalid bytes, spend, output or merkle-root refusal; byte errors name offset and kind. |
 | 400 | `ERR_INSUFFICIENT_PAYMENT` | The delivery output pays less than the fee. |
 | 422 | `ERR_PAYMENT_WORK` | Local work budget exhausted; validity remains undetermined. |
-| 422 | `ERR_PAYMENT_MEMORY` | Local stack-memory budget (8,000,000 bytes per stack) reached; validity remains undetermined. |
+| 422 | `ERR_PAYMENT_MEMORY` | Local stack-memory budget (1,000,000 bytes per stack, named in `budget`) reached, or memory for a script's step declined; validity remains undetermined. |
 | 500 | `ERR_SERVER_MISCONFIGURED` | No header service is configured. |
 | 503 | `ERR_PAYMENT_UNAVAILABLE` | Header service could not answer; retry. |
 | 503 | `ERR_PAYMENT_PENDING` | Reading paused; repeat the same request to resume. |
 | 503 | `ERR_PAYMENT_CHANGED` | Object changed between verification and hand-off. |
+
+The reference message box server answers a payment it cannot verify with 503 or 500;
+this relay answers a local work or memory decline with 422, because the same payment
+would be declined again.
 
 `/sendMessage` also carries a per-identity send budget
 ([src/send_budget.rs](src/send_budget.rs)): past it the answer is 429
