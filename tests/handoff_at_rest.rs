@@ -1,12 +1,15 @@
 //! NL-4b (the no-limits program, bsv-stack-lean `docs/charters/beef-of-any-size.md`):
-//! a valid payment of any size is accepted end to end, not only at the door.
+//! the reader and the hand-off take a valid payment of any size end to end.
+//! The route's door holds a payment's bytes to
+//! `payments::payment_budget_bytes()` before either; these runs call them
+//! directly.
 //!
 //! 0.4.0's door (NL-4) gives a verdict that is free of size. What stood
 //! behind it was not: after `Verified` the relay inlined the BEEF whole into
 //! wallet-infra's JSON-RPC argument and into each paid recipient's D1 row, so
 //! a large valid payment passed the door and failed there. Here the NL-4
 //! witness's payment (100,000 unproven links under a proven parent, 6,200,112
-//! bytes) goes through the door and through the hand-off:
+//! bytes) goes through the reader and through the hand-off:
 //!
 //! - the message is stored and the recipient lists it;
 //! - the recipient's row holds the R2 key, the verdict and the subject's
@@ -658,7 +661,7 @@ async fn send_into(
             .await
         }
     }
-    .expect("the door verifies a valid payment of any size");
+    .expect("the reader verifies a valid payment of any size");
 
     // The hand-off.
     let stored_rows = Rows(&world.db);

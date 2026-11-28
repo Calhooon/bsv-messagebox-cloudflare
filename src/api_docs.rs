@@ -19,9 +19,10 @@ pub fn openapi_spec() -> Value {
 }
 
 fn info() -> Value {
+    let budget = crate::payments::payment_budget_bytes();
     json!({
         "title": "rust-message-box",
-        "description": "BSV message box service — authenticated message delivery with permissions, payments, and device registration. All authenticated endpoints use BRC-31 mutual authentication. For payloads ≤100 MB this server is byte-for-byte compatible with the TS `message-box-server` and Go `go-messagebox-server` reference implementations; above 100 MB it exposes an opt-in Rust-only R2 upload extension (see `POST /beef/upload-url`).\n\nIn addition to the HTTP routes documented here, the service exposes a WebSocket endpoint at `GET /ws` (Upgrade: websocket) that mirrors the TS `@bsv/authsocket` event surface (`joinRoom`, `leaveRoom`, `sendMessage`, etc.) on a per-identity hibernatable Cloudflare Durable Object. WebSocket APIs are out of OpenAPI 3.0 scope — OpenAPI does not model WS event channels — so they are intentionally not included in this spec. See the project README's \"WebSocket\" section for the event envelope and parity boundary; AsyncAPI would be the appropriate spec format if a machine-readable description is needed in the future.",
+        "description": format!("BSV message box service — authenticated message delivery with permissions, payments, and device registration. All authenticated endpoints use BRC-31 mutual authentication. For a payment within this host's bound this server is byte-for-byte compatible with the TS `message-box-server` and Go `go-messagebox-server` reference implementations, and it exposes an opt-in Rust-only R2 upload of a payment's BEEF (see `POST /beef/upload-url`). This host reads at most {budget} bytes of a payment, inline or uploaded (`[limits] payment_bytes`); `/sendMessage` answers a larger payment 413 `ERR_PAYMENT_SIZE`: a bound of this host, not a rule of the chain, and no verdict on the payment.\n\nIn addition to the HTTP routes documented here, the service exposes a WebSocket endpoint at `GET /ws` (Upgrade: websocket) that mirrors the TS `@bsv/authsocket` event surface (`joinRoom`, `leaveRoom`, `sendMessage`, etc.) on a per-identity hibernatable Cloudflare Durable Object. WebSocket APIs are out of OpenAPI 3.0 scope — OpenAPI does not model WS event channels — so they are intentionally not included in this spec. See the project README's \"WebSocket\" section for the event envelope and parity boundary; AsyncAPI would be the appropriate spec format if a machine-readable description is needed in the future."),
         "version": "0.1.0",
         "license": { "name": "Proprietary" }
     })
@@ -637,8 +638,8 @@ fn path_beef_download_url() -> Value {
 fn path_beef_upload_url() -> Value {
     json!({
         "post": {
-            "summary": "[RUST-ONLY EXTENSION] Presigned R2 URL for BEEFs >100 MB",
-            "description": "**Not available on TS or Go reference servers.** Cloudflare Workers cap request bodies at 100 MB; the TS and Go ports have no equivalent cap. To handle larger BEEF payloads, this Rust server exposes an opt-in extension: call `/beef/upload-url` to receive a presigned R2 PUT URL, upload the BEEF bytes directly to R2 (up to 5 TB), then POST `/sendMessage` with `payment.beefR2Key = <key>` instead of `payment.tx`. Clients that stay under 100 MB should continue to use the inline `payment.tx` flow for universal compatibility across TS, Go, and Rust servers. Since 0.4.0 no payment is refused for its size: the object is verified from R2 as a stream, and a verification one request does not finish is answered `503 ERR_PAYMENT_PENDING` (send the same `/sendMessage` again to continue).",
+            "summary": "[RUST-ONLY EXTENSION] Presigned R2 URL for a payment's BEEF",
+            "description": format!("**Not available on TS or Go reference servers.** An opt-in extension: call `/beef/upload-url` to receive a presigned R2 PUT URL, upload the payment's BEEF bytes directly to R2, then POST `/sendMessage` with `payment.beefR2Key = <key>` instead of `payment.tx`. The inline `payment.tx` flow works across TS, Go, and Rust servers. An uploaded payment is held to the same bound as an inline one: this host reads at most {budget} bytes of a payment (`[limits] payment_bytes`), and `/sendMessage` answers a larger object 413 `ERR_PAYMENT_SIZE` from its stored length, before a byte of it is read; a bound of this host, not a rule of the chain, and no verdict on the payment. Within the bound the object is verified from R2 as a stream, and a verification one request does not finish is answered `503 ERR_PAYMENT_PENDING` (send the same `/sendMessage` again to continue).", budget = crate::payments::payment_budget_bytes()),
             "operationId": "beefUploadUrl",
             "tags": ["Messages"],
             "security": [{ "BRC31Auth": [] }],
@@ -709,6 +710,31 @@ fn path_send_message() -> Value {
     })
 }
 
+/// The 413 of a route that takes a payment: the refusal of a payment over
+/// this host's bound, its body the door's own (`payments::payment_size_refusal`).
+fn payment_size_response() -> Value {
+    let budget = crate::payments::payment_budget_bytes();
+    let (payment_size, _) = crate::payments::payment_size_refusal(Some(budget + 1));
+    json!({
+        "description": format!("Not judged: the payment's bytes (its BEEF as bytes, inline in any shape of `payment.tx`, or uploaded and named by `payment.beefR2Key`) are over this host's bound of {budget} bytes (`[limits] payment_bytes`): ERR_PAYMENT_SIZE, with `budget` (the bound), `size` (the payment's bytes), `resource` `Size` and a one-sentence `description`. Measured from the encoding's length or the object's stored length, before any of the payment is parsed, verified or settled. A bound of this host, not a rule of the chain, and no verdict on the payment: pay with other coins. The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then. A send whose first message id is already stored answers 400 ERR_DUPLICATE_MESSAGE instead. Also ERR_BODY_TOO_LARGE: the request body is over the relay's bound for one request, or a payment a box keeps unjudged is over its row's bound."),
+        "content": { "application/json": {
+            "schema": {
+                "allOf": [
+                    { "$ref": "#/components/schemas/ErrorResponse" },
+                    { "type": "object", "properties": {
+                        "resource": { "type": "string", "enum": ["Size"] },
+                        "budget": { "type": "integer", "description": "This host's bound on a payment's bytes." },
+                        "size": { "type": "integer", "description": "The payment's bytes." }
+                    } }
+                ]
+            },
+            "examples": {
+                "paymentSize": { "value": payment_size }
+            }
+        }}
+    })
+}
+
 fn send_message_responses() -> Value {
     json!({
         "200": {
@@ -743,6 +769,7 @@ fn send_message_responses() -> Value {
                 }
             }}
         },
+        "413": payment_size_response(),
         "429": {
             "description": "The sender's send budget for the window is spent (ERR_SEND_BUDGET, with `windowStart`, `windowSecs`, `retryAt`); or (0.8.1, under `HUB_STORE = \"sql\"`) a recipient's mailbox holds 10,000 unacknowledged rows or 1 GiB of their text (ERR_INBOX_QUOTA_EXCEEDED, the reference's quota refusal, with `resource` (`messages` or `bytes`), `limit`, `held`, `recipient` and `freedBy`). Nothing is stored for that recipient; rows stored for the recipients before it stay, so a resend with the same message ids meets the duplicate answer for those.",
             "content": { "application/json": {
@@ -1251,6 +1278,37 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("ERR_SEND_BUDGET"));
+    }
+
+    #[test]
+    fn spec_send_message_names_the_payment_size_refusal() {
+        let spec = openapi_spec();
+        let budget = crate::payments::payment_budget_bytes();
+        let r = &spec["paths"]["/sendMessage"]["post"]["responses"]["413"];
+        let example = &r["content"]["application/json"]["examples"]["paymentSize"]["value"];
+        assert_eq!(
+            *example,
+            crate::payments::payment_size_refusal(Some(budget + 1)).0,
+            "the documented 413 is the one the door answers"
+        );
+        assert_eq!(example["code"], "ERR_PAYMENT_SIZE");
+        assert_eq!(example["budget"], budget);
+        let said = r["description"].as_str().unwrap();
+        assert!(said.contains(&format!("{budget} bytes")), "{said}");
+        assert!(said.contains("The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then."));
+        for text in [
+            spec["info"]["description"].as_str().unwrap(),
+            spec["paths"]["/beef/upload-url"]["post"]["description"]
+                .as_str()
+                .unwrap(),
+        ] {
+            assert!(
+                text.contains(&format!("at most {budget} bytes of a payment")),
+                "{text}"
+            );
+            assert!(text.contains("ERR_PAYMENT_SIZE"), "{text}");
+            assert!(!text.contains("refused for its size"), "{text}");
+        }
     }
 
     #[test]

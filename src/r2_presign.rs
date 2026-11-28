@@ -1,10 +1,11 @@
 //! AWS Signature Version 4 presigning for Cloudflare R2 PUT uploads.
 //!
-//! Workers cap request bodies at 100 MB. For larger BEEFs we hand the client
-//! a presigned URL pointing directly at R2's S3-compatible endpoint; the
-//! client PUTs there (up to 5 TB per object — R2's only ceiling) and sends
-//! the resulting key to the Worker in the `sendMessage` body. The Worker
-//! then fetches the object from R2 and internalizes the BEEF.
+//! A payment's BEEF may be uploaded instead of sent inline: we hand the
+//! client a presigned URL pointing directly at R2's S3-compatible endpoint;
+//! the client PUTs there and sends the resulting key to the Worker in the
+//! `sendMessage` body. The Worker holds the object to
+//! `payments::payment_budget_bytes()` by its stored length, then reads it
+//! from R2 and internalizes the BEEF.
 //!
 //! Reference: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
 //! R2 S3 endpoint: https://<account_id>.r2.cloudflarestorage.com
