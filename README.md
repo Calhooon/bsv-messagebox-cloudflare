@@ -74,7 +74,7 @@ of a `/sendMessage` and an upload named by `payment.beefR2Key`: `[limits] paymen
 wrangler.toml, read at build time beside `work_units` (rebuild after changing it), 614,400
 bytes (600 KiB) when the key is absent; a value that is not a whole number of bytes above
 zero stops the build. An
-ordinary payment is a few kilobytes (in 727 real payments the median was 5.4 KB and the
+ordinary payment is about a kilobyte (in 727 real payments the median was 1.2 KB and the
 largest 434 KB); a host that must read a larger payment raises the setting. The rest of the
 body keeps its own bound (12 MiB). A Worker's isolate is memory-limited, and a door bounds
 what it reads. The reference names no figure for a payment; only its whole body is bounded

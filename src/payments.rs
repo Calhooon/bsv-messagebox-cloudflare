@@ -763,8 +763,8 @@ fn beef_key_not_found(why: &str) -> RouteResult {
 
 /// The default of the most of a payment's bytes the relay reads (0.8.9):
 /// 614,400 bytes (600 KiB) of the payment itself, its BEEF as bytes, whatever
-/// encoding carried it. An ordinary payment is a few kilobytes (in 727 real
-/// payments the median was 5.4 KB and the largest 434 KB); a host that must
+/// encoding carried it. An ordinary payment is about a kilobyte (in 727 real
+/// payments the median was 1.2 KB and the largest 434 KB); a host that must
 /// read a larger payment raises `[limits] payment_bytes` in wrangler.toml.
 /// The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then.
 pub const DEFAULT_PAYMENT_BUDGET_BYTES: u64 = 614_400;
