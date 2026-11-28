@@ -1160,7 +1160,7 @@ fn the_same_frame_under_the_memory_budget_keeps_its_verdict() {
 #[test]
 fn the_memory_budget_is_set_on_every_reader_including_a_resumed_one() {
     let (beef, root) = stack_frame(PAST_THE_BUDGET);
-    assert!(2 * PAST_THE_BUDGET < 32_000_000);
+    const { assert!(2 * PAST_THE_BUDGET < 32_000_000) };
     for path in [Path::AtRest, Path::Inline] {
         let (run, pending, _) = paced(&beef, &root, path, Clock::Frozen, 0, u64::MAX, u64::MAX);
         assert!(
