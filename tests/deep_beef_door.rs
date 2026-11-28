@@ -1,13 +1,15 @@
 //! NL-4 (the no-limits program, bsv-stack-lean `docs/charters/beef-of-any-size.md`):
-//! a stranger's BEEF of any size at the message box's payment door.
+//! a stranger's BEEF of any size at the message box's payment reader.
 //!
-//! The posture: a valid BEEF is never refused for its size or its counts; a
-//! refusal is for invalid bytes only, and names them (the offset and the
-//! kind). This file is the P0-5b witness of 0.3.28 inverted. Until 0.4.0 the
+//! The reader's posture: it refuses a valid BEEF for neither its size nor its
+//! counts; a refusal is for invalid bytes only, and names them (the offset and
+//! the kind). The route's door holds a payment's bytes to
+//! `payments::payment_budget_bytes()` before the reader is reached; these runs
+//! call the reader directly. This file is the P0-5b witness of 0.3.28 inverted. Until 0.4.0 the
 //! door refused a payment above 4 MiB (413 on the route, `PaymentTooLarge`
 //! under the delivery check) and a BEEF of more than 128 transactions
 //! (`BeefTransactionsExceeded`, the P0-5d door). Here the same shapes, valid,
-//! are accepted, and the same shapes with one wrong byte are refused at that
+//! are accepted by the reader, and the same shapes with one wrong byte are refused at that
 //! byte.
 //!
 //! Every run is on a thread with a 1 MiB stack (the order of a WASM stack in
@@ -127,11 +129,11 @@ fn a_shallow_chain_is_accepted() {
     }
 }
 
-/// A valid payment one byte over the old 4 MiB door is accepted, in each of
-/// the three shapes of `tx`. (0.3.31: `PaymentTooLarge` under the delivery
+/// A valid payment one byte over the old 4 MiB door is accepted by the
+/// reader, in each of the three shapes of `tx`. (0.3.31: `PaymentTooLarge` under the delivery
 /// check, 413 `ERR_BODY_TOO_LARGE` on the route.)
 #[test]
-fn a_valid_payment_one_byte_over_the_old_door_is_accepted() {
+fn a_valid_payment_one_byte_over_the_old_door_is_accepted_by_the_reader() {
     let chain = chain_of_exactly(10, THE_OLD_DOOR + 1);
     eprintln!("deep_beef_door: 10 links, {} bytes", chain.beef.len());
     for shape in [Shape::Hex, Shape::Array, Shape::Base64] {

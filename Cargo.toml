@@ -8,7 +8,7 @@ readme = "README.md"
 keywords = ["bitcoin", "bsv", "messagebox", "cloudflare", "wasm"]
 categories = ["cryptography::cryptocurrencies"]
 edition = "2021"
-# build.rs reads `[limits] work_units` from wrangler.toml, so the template ships.
+# build.rs reads `[limits] work_units` and `payment_bytes` from wrangler.toml, so the template ships.
 # The two small JSON fixtures are read by the library's own unit tests.
 include = [
     "src/**/*.rs",

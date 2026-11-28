@@ -10,7 +10,8 @@
 //! reference's default body limit). The window is a minute. A deployment
 //! sets its own with `SEND_BUDGET_SENDS`, `SEND_BUDGET_BYTES` and
 //! `SEND_BUDGET_WINDOW_SECS`. A payment a delivery fee judges is not counted
-//! in bytes: it is paid for, and a valid BEEF is never refused for its size.
+//! in bytes: it is paid for, and its bytes are held to their own bound
+//! (`payments::payment_budget_bytes()`).
 
 use serde::Deserialize;
 use serde_json::{json, Value};

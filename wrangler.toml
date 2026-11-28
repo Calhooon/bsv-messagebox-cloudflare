@@ -93,6 +93,13 @@ command = "worker-build --release"
 cpu_ms = 43000
 # Relay build-time work budget per input. Rebuild when changing it.
 work_units = 10000000
+# The most of a payment's bytes the relay reads (0.8.9), inline or uploaded,
+# in bytes: a build-time setting beside the work budget. Default 614400
+# (600 KiB): an ordinary payment is a few kilobytes (in 727 real payments the
+# median was 5.4 KB and the largest 434 KB); a host that must read a larger
+# payment raises it. Zero, or a value that does not parse, uses the default.
+# Rebuild when changing it.
+payment_bytes = 614400
 
 [[d1_databases]]
 binding = "DB"
@@ -103,8 +110,9 @@ database_id = "<your-d1-database-id>"
 binding = "AUTH_SESSIONS"
 id = "<your-kv-namespace-id>"
 
-# R2 bucket used by /beef/upload-url + sendMessage to handle BEEFs larger
-# than the 100 MB Workers body cap. Clients upload via presigned URL (S3 v4
+# R2 bucket used by /beef/upload-url + sendMessage: a payment's BEEF may be
+# uploaded instead of sent inline, and either is held to [limits]
+# payment_bytes. Clients upload via presigned URL (S3 v4
 # signed in-WASM via r2_presign.rs), server fetches by key via this binding.
 # Since 0.4.0 a paid message's BEEF stays at rest here: the recipient's D1 row
 # carries the key and never the bytes, and a deferred delivery fee names them

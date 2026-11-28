@@ -1,7 +1,7 @@
 //! `/beef/upload-url` endpoint: hand the caller a presigned R2 PUT URL so
 //! they can upload a payment's BEEF directly to R2 and send its key. The
 //! relay does not take the upload's bytes itself; it reads an uploaded
-//! payment of at most `payments::PAYMENT_BUDGET_BYTES`, held by the object's
+//! payment of at most `payments::payment_budget_bytes()`, held by the object's
 //! stored length before a byte of it is read (step 5).
 //!
 //! The key is scoped to the caller's identity key:
@@ -19,7 +19,7 @@
 //!      deletes the object.
 //!
 //! Step 5 lives in `payments.rs` and `beef_door.rs`: an object over
-//! `payments::PAYMENT_BUDGET_BYTES` is refused 413 `ERR_PAYMENT_SIZE` from its
+//! `payments::payment_budget_bytes()` is refused 413 `ERR_PAYMENT_SIZE` from its
 //! stored length (`beef_door::verify_at_rest_within`); one within it is never
 //! held whole while it is verified, and a verification one request cannot
 //! finish saves its cursor beside the object and the same request again

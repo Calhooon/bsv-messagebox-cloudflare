@@ -1,9 +1,8 @@
 use std::{env, fs, path::PathBuf};
 
-fn main() {
-    println!("cargo:rerun-if-changed=wrangler.toml");
-    let config = fs::read_to_string("wrangler.toml").expect("read relay work budget configuration");
-    let work = config
+/// The raw text of `key` in wrangler.toml's `[limits]` table, its comment cut.
+fn limit<'a>(config: &'a str, key: &str) -> Option<&'a str> {
+    config
         .split("\n[limits]\n")
         .nth(1)
         .into_iter()
@@ -13,23 +12,32 @@ fn main() {
                 .take_while(|line| !line.trim().starts_with('['))
         })
         .find_map(|line| {
-            let (key, value) = line.split_once('=')?;
-            (key.trim() == "work_units").then(|| {
-                value
-                    .split('#')
-                    .next()
-                    .unwrap()
-                    .trim()
-                    .parse::<u64>()
-                    .expect("[limits] work_units must be a u64")
-            })
-        });
+            let (name, value) = line.split_once('=')?;
+            (name.trim() == key).then(|| value.split('#').next().unwrap().trim())
+        })
+}
+
+fn main() {
+    println!("cargo:rerun-if-changed=wrangler.toml");
+    let config = fs::read_to_string("wrangler.toml").expect("read relay work budget configuration");
+    let work = limit(&config, "work_units").map(|value| {
+        value
+            .parse::<u64>()
+            .expect("[limits] work_units must be a u64")
+    });
     let literal = work.map_or_else(|| "None".to_string(), |n| format!("Some({n})"));
+    // The payment's byte budget is passed as written: the relay reads it, and
+    // a value of zero or one that does not parse uses its default
+    // (`payments::payment_budget_from`).
+    let payment = limit(&config, "payment_bytes")
+        .map_or_else(|| "None".to_string(), |raw| format!("Some({raw:?})"));
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo build output directory"));
-    // Compile only the budget, never the rest of the deployment configuration.
+    // Compile only the budgets, never the rest of the deployment configuration.
     fs::write(
         output.join("work_limit.rs"),
-        format!("pub const WORK_UNITS: Option<u64> = {literal};\n"),
+        format!(
+            "pub const WORK_UNITS: Option<u64> = {literal};\npub const PAYMENT_BYTES: Option<&str> = {payment};\n"
+        ),
     )
     .expect("write relay work budget constant");
 }

@@ -684,6 +684,20 @@ impl<'a> Storage<'a> {
         }
     }
 
+    /// Whether a row by this message id is stored (archived rows included):
+    /// the rows `INSERT_MESSAGE_SQL` ignores as a duplicate.
+    pub async fn holds_message_id(&self, message_id: &str) -> worker::Result<bool> {
+        #[derive(Deserialize)]
+        struct Held {
+            #[allow(dead_code)]
+            held: Option<i64>,
+        }
+        let q = Query::new("SELECT 1 AS held FROM messages WHERE message_id = ? LIMIT 1")
+            .bind(message_id);
+        let found: Option<Held> = with_d1_read_retry(|| q.fetch_optional(self.db)).await?;
+        Ok(found.is_some())
+    }
+
     /// Who a stored row by this message id is from and to, and its body.
     async fn message_identity(&self, message_id: &str) -> worker::Result<Option<StoredIdentity>> {
         let q = Query::new("SELECT sender, recipient, body FROM messages WHERE message_id = ?")

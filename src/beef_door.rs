@@ -1,6 +1,6 @@
 //! The payment door's reader (0.4.0, the no-limits program): a payment's BEEF
 //! read as a stream, one element in hand, never refused for its counts. The
-//! route holds a payment's bytes to `payments::PAYMENT_BUDGET_BYTES` before
+//! route holds a payment's bytes to `payments::payment_budget_bytes()` before
 //! the reader is reached (`payments::check_payment_size` inline,
 //! `verify_at_rest_within` at rest); the reader itself names no size.
 //!
@@ -142,7 +142,8 @@ pub const DEFAULT_WORK_UNITS: u64 = 10_000_000;
 /// reader, a resumed one included.
 pub const STACK_MEMORY_BYTES: usize = 1_000_000;
 
-mod configured_limits {
+/// The relay's build-time settings in wrangler.toml's `[limits]` (`build.rs`).
+pub(crate) mod configured_limits {
     include!(concat!(env!("OUT_DIR"), "/work_limit.rs"));
 }
 
@@ -1342,7 +1343,9 @@ pub enum Within {
 /// stored length, from the stamp the reading uses, is held to `budget` before
 /// the door's saved state is loaded or a byte of the object is opened. An
 /// object over it is `Within::Over` with its length; one at or under it is
-/// read as before.
+/// read as before. With no header service named, the answer is
+/// `PaymentVerdict::NoHeaderService` before the stamp is asked, whatever the
+/// object's length, and no byte of it is read.
 pub async fn verify_at_rest_within(
     store: &dyn BeefStore,
     key: &str,

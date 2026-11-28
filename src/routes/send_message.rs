@@ -365,6 +365,10 @@ pub(crate) trait SendStore {
         r2_key: Option<&str>,
         failed: bool,
     );
+    /// Whether a stored row already holds `message_id`, as the insert of a
+    /// paid row would find it (`messages.message_id` is unique): a lookup by
+    /// the id alone.
+    async fn holds_message_id(&self, message_id: &str) -> worker::Result<bool>;
     fn now_ms(&self) -> u64;
     fn log(&self, line: String);
     /// The box switch (0.8.1, `BOXES_OFF`): a send into a box switched off is
@@ -492,6 +496,10 @@ impl SendStore for WorkerStore<'_, '_> {
         failed: bool,
     ) {
         payments::forget_unnamed(self.env, rows_naming, handed, r2_key, failed).await
+    }
+
+    async fn holds_message_id(&self, message_id: &str) -> worker::Result<bool> {
+        self.store.holds_message_id(message_id).await
     }
 
     fn now_ms(&self) -> u64 {
@@ -723,7 +731,24 @@ async fn store_rows<S: SendStore>(
                     .await
                 {
                     Ok(settled) => (settled.outputs, r2_key, Some(settled.handed)),
-                    Err((body, status)) => return SendOutcome::PaymentFailed { body, status },
+                    Err((body, status)) => {
+                        // A payment refused for its size (0.8.9) was refused
+                        // before any of it was parsed or settled. When the
+                        // send's first message id is already stored, the send
+                        // was delivered: it answers as the insert below would
+                        // answer that duplicate. No other refusal looks.
+                        if status == 413 && body["code"] == "ERR_PAYMENT_SIZE" {
+                            if let Some((recipient, message_id, _, _)) = ctx_map.first() {
+                                if let Ok(true) = store.holds_message_id(message_id).await {
+                                    return SendOutcome::DuplicateMessage {
+                                        recipient: recipient.clone(),
+                                        message_id: message_id.clone(),
+                                    };
+                                }
+                            }
+                        }
+                        return SendOutcome::PaymentFailed { body, status };
+                    }
                 }
             }
         }
@@ -1454,6 +1479,11 @@ mod decouple_r1_tests {
         full: Option<&'static str>,
         /// 0.8.1: the box `BOXES_OFF` names.
         off: Option<&'static str>,
+        /// 0.8.9: the box's delivery fee, and the door's answer to the payment.
+        fee: i32,
+        refused: Option<(Value, u16)>,
+        /// 0.8.9: the message id a stored row already holds.
+        held: Option<&'static str>,
     }
 
     impl StubStore {
@@ -1464,6 +1494,9 @@ mod decouple_r1_tests {
                 fault: None,
                 full: None,
                 off: None,
+                fee: 0,
+                refused: None,
+                held: None,
             }
         }
     }
@@ -1478,7 +1511,7 @@ mod decouple_r1_tests {
             self.log.borrow_mut().push("context".into());
             Ok(SendContext {
                 recipient_fee: 0,
-                server_fee: 0,
+                server_fee: self.fee,
                 box_id: Some(1),
             })
         }
@@ -1496,7 +1529,11 @@ mod decouple_r1_tests {
             _delivery_fee: i32,
             _sender: &str,
         ) -> Result<payments::Settled, (Value, u16)> {
-            panic!("a send that owes no fee settles nothing")
+            self.log.borrow_mut().push("settle".into());
+            match &self.refused {
+                Some(refused) => Err(refused.clone()),
+                None => panic!("a send that owes no fee settles nothing"),
+            }
         }
 
         async fn get_or_create_message_box(
@@ -1549,6 +1586,11 @@ mod decouple_r1_tests {
             _r2_key: Option<&str>,
             _failed: bool,
         ) {
+        }
+
+        async fn holds_message_id(&self, message_id: &str) -> worker::Result<bool> {
+            self.log.borrow_mut().push(format!("holds {message_id}"));
+            Ok(self.held == Some(message_id))
         }
 
         fn now_ms(&self) -> u64 {
@@ -1816,5 +1858,75 @@ mod decouple_r1_tests {
         assert_eq!(body["resource"], "messages");
         assert_eq!(body["freedBy"], "acknowledgeMessage");
         assert!(!log.borrow().iter().any(|l| l.contains("m3")));
+    }
+
+    // 0.8.9: a send whose payment the door refuses for its size, retried
+    // after it was delivered, answers what a duplicate answers; one not yet
+    // delivered is refused 413; any other refusal answers as before and asks
+    // the store nothing.
+    #[test]
+    fn a_delivered_send_retried_with_a_payment_over_the_budget_answers_duplicate() {
+        let size = payments::payment_budget_bytes() + 1;
+        let paid = |rows: &[(&str, &str)]| ValidatedSendMessage {
+            payment: Some(json!({ "tx": "00".repeat(size as usize), "outputs": [] })),
+            ..send("inbox", rows)
+        };
+        let store_with = |log: &Log, refused: (Value, u16), held: Option<&'static str>| {
+            let mut store = StubStore::new(log.clone());
+            store.fee = 10;
+            store.refused = Some(refused);
+            store.held = held;
+            store
+        };
+
+        // Delivered: the duplicate's answer, and no row is written.
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let store = store_with(&log, payments::payment_size_refusal(Some(size)), Some("m1"));
+        let sent = block_on(store_send(paid(&[("R1", "m1")]), "S", &store));
+        assert!(
+            matches!(
+                &sent.outcome,
+                SendOutcome::DuplicateMessage { recipient, message_id }
+                    if recipient == "R1" && message_id == "m1"
+            ),
+            "{:?}",
+            sent.outcome
+        );
+        let (body, status) = outcome_to_http(sent.outcome);
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("ERR_DUPLICATE_MESSAGE"))
+        );
+        assert_eq!(
+            *log.borrow(),
+            vec!["context", "charge", "settle", "holds m1"]
+        );
+
+        // Not delivered: the size refusal, unchanged.
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let store = store_with(&log, payments::payment_size_refusal(Some(size)), None);
+        let sent = block_on(store_send(paid(&[("R1", "m1")]), "S", &store));
+        assert_eq!(
+            outcome_to_http(sent.outcome),
+            payments::payment_size_refusal(Some(size))
+        );
+
+        // Only the send's first message id is looked up: a send whose first
+        // row is new stores nothing without its payment, and is refused 413.
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let store = store_with(&log, payments::payment_size_refusal(Some(size)), Some("m2"));
+        let sent = block_on(store_send(paid(&[("R1", "m1"), ("R2", "m2")]), "S", &store));
+        assert_eq!(outcome_to_http(sent.outcome).1, 413);
+
+        // Any other refusal answers as before, and the store is not asked.
+        let invalid = (
+            json!({ "status": "error", "code": "ERR_INVALID_PAYMENT", "description": "no" }),
+            400,
+        );
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let store = store_with(&log, invalid.clone(), Some("m1"));
+        let sent = block_on(store_send(paid(&[("R1", "m1")]), "S", &store));
+        assert_eq!(outcome_to_http(sent.outcome), invalid);
+        assert!(!log.borrow().iter().any(|line| line.starts_with("holds")));
     }
 }

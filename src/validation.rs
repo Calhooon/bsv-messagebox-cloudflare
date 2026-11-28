@@ -32,7 +32,7 @@ pub struct ValidatedSendMessage {
 /// estimate on the host, not measured in wasm32. Through 0.4.3 the bound was
 /// the platform's 100 MB, and a byte array of about 15 MB exhausted the
 /// isolate in parsing alone. The payment inside the body has its own bound
-/// (`payments::PAYMENT_BUDGET_BYTES`), by upload (`/beef/upload-url`) or
+/// (`payments::payment_budget_bytes()`), by upload (`/beef/upload-url`) or
 /// inline.
 pub const SEND_BODY_BYTES: usize = 12 * 1024 * 1024;
 
