@@ -6,6 +6,14 @@ tag publishes the release. Before 0.5.5 releases were cut from a private canonic
 repository with a release script that scrubbed every Cloudflare resource identifier;
 the `scrub` check (`tools/scrub.sh`) now holds that rule on every pull request.
 
+## [0.8.7] - 2026-11-28
+
+bsv-rs's floor moves from `0.8.12` to `0.8.14`. The requirement keeps its form (a caret) and its features (`auth`, `wallet`, `transaction`, `wasm`). No other requirement moves, and no line of the relay's code changes.
+
+- **What moved.** `Cargo.toml`: `bsv-rs = "0.8.14"`. `Cargo.lock` moves bsv-rs alone (0.8.14 requires no dependency differently). The version guard (`tests/middleware_version_guard.rs`) asserts the lock's one bsv-rs at `0.8.14`. The load generator's own lock (`tests/load_gen/Cargo.lock`) moves bsv-rs from `0.8.12` to `0.8.14` and nothing else; its manifest is unchanged.
+- **The advisories it closes in what the relay compiles.** bsv-rs here resolves the features `auth`, `block`, `messages`, `primitives`, `script`, `transaction`, `wallet` and `wasm`. Of the advisories 0.8.14 patches, these reach them: GHSA-56fp-4337-6vfh, GHSA-grrj-gwrr-v7r3, GHSA-63w6-rpmj-r9gg, GHSA-7vx5-cf5p-5c48, GHSA-fm3p-cmwv-rf6h, GHSA-wh67-gjx6-4qqh, GHSA-mqr8-3gvc-hhg3 and GHSA-4gp5-q4cj-4qjf (its wallet-wire and certificate fields). The rest fall in features the relay does not compile (`compat`, `overlay`, `kvstore`), as does 0.8.13's.
+- **A test moved with it.** The default script mode now accepts a signature carrying the CHRONICLE sighash bit only at a transaction version above 1, as the reference does. So `tests/hostile_wide_door.rs` writes its CHRONICLE-signed frames at version 2, a commit of its own before the lock moves. Their weights and work are unchanged. A BUMP whose offset lies outside its tree no longer parses. Every BUMP the tests and fixtures carry already lies inside its tree.
+
 ## [0.8.6] - 2026-11-17
 
 bsv-rs's floor moves from `0.8.11` to `0.8.12`, the release that closes GHSA-33fm-jcm5-4m3m. The requirement keeps its form (a caret) and its features (`auth`, `wallet`, `transaction`, `wasm`); no other requirement moves, and no line of the relay's code.
