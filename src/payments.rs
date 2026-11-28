@@ -135,20 +135,26 @@ pub async fn process_payment(
             weight: SCRIPT_WEIGHT_PER_PASS,
             work_units: crate::beef_door::work_units_per_input(),
         };
-        let judged = match r2_key {
-            Some(key) => {
-                judge_delivery_at_rest(
-                    &store,
-                    key,
-                    server_output,
-                    due,
-                    sender_key,
-                    &server_wallet,
-                    headers,
-                    &slices,
-                )
-                .await?
+        // A payment the door did not judge leaves one line for the operator.
+        let counted = |refused: RouteResult| {
+            if let Some(line) = not_judged_line(&refused.0, sender_key) {
+                worker::console_log!("{line}");
             }
+            refused
+        };
+        let judged = match r2_key {
+            Some(key) => judge_delivery_at_rest(
+                &store,
+                key,
+                server_output,
+                due,
+                sender_key,
+                &server_wallet,
+                headers,
+                &slices,
+            )
+            .await
+            .map_err(counted)?,
             // An inline payment is spooled after its output and before its
             // scripts (0.4.4, bsv-low #591 H1), so the slice and the 503
             // resume cover it as they cover an upload. Where no bucket is
@@ -183,14 +189,15 @@ pub async fn process_payment(
                         if let (Some(key), false) = (&key, is_pending(&refused)) {
                             forget_spool(env, &store, key).await;
                         }
-                        return Err(refused);
+                        return Err(counted(refused));
                     }
                 }
             }
             None => {
                 let tx = payment.get("tx").ok_or_else(missing_tx)?;
                 judge_delivery_output(tx, server_output, due, sender_key, &server_wallet, headers)
-                    .await?
+                    .await
+                    .map_err(counted)?
             }
         };
         Some((server_output, judged))
@@ -915,7 +922,10 @@ pub fn delivery_answer(verdict: PaymentVerdict) -> Result<u64, RouteResult> {
         // (`beef_door::STACK_MEMORY_BYTES`) reached, or memory for a script's
         // step declined. The same road as the work budget: a 422 naming the
         // resource, the relay's own budget (always the constant) and the bytes
-        // the input asked for.
+        // the input asked for. The payment is not judged: `txid` and `input`
+        // name the unproven transaction of the payment's BEEF whose input's
+        // script was running (bsv-rs `Verdict::SpendRefused`), and the
+        // description gives the way out.
         PaymentVerdict::Unverifiable(UnverifiableReason::SpendRefused {
             offset,
             txid,
@@ -925,7 +935,7 @@ pub fn delivery_answer(verdict: PaymentVerdict) -> Result<u64, RouteResult> {
             json!({
                 "status": "error",
                 "code": "ERR_PAYMENT_MEMORY",
-                "description": "The local evaluator declined this input at its memory budget, or declined memory for a script's step; payment validity is undetermined.",
+                "description": memory_description(&txid, input),
                 "resource": format!("{:?}", limit.resource),
                 "offset": offset,
                 "txid": txid,
@@ -944,6 +954,42 @@ pub fn delivery_answer(verdict: PaymentVerdict) -> Result<u64, RouteResult> {
             &format!("The server delivery output is invalid: {}", description),
         )),
     }
+}
+
+/// The sentence of a memory decline: the payment is not judged; the bound
+/// passed is this host's, not a rule of the chain; the unproven transaction
+/// and input whose script passed it; and the way out.
+pub fn memory_description(txid: &str, input: Option<u32>) -> String {
+    let script = match input {
+        Some(input) => format!("the script of input {input} of transaction {txid}"),
+        None => format!("a script of transaction {txid}"),
+    };
+    format!(
+        "Not judged: {script}, an unproven transaction in this payment's BEEF, passed this host's memory bound of {STACK_MEMORY_BYTES} bytes per stack. The bound is this host's, not a rule of the chain. Pay with coins whose ancestry is proven, or present this payment again once transaction {txid} has its proof."
+    )
+}
+
+/// The operator's record of a payment the door did not judge (a work or a
+/// memory decline, 422 `ERR_PAYMENT_WORK` or `ERR_PAYMENT_MEMORY`): one
+/// `AUDIT payment.not_judged` line with the code, the resource, the
+/// transaction and input whose script passed the bound, and the sender's
+/// public identity key. `None` for every other answer.
+pub fn not_judged_line(body: &Value, sender: &str) -> Option<String> {
+    let code = body["code"].as_str()?;
+    if code != "ERR_PAYMENT_MEMORY" && code != "ERR_PAYMENT_WORK" {
+        return None;
+    }
+    let word = |field: &str| match &body[field] {
+        Value::String(text) => text.clone(),
+        Value::Null => "none".to_string(),
+        other => other.to_string(),
+    };
+    Some(format!(
+        "AUDIT payment.not_judged code={code} resource={} txid={} input={} sender={sender}",
+        word("resource"),
+        word("txid"),
+        word("input"),
+    ))
 }
 
 /// The host a lookup over the binding names. A service binding ignores the
@@ -2262,8 +2308,86 @@ mod tests {
                 assert_eq!(body["input"], 0, "{body}");
                 assert_eq!(body["offset"], 77, "{body}");
                 assert_eq!(body["txid"], "ab".repeat(32), "{body}");
+                assert_eq!(
+                    body["description"],
+                    memory_description(&"ab".repeat(32), Some(0)),
+                    "{body}"
+                );
             }
         }
+    }
+
+    /// A memory decline reads "not judged": a host's bound, not a rule of the
+    /// chain, the transaction and input whose script passed it, and the way
+    /// out; no word of it reads as a verdict on the payment.
+    #[test]
+    fn a_memory_decline_reads_not_judged_and_gives_the_way_out() {
+        let txid = "cd".repeat(32);
+        let text = memory_description(&txid, Some(3));
+        assert_eq!(
+            text,
+            format!(
+                "Not judged: the script of input 3 of transaction {txid}, an unproven transaction in this payment's BEEF, passed this host's memory bound of 1000000 bytes per stack. The bound is this host's, not a rule of the chain. Pay with coins whose ancestry is proven, or present this payment again once transaction {txid} has its proof."
+            )
+        );
+        let lower = text.to_lowercase();
+        for word in ["invalid", "bad", "malformed", "rejected"] {
+            assert!(!lower.contains(word), "{word}: {text}");
+        }
+    }
+
+    /// One `AUDIT payment.not_judged` line for each memory or work decline,
+    /// with the code, the resource, the transaction and input whose script
+    /// passed the bound, and the sender's public identity key; none for any
+    /// other answer.
+    #[test]
+    fn a_decline_not_judged_leaves_one_audit_line() {
+        let sender = "02".to_string() + &"11".repeat(32);
+        let txid = "ab".repeat(32);
+        let memory = PaymentVerdict::Unverifiable(UnverifiableReason::SpendRefused {
+            offset: 77,
+            txid: txid.clone(),
+            input: Some(1),
+            why: SpendRefusal::Resource(bsv_rs::script::ScriptResourceLimit {
+                resource: ScriptResource::Stack,
+                limit: STACK_MEMORY_BYTES as u64,
+                attempted: 1_200_000,
+                work_spent: None,
+            }),
+        });
+        let (body, _) = delivery_answer(memory).expect_err("a memory decline");
+        assert_eq!(
+            not_judged_line(&body, &sender).as_deref(),
+            Some(
+                format!(
+                    "AUDIT payment.not_judged code=ERR_PAYMENT_MEMORY resource=Stack txid={txid} input=1 sender={sender}"
+                )
+                .as_str()
+            )
+        );
+        let work = PaymentVerdict::Unverifiable(UnverifiableReason::SpendRefused {
+            offset: 77,
+            txid: txid.clone(),
+            input: Some(0),
+            why: SpendRefusal::Resource(bsv_rs::script::ScriptResourceLimit {
+                resource: ScriptResource::Work,
+                limit: 10,
+                attempted: 11,
+                work_spent: Some(10),
+            }),
+        });
+        let (body, _) = delivery_answer(work).expect_err("a work decline");
+        assert_eq!(
+            not_judged_line(&body, &sender).as_deref(),
+            Some(
+                format!(
+                    "AUDIT payment.not_judged code=ERR_PAYMENT_WORK resource=Work txid={txid} input=0 sender={sender}"
+                )
+                .as_str()
+            )
+        );
+        let (body, _) = invalid("Payment must contain a valid Atomic BEEF.");
+        assert_eq!(not_judged_line(&body, &sender), None);
     }
 
     #[test]

@@ -49,22 +49,24 @@ objects.
 The paid door checks the fee and verifies BEEF ancestry and unproven spends.
 It reads BEEF as a stream, including R2 objects, with a saved cursor when a
 request pauses between elements or inputs. A local script-work or stack-memory decline
-is not a verdict that the payment is invalid.
+is no verdict on the payment: the payment is not judged.
 
 | HTTP | Word | Meaning |
 |---|---|---|
 | 400 | `ERR_INVALID_PAYMENT` | Invalid bytes, spend, output or merkle-root refusal; byte errors name offset and kind. |
 | 400 | `ERR_INSUFFICIENT_PAYMENT` | The delivery output pays less than the fee. |
 | 422 | `ERR_PAYMENT_WORK` | Local work budget exhausted; validity remains undetermined. |
-| 422 | `ERR_PAYMENT_MEMORY` | Local stack-memory budget (1,000,000 bytes per stack, named in `budget`) reached, or memory for a script's step declined; validity remains undetermined. |
+| 422 | `ERR_PAYMENT_MEMORY` | Not judged: a script of an unproven transaction in the payment's BEEF passed this host's stack-memory bound (1,000,000 bytes per stack, named in `budget`), a bound of this host and not a rule of the chain, or was declined memory for a step. `txid` and `input` name that transaction and input. The way out: pay with coins whose ancestry is proven, or present the payment again once that transaction has its proof. Each decline is logged for the operator (`AUDIT payment.not_judged`). |
 | 500 | `ERR_SERVER_MISCONFIGURED` | No header service is configured. |
 | 503 | `ERR_PAYMENT_UNAVAILABLE` | Header service could not answer; retry. |
 | 503 | `ERR_PAYMENT_PENDING` | Reading paused; repeat the same request to resume. |
 | 503 | `ERR_PAYMENT_CHANGED` | Object changed between verification and hand-off. |
 
 The reference message box server answers a payment it cannot verify with 503 or 500;
-this relay answers a local work or memory decline with 422, because the same payment
-would be declined again.
+this relay answers a local work or memory decline with 422, because the same bytes
+would be declined again. A memory decline's way out is coins whose ancestry is proven, or
+the payment presented again once the transaction it names has its proof: a decline keeps
+nothing of the payment, so the next presentation is read afresh.
 
 `/sendMessage` also carries a per-identity send budget
 ([src/send_budget.rs](src/send_budget.rs)): past it the answer is 429
