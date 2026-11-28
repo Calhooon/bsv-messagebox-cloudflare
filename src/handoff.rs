@@ -280,8 +280,9 @@ pub struct Paid<'a> {
     /// The server's delivery output, when the box owes a delivery fee.
     pub server_output: Option<&'a Value>,
     /// The stamp of the object the door read at `r2_key` or `spooled`, when
-    /// it read one (0.4.4, bsv-low #591 L1). The hand-off records nothing of
-    /// bytes that are no longer these.
+    /// it read one (0.4.4, bsv-low #591 L1), or measured at `r2_key` when it
+    /// judged nothing (`payments::check_unjudged_at_rest`). The hand-off
+    /// records nothing of bytes that are no longer these.
     pub stamp: Option<&'a Stamp>,
     /// The subject's txid, when the door judged the payment (a box with no
     /// delivery fee judges nothing).

@@ -1,6 +1,8 @@
 //! The payment door's reader (0.4.0, the no-limits program): a payment's BEEF
-//! read as a stream, one element in hand, never refused for its size or its
-//! counts.
+//! read as a stream, one element in hand, never refused for its counts. The
+//! route holds a payment's bytes to `payments::PAYMENT_BUDGET_BYTES` before
+//! the reader is reached (`payments::check_payment_size` inline,
+//! `verify_at_rest_within` at rest); the reader itself names no size.
 //!
 //! The reader is bsv-rs 0.4.5's `StreamVerifier`
 //! (`src/transaction/beef_stream.rs:2770-2950`): one step per element, a
@@ -1324,6 +1326,48 @@ pub async fn verify_at_rest_stamped(
     door_at_rest(store, key, terms, headers, slices, stamp)
         .await
         .map(|answer| (answer, Some(read)))
+}
+
+/// What the door made of an object at rest under a budget of bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Within {
+    /// The object's stored length is over the budget: answered from its
+    /// stamp alone, with no state loaded and no byte of it opened.
+    Over(u64),
+    /// The object was read, as `verify_at_rest_stamped` reads it.
+    Read(AtRest, Option<Stamp>),
+}
+
+/// `verify_at_rest_stamped` under a budget of bytes (0.8.9): the object's
+/// stored length, from the stamp the reading uses, is held to `budget` before
+/// the door's saved state is loaded or a byte of the object is opened. An
+/// object over it is `Within::Over` with its length; one at or under it is
+/// read as before.
+pub async fn verify_at_rest_within(
+    store: &dyn BeefStore,
+    key: &str,
+    terms: &Terms<'_>,
+    header_service: Option<&dyn HeaderService>,
+    slices: &Slices<'_>,
+    budget: u64,
+) -> Result<Within, DoorError> {
+    let Some(headers) = header_service else {
+        return Ok(Within::Read(
+            AtRest::Done(PaymentVerdict::NoHeaderService.into()),
+            None,
+        ));
+    };
+    let source = DoorError::Source;
+    let Some(stamp) = store.stamp(key).await.map_err(source)? else {
+        return Ok(Within::Read(AtRest::NotFound, None));
+    };
+    if stamp.size > budget {
+        return Ok(Within::Over(stamp.size));
+    }
+    let read = stamp.clone();
+    door_at_rest(store, key, terms, headers, slices, stamp)
+        .await
+        .map(|answer| Within::Read(answer, Some(read)))
 }
 
 async fn door_at_rest(
