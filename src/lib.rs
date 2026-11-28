@@ -245,7 +245,13 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
             return Response::error("unauthorized", 401);
         }
         let mut req = req;
-        let raw = req.bytes().await?;
+        // The bearer is checked above; the body is read within `/push`'s
+        // figure (`body_bounds::PUSH_BODY_BYTES`).
+        let raw =
+            match read_bearer_body(&mut req, "/push", crate::body_bounds::PUSH_BODY_BYTES).await {
+                Ok(raw) => raw,
+                Err(refusal) => return Ok(refusal),
+            };
         let (sender, send_body) = match split_push_body(&raw, Date::now().as_millis()) {
             Ok(x) => x,
             Err(reason) => return Response::error(reason, 400),
@@ -288,7 +294,19 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
             return Response::error("unauthorized", 401);
         }
         let mut req = req;
-        let body: serde_json::Value = match req.json().await {
+        // The bearer is checked above; the body is read within the attest
+        // figure (`body_bounds::ATTEST_BODY_BYTES`).
+        let raw = match read_bearer_body(
+            &mut req,
+            "/session/attest",
+            crate::body_bounds::ATTEST_BODY_BYTES,
+        )
+        .await
+        {
+            Ok(raw) => raw,
+            Err(refusal) => return Ok(refusal),
+        };
+        let body: serde_json::Value = match serde_json::from_slice(&raw) {
             Ok(v) => v,
             Err(e) => return Response::error(format!("invalid attest body: {e}"), 400),
         };
@@ -372,7 +390,19 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
             body: serde_json::Value,
         }
         let mut req = req;
-        let b: BroadcastBody = match req.json().await {
+        // The bearer is checked above; the body is read within the broadcast
+        // figure (`body_bounds::BROADCAST_BODY_BYTES`).
+        let raw = match read_bearer_body(
+            &mut req,
+            "/broadcast",
+            crate::body_bounds::BROADCAST_BODY_BYTES,
+        )
+        .await
+        {
+            Ok(raw) => raw,
+            Err(refusal) => return Ok(refusal),
+        };
+        let b: BroadcastBody = match serde_json::from_slice(&raw) {
             Ok(b) => b,
             Err(e) => return Response::error(format!("bad body: {e}"), 400),
         };
@@ -904,6 +934,68 @@ fn session_lane_body_refusal(refusal: &bsv_middleware_cloudflare::BodyRefusal) -
         Err(_) => Response::error("request body refused", status)
             .unwrap_or_else(|_| Response::empty().expect("an empty response builds")),
     }
+}
+
+/// A bearer-gated route's body, read after its bearer is checked, within
+/// `budget` (`body_bounds::read_bearer_route_body`); the route's refusal
+/// (`body_bounds::bearer_refusal_answer`) where it was not read in full, and
+/// 400 for a body that could not be read.
+async fn read_bearer_body(
+    req: &mut Request,
+    route: &str,
+    budget: u64,
+) -> std::result::Result<Vec<u8>, Response> {
+    let content_length = req.headers().get("content-length").ok().flatten();
+    let read = crate::body_bounds::read_bearer_route_body(
+        content_length.as_deref(),
+        budget,
+        || match req.stream() {
+            Ok(stream) => Ok(Some(stream)),
+            Err(e @ Error::BodyUsed) => Err(e.to_string()),
+            // A request with no body reads as an empty body.
+            Err(_) => Ok(None),
+        },
+        Delay::from(bsv_middleware_cloudflare::DEFAULT_BODY_DEADLINE),
+        || Date::now().as_millis(),
+    )
+    .await;
+    let fallback = |status: u16| {
+        Response::error("request body refused", status)
+            .unwrap_or_else(|_| Response::empty().expect("an empty response builds"))
+    };
+    match read {
+        Ok(Ok(raw)) => Ok(raw),
+        Ok(Err(refusal)) => {
+            console_log!("{route} body refused {}", refusal.log_line());
+            let (body, status, retry_after) =
+                crate::body_bounds::bearer_refusal_answer(route, &refusal);
+            Err(match Response::from_json(&body) {
+                Ok(r) => {
+                    let r = r.with_status(status);
+                    if let Some(seconds) = retry_after {
+                        let _ = r.headers().set("Retry-After", &seconds.to_string());
+                    }
+                    r
+                }
+                Err(_) => fallback(status),
+            })
+        }
+        Err(e) => {
+            Err(Response::error(format!("bad body: {e}"), 400).unwrap_or_else(|_| fallback(400)))
+        }
+    }
+}
+
+/// The polling POST's refusal of a body it did not read in full, in the
+/// transport's plain text (`body_bounds::polling_refusal_answer`): 413, 503
+/// with `Retry-After`, or 408.
+fn polling_body_refusal(refusal: &bsv_middleware_cloudflare::BodyRefusal) -> Result<Response> {
+    let (text, status, retry_after) = crate::body_bounds::polling_refusal_answer(refusal);
+    let r = engineio::public_polling_text_response(&text, status)?;
+    if let Some(seconds) = retry_after {
+        r.headers().set("Retry-After", &seconds.to_string())?;
+    }
+    Ok(r)
 }
 
 /// The lane's refusal body: `{status, code, reason}` with CORS, so a browser
@@ -1697,7 +1789,39 @@ async fn route_socketio_request(mut req: Request, env: &Env, ctx: &Context) -> R
     if transport == "polling" {
         match req.method() {
             Method::Post => {
-                let body = req.text().await.unwrap_or_default();
+                // The batch is read within `body_bounds::POLLING_POST_BODY_BYTES`
+                // (the handshake's `maxPayload`), counted in the relay's total
+                // before a caller is known, within the default deadline.
+                let content_length = req.headers().get("content-length").ok().flatten();
+                let read = crate::body_bounds::read_polling_post_body(
+                    content_length.as_deref(),
+                    || match req.stream() {
+                        Ok(stream) => Ok(Some(stream)),
+                        Err(e @ Error::BodyUsed) => Err(e.to_string()),
+                        // A request with no body reads as an empty batch.
+                        Err(_) => Ok(None),
+                    },
+                    Delay::from(bsv_middleware_cloudflare::DEFAULT_BODY_DEADLINE),
+                    || Date::now().as_millis(),
+                )
+                .await;
+                let body = match read {
+                    Ok(Ok(raw)) => String::from_utf8_lossy(&raw).into_owned(),
+                    Ok(Err(refusal)) => {
+                        let elapsed = Date::now().as_millis().saturating_sub(received_at_ms);
+                        let (_, line) = socketio_worker::entry_line(
+                            "refused",
+                            "polling",
+                            sid,
+                            refusal.code(),
+                            elapsed,
+                        );
+                        console_warn!("{line}");
+                        return polling_body_refusal(&refusal);
+                    }
+                    // A body that could not be read reads as an empty batch.
+                    Err(_) => String::new(),
+                };
                 return socketio_worker::handle_polling_post(&body, env, sid, received_at_ms).await;
             }
             Method::Get => {
@@ -2382,6 +2506,77 @@ mod push_route_tests {
         );
         assert_eq!(code.matches("relay_auth(req,env,auth_options)").count(), 1);
         assert!(code.contains("body_bounds::layer_refusal_answer(413,&layer)"));
+    }
+
+    /// `/push`, `/session/attest` and `/broadcast` check the bearer before
+    /// they read the body, and read it only through the bounded reader within
+    /// the route's own figure.
+    #[test]
+    fn the_bearer_routes_check_the_bearer_before_the_body_within_their_figures() {
+        let src = strip_ws(include_str!("lib.rs"));
+        let code = &src[..src.find("#[cfg(test)]").expect("the tests")];
+        for (route, next, figure) in [
+            (
+                "req.path()==\"/push\"",
+                "req.path()==\"/session/attest\"",
+                "crate::body_bounds::PUSH_BODY_BYTES",
+            ),
+            (
+                "req.path()==\"/session/attest\"",
+                "req.path()==\"/broadcast\"",
+                "crate::body_bounds::ATTEST_BODY_BYTES",
+            ),
+            (
+                "req.path()==\"/broadcast\"",
+                "req.path()==\"/ws\"",
+                "crate::body_bounds::BROADCAST_BODY_BYTES",
+            ),
+        ] {
+            let start = code.find(route).expect(route);
+            let end = code[start..].find(next).expect(next) + start;
+            let seg = &code[start..end];
+            let bearer = seg
+                .find("if!crate::session_lane::bearer_matches(&got,&expected){returnResponse::error(\"unauthorized\",401);}")
+                .expect("the bearer check");
+            let read = seg.find("read_bearer_body(&mutreq,").expect("the read");
+            assert!(bearer < read, "{route}: the bearer before the body");
+            assert!(seg[read..].contains(figure), "{route}: {figure}");
+            for unbounded in ["req.json()", "req.bytes()", "req.text()"] {
+                assert!(!seg.contains(unbounded), "{route}: {unbounded}");
+            }
+        }
+        assert!(code.contains("crate::body_bounds::read_bearer_route_body("));
+    }
+
+    /// The polling POST reads its batch through its bounded reader and
+    /// answers a refusal in the transport's plain text; nothing in the
+    /// Worker's routes reads a request's body whole.
+    #[test]
+    fn the_polling_post_reads_its_batch_under_its_figures() {
+        let src = strip_ws(include_str!("lib.rs"));
+        let code = &src[..src.find("#[cfg(test)]").expect("the tests")];
+        let start = code
+            .find("asyncfnroute_socketio_request(")
+            .expect("the route");
+        let end = code[start..]
+            .find("pub(crate)constLOBBY_BROADCAST_BOX")
+            .expect("its end")
+            + start;
+        let route = &code[start..end];
+        let read = route
+            .find("crate::body_bounds::read_polling_post_body(")
+            .expect("the bounded read");
+        let handled = route
+            .find("socketio_worker::handle_polling_post(&body,")
+            .expect("the batch handled");
+        assert!(
+            read < handled,
+            "read under its figures before it is handled"
+        );
+        assert!(route.contains("returnpolling_body_refusal(&refusal);"));
+        for unbounded in ["req.json()", "req.bytes()", "req.text()"] {
+            assert_eq!(code.matches(unbounded).count(), 0, "{unbounded}");
+        }
     }
 
     /// The lane reads the body through its bounded reader, never whole.

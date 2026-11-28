@@ -55,6 +55,24 @@ pub fn body_too_large(size: Option<u64>) -> ValErr {
     err(413, "ERR_BODY_TOO_LARGE", &description)
 }
 
+/// A bearer-gated route's answer to a body over its figure: 413
+/// `ERR_BODY_TOO_LARGE`, `{status, code, description}` as [`body_too_large`],
+/// the description naming the route (`/push`, `/session/attest`,
+/// `/broadcast`) and its figure `budget`. `size` is the declared length where
+/// one was declared; where the read stopped at the figure the description
+/// says "more than" it.
+pub fn request_body_too_large(route: &str, size: Option<u64>, budget: u64) -> ValErr {
+    let description = match size {
+        Some(size) => format!(
+            "The {route} body is {size} bytes and the relay reads at most {budget} of it in one request."
+        ),
+        None => format!(
+            "The {route} body is more than {budget} bytes and the relay reads at most {budget} of it in one request."
+        ),
+    };
+    err(413, "ERR_BODY_TOO_LARGE", &description)
+}
+
 /// The `/sendMessage` body as a `Value`, read so that no `payment.tx` is
 /// ever a `Value` a byte (0.4.4, bsv-low #591 NOTE-4): the body is held to
 /// `SEND_BODY_BYTES` before a byte of it is parsed (413

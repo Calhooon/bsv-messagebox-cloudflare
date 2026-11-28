@@ -93,7 +93,10 @@ const PING_TIMEOUT_MS: u64 = 20_000;
 // deadline — both hold by construction, pinned at compile time.
 const _: () = assert!(PING_INTERVAL_MS > PING_TIMEOUT_MS); // the cadence judges an unanswered ping at the next tick
 const _: () = assert!(PING_INTERVAL_MS < PING_INTERVAL_MS + PING_TIMEOUT_MS); // the tick lands before the client's silence deadline
-const MAX_PAYLOAD: u64 = 1_000_000;
+/// The `maxPayload` the Engine.IO handshake names to the client: the most
+/// bytes of one polling POST the relay reads
+/// (`body_bounds::POLLING_POST_BODY_BYTES`).
+pub(crate) const MAX_PAYLOAD: u64 = 1_000_000;
 
 /// Active transport for this session.
 ///

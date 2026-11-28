@@ -1,36 +1,55 @@
-//! The relay's bounds on a request's body before its caller is authenticated.
+//! The relay's bounds on every request body it reads.
 //!
-//! Two doors read a body before the caller is known: the BRC-31 layer
+//! Three doors read a body before the caller is known: the BRC-31 layer
 //! (bsv-middleware-cloudflare's `process_auth_do_with_body_bounds`, which
-//! signs over the body, so it reads it first) and the relay's own HTTP session
+//! signs over the body, so it reads it first), the relay's own HTTP session
 //! lane (`session_lane_auth` in `lib.rs`, which hashes the body for the hub's
-//! MAC check). Both read at most the relay's figure for one send,
+//! MAC check) and the Socket.IO polling POST (`route_socketio_request` in
+//! `lib.rs`, the Engine.IO packets of a session). The BRC-31 layer and the
+//! session lane read at most the relay's figure for one send,
 //! [`validation::SEND_BODY_BYTES`], and answer a larger body with the relay's
-//! own 413 `ERR_BODY_TOO_LARGE` ([`validation::body_too_large`]).
+//! own 413 `ERR_BODY_TOO_LARGE` ([`validation::body_too_large`]). The polling
+//! POST reads at most [`POLLING_POST_BODY_BYTES`], the `maxPayload` the relay
+//! names to the client in its Engine.IO handshake, and answers in the
+//! transport's own plain text.
+//!
+//! The three bearer-gated routes (`/push`, `/session/attest`, `/broadcast`)
+//! check the bearer first and then read the body within a figure fit for the
+//! route's own message ([`PUSH_BODY_BYTES`], [`ATTEST_BODY_BYTES`],
+//! [`BROADCAST_BODY_BYTES`]), answering a larger one 413
+//! `ERR_BODY_TOO_LARGE` in the relay's error shape
+//! ([`validation::request_body_too_large`]).
 //!
 //! The figures are this host's. One constant, `SEND_BODY_BYTES`, sets the
-//! bound on one request at both doors and at the relay's own check after the
-//! read (`validation::read_send_body`), so the three cannot disagree.
+//! bound on one send at the BRC-31 door, the session lane, `/push` and the
+//! relay's own check after the read (`validation::read_send_body`), so they
+//! cannot disagree.
 //!
 //! The totals. A Worker's isolate is memory-limited and serves several
 //! requests at once, so each door also keeps a count of the body bytes it is
-//! holding for callers not yet authenticated, and answers a chunk that would
-//! pass its total 503 `ERR_AUTH_BODIES_FULL` with `Retry-After`. Once a door
-//! hands a body to the route, the relay holds up to three copies of a send's
-//! size while it reads it (the body, the text it parses and a payment's hex
-//! beside it: `validation::SEND_BODY_BYTES`'s own estimate), 3 x 12 MiB =
-//! 36 MiB for one send at the bound. Beside that one send:
+//! holding while it reads them, and answers a chunk that would pass its total
+//! 503 `ERR_AUTH_BODIES_FULL` with `Retry-After`. Once a door hands a body to
+//! the route, the relay holds up to three copies of a send's size while it
+//! reads it (the body, the text it parses and a payment's hex beside it:
+//! `validation::SEND_BODY_BYTES`'s own estimate), 3 x 12 MiB = 36 MiB for one
+//! send at the bound. Beside that one send:
 //!
 //! - the BRC-31 layer's total, [`AUTH_HELD_BODY_BYTES`] = 2 x 12 MiB = 24 MiB
 //!   (two sends at the bound being read at once);
-//! - the session lane's total, [`SESSION_LANE_HELD_BODY_BYTES`] = 12 MiB (one
-//!   send at the bound being read at once).
+//! - the relay's own total before a caller is known,
+//!   [`PRE_AUTH_HELD_BODY_BYTES`] = 12 MiB, ONE count ([`PRE_AUTH_BODIES`])
+//!   shared by the session lane and the polling POST (one send at the bound,
+//!   or twelve polling POSTs at theirs, being read at once);
+//! - the bearer-gated routes' total, [`BEARER_HELD_BODY_BYTES`] = 12 MiB (one
+//!   `/push` at the bound being read at once), its own count
+//!   ([`BEARER_BODIES`]) so no unauthenticated body takes a first-party
+//!   producer's room.
 //!
-//! 36 + 24 + 12 = 72 MiB of request bodies at most, of a Workers isolate's
-//! 128 MiB; the rest is the Worker's own state and the reading's.
+//! 36 + 24 + 12 + 12 = 84 MiB of request bodies at most, of a Workers
+//! isolate's 128 MiB; the rest is the Worker's own state and the reading's.
 //!
 //! The deadline: a body's whole read has the layer's default,
-//! `DEFAULT_BODY_DEADLINE` (30 seconds), at both doors, and is answered 408
+//! `DEFAULT_BODY_DEADLINE` (30 seconds), at every door, and is answered 408
 //! `ERR_AUTH_BODY_TIMEOUT` past it. No timeout of the relay's own runs during
 //! a body's read (its hub ask, `hub_forward::FORWARD_OP_TIMEOUT_MS`, starts
 //! after the body is read), so none is shorter.
@@ -63,15 +82,67 @@ pub const AUTH_HELD_BODY_BYTES: u64 = 2 * AUTH_BODY_BYTES;
 /// `SEND_BODY_BYTES` (12 MiB).
 pub const SESSION_LANE_BODY_BYTES: u64 = SEND_BODY_BYTES as u64;
 
-/// The most request-body bytes the HTTP session lane holds at once in one
-/// isolate: one send at the bound, 12 MiB. The lane keeps its own count
-/// ([`SESSION_LANE_BODIES`]): the BRC-31 layer's count is the adapter's own
-/// and is not one of its public items.
-pub const SESSION_LANE_HELD_BODY_BYTES: u64 = SESSION_LANE_BODY_BYTES;
+/// The most bytes of one Socket.IO polling POST's body the relay reads:
+/// 1,000,000, the `maxPayload` the relay's Engine.IO handshake names to the
+/// client (`engineio::session::MAX_PAYLOAD`). A polling POST carries a batch
+/// of Engine.IO packets (`authMessage` rounds, Socket.IO events, pings and
+/// closes), and a Socket.IO client keeps a batch within the `maxPayload` it
+/// was told. It is under `SEND_BODY_BYTES`.
+pub const POLLING_POST_BODY_BYTES: u64 = crate::engineio::session::MAX_PAYLOAD;
 
-/// The session lane's count of the body bytes it holds at this moment, one
-/// per isolate.
-pub static SESSION_LANE_BODIES: BodyLedger = BodyLedger::new();
+/// The most request-body bytes the relay itself holds at once in one isolate
+/// before a caller is known: one send at the bound, 12 MiB, ONE total for the
+/// session lane and the polling POST, counted in [`PRE_AUTH_BODIES`]. The
+/// BRC-31 layer's count is the adapter's own and is not one of its public
+/// items, so it keeps its own total ([`AUTH_HELD_BODY_BYTES`]).
+pub const PRE_AUTH_HELD_BODY_BYTES: u64 = SESSION_LANE_BODY_BYTES;
+
+/// The count of the body bytes the session lane and the polling POST hold at
+/// this moment, one per isolate.
+pub static PRE_AUTH_BODIES: BodyLedger = BodyLedger::new();
+
+/// The most bytes of a `POST /push` body the relay reads: `SEND_BODY_BYTES`
+/// (12 MiB). The body is a `/sendMessage` body (flat or wrapped in
+/// `message`) and the producer's `sender`, so its figure is the send's.
+pub const PUSH_BODY_BYTES: u64 = SEND_BODY_BYTES as u64;
+
+/// The most bytes of a `POST /session/attest` body the relay reads: 16 KiB.
+/// The body is the hub's verify body (`session_attest_body_ok`): `id` (64
+/// hex), `identity` (66 hex), `h` (a u64), `method` (at most 8),
+/// `path` (at most 2,048), `bodySha256` and `mac` (at most 64 each), under
+/// 2.5 KB as plain JSON and under 13 KB with every `path` character written
+/// as a six-byte JSON escape.
+pub const ATTEST_BODY_BYTES: u64 = 16 * 1024;
+
+/// The most bytes of a `POST /broadcast` body the relay reads: 256 KiB. The
+/// body is `{box, body}`; the event `body` is written into one hub push per
+/// subscriber with up to `BROADCAST_FANOUT_CONCURRENCY` (32) pushes in flight,
+/// so its figure is kept to a carrier event's: 32 x 256 KiB = 8 MiB of
+/// pushes in flight at the bound.
+pub const BROADCAST_BODY_BYTES: u64 = 256 * 1024;
+
+/// The most request-body bytes the bearer-gated routes hold at once in one
+/// isolate: one `/push` at the bound, 12 MiB, counted in [`BEARER_BODIES`].
+pub const BEARER_HELD_BODY_BYTES: u64 = PUSH_BODY_BYTES;
+
+/// The count of the body bytes the bearer-gated routes hold at this moment,
+/// one per isolate.
+pub static BEARER_BODIES: BodyLedger = BodyLedger::new();
+
+const _: () = assert!(POLLING_POST_BODY_BYTES <= SEND_BODY_BYTES as u64);
+const _: () = assert!(PRE_AUTH_HELD_BODY_BYTES >= SESSION_LANE_BODY_BYTES);
+const _: () = assert!(PRE_AUTH_HELD_BODY_BYTES >= POLLING_POST_BODY_BYTES);
+const _: () = assert!(BEARER_HELD_BODY_BYTES >= PUSH_BODY_BYTES);
+const _: () = assert!(BEARER_HELD_BODY_BYTES >= ATTEST_BODY_BYTES);
+const _: () = assert!(BEARER_HELD_BODY_BYTES >= BROADCAST_BODY_BYTES);
+// Every total and one send's three copies together, under a 128 MiB isolate.
+const _: () = assert!(
+    AUTH_HELD_BODY_BYTES
+        + PRE_AUTH_HELD_BODY_BYTES
+        + BEARER_HELD_BODY_BYTES
+        + 3 * SEND_BODY_BYTES as u64
+        <= 84 * 1024 * 1024
+);
 
 /// The figures every call of the BRC-31 layer names: [`AUTH_BODY_BYTES`],
 /// [`AUTH_HELD_BODY_BYTES`] and the default deadline.
@@ -111,8 +182,8 @@ pub fn lane_refusal_answer(refusal: &BodyRefusal) -> (Value, u16, Option<u64>) {
 }
 
 /// The session lane's read of a request's body, under its figures
-/// ([`SESSION_LANE_BODY_BYTES`], [`SESSION_LANE_HELD_BODY_BYTES`] and the
-/// default deadline, counted in [`SESSION_LANE_BODIES`]).
+/// ([`SESSION_LANE_BODY_BYTES`], [`PRE_AUTH_HELD_BODY_BYTES`] and the
+/// default deadline, counted in [`PRE_AUTH_BODIES`]).
 pub async fn read_session_lane_body<S, E, F, D, C>(
     content_length: Option<&str>,
     open: F,
@@ -127,16 +198,107 @@ where
     C: Fn() -> u64,
 {
     read_bounded_body(
-        &SESSION_LANE_BODIES,
+        &PRE_AUTH_BODIES,
         content_length,
         SESSION_LANE_BODY_BYTES,
-        SESSION_LANE_HELD_BODY_BYTES,
-        u64::try_from(DEFAULT_BODY_DEADLINE.as_millis()).unwrap_or(u64::MAX),
+        PRE_AUTH_HELD_BODY_BYTES,
+        default_deadline_ms(),
         open,
         deadline,
         now_ms,
     )
     .await
+}
+
+/// The polling POST's read of a request's body, under its figures
+/// ([`POLLING_POST_BODY_BYTES`], [`PRE_AUTH_HELD_BODY_BYTES`] and the
+/// default deadline, counted in [`PRE_AUTH_BODIES`] with the session lane's).
+pub async fn read_polling_post_body<S, E, F, D, C>(
+    content_length: Option<&str>,
+    open: F,
+    deadline: D,
+    now_ms: C,
+) -> Result<Result<Vec<u8>, BodyRefusal>, String>
+where
+    F: FnOnce() -> Result<Option<S>, String>,
+    S: Stream<Item = Result<Vec<u8>, E>>,
+    E: std::fmt::Display,
+    D: Future<Output = ()>,
+    C: Fn() -> u64,
+{
+    read_bounded_body(
+        &PRE_AUTH_BODIES,
+        content_length,
+        POLLING_POST_BODY_BYTES,
+        PRE_AUTH_HELD_BODY_BYTES,
+        default_deadline_ms(),
+        open,
+        deadline,
+        now_ms,
+    )
+    .await
+}
+
+/// A bearer-gated route's read of its body, after the bearer is checked:
+/// at most `budget` bytes (the route's figure), counted in [`BEARER_BODIES`]
+/// under [`BEARER_HELD_BODY_BYTES`], within the default deadline.
+pub async fn read_bearer_route_body<S, E, F, D, C>(
+    content_length: Option<&str>,
+    budget: u64,
+    open: F,
+    deadline: D,
+    now_ms: C,
+) -> Result<Result<Vec<u8>, BodyRefusal>, String>
+where
+    F: FnOnce() -> Result<Option<S>, String>,
+    S: Stream<Item = Result<Vec<u8>, E>>,
+    E: std::fmt::Display,
+    D: Future<Output = ()>,
+    C: Fn() -> u64,
+{
+    read_bounded_body(
+        &BEARER_BODIES,
+        content_length,
+        budget,
+        BEARER_HELD_BODY_BYTES,
+        default_deadline_ms(),
+        open,
+        deadline,
+        now_ms,
+    )
+    .await
+}
+
+fn default_deadline_ms() -> u64 {
+    u64::try_from(DEFAULT_BODY_DEADLINE.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The polling POST's answer to a body it did not read (or stopped reading),
+/// in the transport's own family (plain text, as its 400 for a batch it
+/// cannot decode): the text, the status and the `Retry-After` seconds. 413
+/// over [`POLLING_POST_BODY_BYTES`], 503 with `Retry-After` past the total,
+/// 408 past the deadline.
+pub fn polling_refusal_answer(refusal: &BodyRefusal) -> (String, u16, Option<u64>) {
+    (
+        refusal.to_string(),
+        refusal.status(),
+        refusal.retry_after_seconds(),
+    )
+}
+
+/// A bearer-gated route's answer to a body it did not read (or stopped
+/// reading): over the route's figure, 413 `ERR_BODY_TOO_LARGE` in the
+/// relay's error shape naming the route and its figure; past the total or
+/// the deadline, the same 503 `ERR_AUTH_BODIES_FULL` (with `Retry-After`)
+/// and 408 `ERR_AUTH_BODY_TIMEOUT` the session lane answers.
+pub fn bearer_refusal_answer(route: &str, refusal: &BodyRefusal) -> (Value, u16, Option<u64>) {
+    match refusal {
+        BodyRefusal::TooLarge { size, budget } => {
+            let (body, status) = validation::request_body_too_large(route, *size, *budget);
+            (body, status, None)
+        }
+        other => (other.to_json(), other.status(), other.retry_after_seconds()),
+    }
 }
 
 /// A request's body read under a bound, a total and a deadline, in the
@@ -254,8 +416,7 @@ mod tests {
     #[test]
     fn the_lanes_figure_is_the_relays_send_bound() {
         assert_eq!(SESSION_LANE_BODY_BYTES, SEND_BODY_BYTES as u64);
-        assert_eq!(SESSION_LANE_HELD_BODY_BYTES, 12 * 1024 * 1024);
-        const { assert!(SESSION_LANE_HELD_BODY_BYTES >= SESSION_LANE_BODY_BYTES) };
+        assert_eq!(PRE_AUTH_HELD_BODY_BYTES, 12 * 1024 * 1024);
     }
 
     /// The layer's 413 for a declared length over the bound is answered with
@@ -340,7 +501,7 @@ mod tests {
         });
         let full = BodyRefusal::BodiesFull {
             held: 5,
-            total: SESSION_LANE_HELD_BODY_BYTES,
+            total: PRE_AUTH_HELD_BODY_BYTES,
         };
         assert_eq!(lane_refusal_answer(&full), (full.to_json(), 503, Some(2)));
         assert_eq!(full.to_json()["code"], "ERR_AUTH_BODIES_FULL");
@@ -537,6 +698,262 @@ mod tests {
                 budget: SESSION_LANE_BODY_BYTES
             })
         );
-        assert_eq!(SESSION_LANE_BODIES.held(), 0);
+        assert_eq!(PRE_AUTH_BODIES.held(), 0);
+    }
+
+    type NoBody = stream::Iter<std::vec::IntoIter<Chunk>>;
+
+    /// A body of `len` bytes read in 64 KiB chunks under `budget`, on a ledger
+    /// of its own (a total of twice the budget), the deadline never firing.
+    async fn read_len(budget: u64, len: usize) -> Result<Vec<u8>, BodyRefusal> {
+        let ledger = BodyLedger::new();
+        let got = read_bounded_body(
+            &ledger,
+            None,
+            budget,
+            2 * budget,
+            250,
+            || Ok(Some(stream::iter(chunks(&vec![b'4'; len], 64 * 1024)))),
+            std::future::pending::<()>(),
+            || 0,
+        )
+        .await
+        .expect("no stream error");
+        assert_eq!(ledger.held(), 0, "every charge given back");
+        got
+    }
+
+    #[test]
+    fn the_polling_posts_figure_is_the_handshakes_max_payload() {
+        assert_eq!(POLLING_POST_BODY_BYTES, 1_000_000);
+        assert_eq!(
+            POLLING_POST_BODY_BYTES,
+            crate::engineio::session::MAX_PAYLOAD
+        );
+        let open = crate::engineio::open_handshake_packet("sid").encode();
+        let named: Value = serde_json::from_str(&open[1..]).expect("the open packet's JSON");
+        assert_eq!(named["maxPayload"], POLLING_POST_BODY_BYTES);
+        assert_eq!(PRE_AUTH_HELD_BODY_BYTES, SEND_BODY_BYTES as u64);
+    }
+
+    #[test]
+    fn the_bearer_routes_figures() {
+        assert_eq!(PUSH_BODY_BYTES, SEND_BODY_BYTES as u64);
+        assert_eq!(ATTEST_BODY_BYTES, 16_384);
+        assert_eq!(BROADCAST_BODY_BYTES, 262_144);
+        assert_eq!(BEARER_HELD_BODY_BYTES, 12 * 1024 * 1024);
+    }
+
+    /// The largest attest body `session_attest_body_ok` accepts, every `path`
+    /// character written as a six-byte escape, is within the attest figure.
+    #[test]
+    fn the_largest_valid_attest_body_is_within_its_figure() {
+        let body = json!({
+            "id": "ab".repeat(32),
+            "identity": format!("02{}", "cd".repeat(32)),
+            "h": u64::MAX,
+            "method": "OPTIONSX",
+            "path": "\u{1}".repeat(2_048),
+            "bodySha256": "ef".repeat(32),
+            "mac": "01".repeat(32),
+        });
+        assert!(crate::session_attest_body_ok(&body));
+        let bytes = serde_json::to_vec(&body).unwrap();
+        assert!(bytes.len() > 2_048 * 6, "every path character escaped");
+        assert!(bytes.len() as u64 <= ATTEST_BODY_BYTES, "{}", bytes.len());
+    }
+
+    /// The session lane and the polling POST count in the one total.
+    #[test]
+    fn the_lane_and_the_polling_post_share_one_total() {
+        let src: String = include_str!("body_bounds.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for reader in ["fnread_session_lane_body<", "fnread_polling_post_body<"] {
+            let start = src.find(reader).expect(reader);
+            let end = src[start..]
+                .find("pubasyncfn")
+                .map_or(src.len(), |e| e + start);
+            let body = &src[start..end];
+            assert!(body.contains("&PRE_AUTH_BODIES,"), "{reader}");
+            assert!(body.contains("PRE_AUTH_HELD_BODY_BYTES,"), "{reader}");
+        }
+        let start = src.find("fnread_bearer_route_body<").unwrap();
+        assert!(src[start..].contains("&BEARER_BODIES,"));
+    }
+
+    #[tokio::test]
+    async fn a_polling_post_at_its_figure_is_read_and_one_byte_over_is_refused() {
+        let at = POLLING_POST_BODY_BYTES as usize;
+        assert_eq!(
+            read_len(POLLING_POST_BODY_BYTES, at).await.map(|b| b.len()),
+            Ok(at)
+        );
+        assert_eq!(
+            read_len(POLLING_POST_BODY_BYTES, at + 1).await,
+            Err(BodyRefusal::TooLarge {
+                size: None,
+                budget: POLLING_POST_BODY_BYTES
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_polling_post_declared_over_its_figure_is_refused_unread() {
+        let at = POLLING_POST_BODY_BYTES.to_string();
+        let got = read_polling_post_body(
+            Some(&at),
+            || -> Result<Option<NoBody>, String> { Ok(None) },
+            std::future::pending::<()>(),
+            || 0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            got,
+            Ok(Vec::new()),
+            "a declared length at the figure is read"
+        );
+        let over = (POLLING_POST_BODY_BYTES + 1).to_string();
+        let got = read_polling_post_body(
+            Some(&over),
+            || -> Result<Option<NoBody>, String> { panic!("the body is never opened") },
+            std::future::pending::<()>(),
+            || 0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            got,
+            Err(BodyRefusal::TooLarge {
+                size: Some(POLLING_POST_BODY_BYTES + 1),
+                budget: POLLING_POST_BODY_BYTES
+            })
+        );
+    }
+
+    #[test]
+    fn the_polling_posts_answers_are_plain_413_503_and_408() {
+        let (text, status, retry) = polling_refusal_answer(&BodyRefusal::TooLarge {
+            size: Some(POLLING_POST_BODY_BYTES + 1),
+            budget: POLLING_POST_BODY_BYTES,
+        });
+        assert_eq!(status, 413);
+        assert_eq!(retry, None);
+        assert_eq!(
+            text,
+            "This request's body is 1000001 bytes, and this host reads at most 1000000 bytes of a request: a bound of this host."
+        );
+        let (text, status, retry) = polling_refusal_answer(&BodyRefusal::BodiesFull {
+            held: 5,
+            total: PRE_AUTH_HELD_BODY_BYTES,
+        });
+        assert_eq!((status, retry), (503, Some(2)));
+        assert!(text.contains("send the request again shortly"), "{text}");
+        let (text, status, retry) = polling_refusal_answer(&BodyRefusal::TimedOut {
+            held: 5,
+            waited_ms: 30_000,
+            deadline_ms: 30_000,
+        });
+        assert_eq!((status, retry), (408, None));
+        assert!(text.contains("within 30 seconds"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn each_bearer_route_reads_its_figure_and_refuses_one_byte_over() {
+        for budget in [ATTEST_BODY_BYTES, BROADCAST_BODY_BYTES] {
+            let at = budget as usize;
+            assert_eq!(
+                read_len(budget, at).await.map(|b| b.len()),
+                Ok(at),
+                "{budget}"
+            );
+            assert_eq!(
+                read_len(budget, at + 1).await,
+                Err(BodyRefusal::TooLarge { size: None, budget }),
+                "{budget}"
+            );
+        }
+        // `/push` at its figure by declared length (12 MiB is not built here).
+        for budget in [PUSH_BODY_BYTES, ATTEST_BODY_BYTES, BROADCAST_BODY_BYTES] {
+            let at = budget.to_string();
+            let got = read_bearer_route_body(
+                Some(&at),
+                budget,
+                || -> Result<Option<NoBody>, String> { Ok(None) },
+                std::future::pending::<()>(),
+                || 0,
+            )
+            .await
+            .unwrap();
+            assert_eq!(got, Ok(Vec::new()), "{budget}: at the figure");
+            let over = (budget + 1).to_string();
+            let got = read_bearer_route_body(
+                Some(&over),
+                budget,
+                || -> Result<Option<NoBody>, String> { panic!("the body is never opened") },
+                std::future::pending::<()>(),
+                || 0,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                got,
+                Err(BodyRefusal::TooLarge {
+                    size: Some(budget + 1),
+                    budget
+                }),
+                "{budget}: one byte over"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bearer_routes_answers_are_the_relays_413_and_the_layers_503_and_408() {
+        let (body, status, retry) = bearer_refusal_answer(
+            "/broadcast",
+            &BodyRefusal::TooLarge {
+                size: Some(BROADCAST_BODY_BYTES + 1),
+                budget: BROADCAST_BODY_BYTES,
+            },
+        );
+        assert_eq!((status, retry), (413, None));
+        assert_eq!(
+            body,
+            json!({
+                "status": "error",
+                "code": "ERR_BODY_TOO_LARGE",
+                "description": "The /broadcast body is 262145 bytes and the relay reads at most 262144 of it in one request.",
+            })
+        );
+        let (body, _, _) = bearer_refusal_answer(
+            "/session/attest",
+            &BodyRefusal::TooLarge {
+                size: None,
+                budget: ATTEST_BODY_BYTES,
+            },
+        );
+        assert_eq!(
+            body["description"],
+            "The /session/attest body is more than 16384 bytes and the relay reads at most 16384 of it in one request."
+        );
+        let full = BodyRefusal::BodiesFull {
+            held: 5,
+            total: BEARER_HELD_BODY_BYTES,
+        };
+        assert_eq!(
+            bearer_refusal_answer("/push", &full),
+            (full.to_json(), 503, Some(2))
+        );
+        let late = BodyRefusal::TimedOut {
+            held: 5,
+            waited_ms: 30_000,
+            deadline_ms: 30_000,
+        };
+        assert_eq!(
+            bearer_refusal_answer("/push", &late),
+            (late.to_json(), 408, None)
+        );
     }
 }
