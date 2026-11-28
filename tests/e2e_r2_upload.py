@@ -4,7 +4,11 @@
 Proves that the Cloudflare Workers 100 MB request body cap is defeated by
 the `/beef/upload-url` + `payment.beefR2Key` extension. The blob uploaded
 is intentionally random garbage (not a valid BEEF) — this test exercises
-the R2 pipeline, not the BSV internalization path. Acceptance:
+the R2 pipeline, not the BSV internalization path. The relay itself reads
+at most `[limits] payment_bytes` (614,400 bytes by default) of an uploaded
+payment and answers a `/sendMessage` that names a larger object 413
+`ERR_PAYMENT_SIZE`; this script never names its key to `/sendMessage`.
+Acceptance:
 
   1. POST /beef/upload-url (auth'd) returns { url, key, expiresAt }.
   2. PUT of a 150 MB blob to the presigned URL returns 200 from R2.

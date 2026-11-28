@@ -97,8 +97,9 @@ work_units = 10000000
 # in bytes: a build-time setting beside the work budget. Default 614400
 # (600 KiB): an ordinary payment is a few kilobytes (in 727 real payments the
 # median was 5.4 KB and the largest 434 KB); a host that must read a larger
-# payment raises it. Zero, or a value that does not parse, uses the default.
-# Rebuild when changing it.
+# payment raises it. A value that is not a whole number of bytes above zero
+# stops the build; with the key absent, the default is used. Rebuild when
+# changing it.
 payment_bytes = 614400
 
 [[d1_databases]]

@@ -72,7 +72,8 @@ no state of the reading, so the next presentation is read afresh.
 A payment's bytes are held to one figure at both of its doors, the inline `payment.tx`
 of a `/sendMessage` and an upload named by `payment.beefR2Key`: `[limits] payment_bytes` in
 wrangler.toml, read at build time beside `work_units` (rebuild after changing it), 614,400
-bytes (600 KiB) by default; zero, or a value that does not parse, uses the default. An
+bytes (600 KiB) when the key is absent; a value that is not a whole number of bytes above
+zero stops the build. An
 ordinary payment is a few kilobytes (in 727 real payments the median was 5.4 KB and the
 largest 434 KB); a host that must read a larger payment raises the setting. The rest of the
 body keeps its own bound (12 MiB). A Worker's isolate is memory-limited, and a door bounds

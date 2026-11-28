@@ -870,8 +870,16 @@ impl SendStore for MailboxSendStore<'_, '_> {
 
     /// A paid row is a D1 row on this path too (`insert_message` with a
     /// `beef_key`), so the lookup is D1's.
-    async fn holds_message_id(&self, message_id: &str) -> Result<bool> {
-        self.worker.holds_message_id(message_id).await
+    async fn holds_own_send(
+        &self,
+        message_id: &str,
+        sender: &str,
+        recipient: &str,
+        message_box_id: i64,
+    ) -> Result<bool> {
+        self.worker
+            .holds_own_send(message_id, sender, recipient, message_box_id)
+            .await
     }
 
     fn now_ms(&self) -> u64 {

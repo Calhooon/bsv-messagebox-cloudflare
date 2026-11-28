@@ -365,10 +365,16 @@ pub(crate) trait SendStore {
         r2_key: Option<&str>,
         failed: bool,
     );
-    /// Whether a stored row already holds `message_id`, as the insert of a
-    /// paid row would find it (`messages.message_id` is unique): a lookup by
-    /// the id alone.
-    async fn holds_message_id(&self, message_id: &str) -> worker::Result<bool>;
+    /// Whether the stored row by `message_id` is this sender's own send: from
+    /// `sender`, to `recipient`, in `message_box_id`. A row by the id that is
+    /// any other send's, or no row, is `false`.
+    async fn holds_own_send(
+        &self,
+        message_id: &str,
+        sender: &str,
+        recipient: &str,
+        message_box_id: i64,
+    ) -> worker::Result<bool>;
     fn now_ms(&self) -> u64;
     fn log(&self, line: String);
     /// The box switch (0.8.1, `BOXES_OFF`): a send into a box switched off is
@@ -498,8 +504,16 @@ impl SendStore for WorkerStore<'_, '_> {
         payments::forget_unnamed(self.env, rows_naming, handed, r2_key, failed).await
     }
 
-    async fn holds_message_id(&self, message_id: &str) -> worker::Result<bool> {
-        self.store.holds_message_id(message_id).await
+    async fn holds_own_send(
+        &self,
+        message_id: &str,
+        sender: &str,
+        recipient: &str,
+        message_box_id: i64,
+    ) -> worker::Result<bool> {
+        self.store
+            .holds_own_send(message_id, sender, recipient, message_box_id)
+            .await
     }
 
     fn now_ms(&self) -> u64 {
@@ -734,12 +748,19 @@ async fn store_rows<S: SendStore>(
                     Err((body, status)) => {
                         // A payment refused for its size (0.8.9) was refused
                         // before any of it was parsed or settled. When the
-                        // send's first message id is already stored, the send
-                        // was delivered: it answers as the insert below would
-                        // answer that duplicate. No other refusal looks.
+                        // send's first message id is stored as this sender's
+                        // own send to the same recipient's box, the send was
+                        // delivered: it answers as the insert below would
+                        // answer that duplicate. An id held by any other row,
+                        // or by none, keeps the size refusal. No other
+                        // refusal looks.
                         if status == 413 && body["code"] == "ERR_PAYMENT_SIZE" {
-                            if let Some((recipient, message_id, _, _)) = ctx_map.first() {
-                                if let Ok(true) = store.holds_message_id(message_id).await {
+                            if let Some((recipient, message_id, _, Some(box_id))) = ctx_map.first()
+                            {
+                                if let Ok(true) = store
+                                    .holds_own_send(message_id, sender_key, recipient, *box_id)
+                                    .await
+                                {
                                     return SendOutcome::DuplicateMessage {
                                         recipient: recipient.clone(),
                                         message_id: message_id.clone(),
@@ -1469,6 +1490,9 @@ mod decouple_r1_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    /// A stored row: its message id, sender, recipient and box id.
+    type HeldRow = (&'static str, &'static str, &'static str, i64);
+
     /// A store whose every row lands but the one named a duplicate (or the
     /// one named a D1 fault); the send owes no fee.
     struct StubStore {
@@ -1482,8 +1506,8 @@ mod decouple_r1_tests {
         /// 0.8.9: the box's delivery fee, and the door's answer to the payment.
         fee: i32,
         refused: Option<(Value, u16)>,
-        /// 0.8.9: the message id a stored row already holds.
-        held: Option<&'static str>,
+        /// 0.8.9: a stored row: its message id, sender, recipient and box id.
+        held: Option<HeldRow>,
     }
 
     impl StubStore {
@@ -1588,9 +1612,17 @@ mod decouple_r1_tests {
         ) {
         }
 
-        async fn holds_message_id(&self, message_id: &str) -> worker::Result<bool> {
+        async fn holds_own_send(
+            &self,
+            message_id: &str,
+            sender: &str,
+            recipient: &str,
+            message_box_id: i64,
+        ) -> worker::Result<bool> {
             self.log.borrow_mut().push(format!("holds {message_id}"));
-            Ok(self.held == Some(message_id))
+            Ok(self.held.is_some_and(|(id, from, to, box_id)| {
+                (id, from, to, box_id) == (message_id, sender, recipient, message_box_id)
+            }))
         }
 
         fn now_ms(&self) -> u64 {
@@ -1871,7 +1903,7 @@ mod decouple_r1_tests {
             payment: Some(json!({ "tx": "00".repeat(size as usize), "outputs": [] })),
             ..send("inbox", rows)
         };
-        let store_with = |log: &Log, refused: (Value, u16), held: Option<&'static str>| {
+        let store_with = |log: &Log, refused: (Value, u16), held: Option<HeldRow>| {
             let mut store = StubStore::new(log.clone());
             store.fee = 10;
             store.refused = Some(refused);
@@ -1881,7 +1913,11 @@ mod decouple_r1_tests {
 
         // Delivered: the duplicate's answer, and no row is written.
         let log: Log = Rc::new(RefCell::new(Vec::new()));
-        let store = store_with(&log, payments::payment_size_refusal(Some(size)), Some("m1"));
+        let store = store_with(
+            &log,
+            payments::payment_size_refusal(Some(size)),
+            Some(("m1", "S", "R1", 1)),
+        );
         let sent = block_on(store_send(paid(&[("R1", "m1")]), "S", &store));
         assert!(
             matches!(
@@ -1914,7 +1950,11 @@ mod decouple_r1_tests {
         // Only the send's first message id is looked up: a send whose first
         // row is new stores nothing without its payment, and is refused 413.
         let log: Log = Rc::new(RefCell::new(Vec::new()));
-        let store = store_with(&log, payments::payment_size_refusal(Some(size)), Some("m2"));
+        let store = store_with(
+            &log,
+            payments::payment_size_refusal(Some(size)),
+            Some(("m2", "S", "R2", 1)),
+        );
         let sent = block_on(store_send(paid(&[("R1", "m1"), ("R2", "m2")]), "S", &store));
         assert_eq!(outcome_to_http(sent.outcome).1, 413);
 
@@ -1924,9 +1964,47 @@ mod decouple_r1_tests {
             400,
         );
         let log: Log = Rc::new(RefCell::new(Vec::new()));
-        let store = store_with(&log, invalid.clone(), Some("m1"));
+        let store = store_with(&log, invalid.clone(), Some(("m1", "S", "R1", 1)));
         let sent = block_on(store_send(paid(&[("R1", "m1")]), "S", &store));
         assert_eq!(outcome_to_http(sent.outcome), invalid);
         assert!(!log.borrow().iter().any(|line| line.starts_with("holds")));
+    }
+
+    // 0.8.9: the retry's lookup is of this sender's own send. The same
+    // message id presented by another sender, to another recipient or into
+    // another box, with a payment over the budget, is refused 413
+    // `ERR_PAYMENT_SIZE`, the same answer as for an id no row holds.
+    #[test]
+    fn a_message_id_held_by_another_send_answers_the_size_refusal() {
+        let size = payments::payment_budget_bytes() + 1;
+        let paid = |rows: &[(&str, &str)]| ValidatedSendMessage {
+            payment: Some(json!({ "tx": "00".repeat(size as usize), "outputs": [] })),
+            ..send("inbox", rows)
+        };
+        let answer = |held: Option<HeldRow>, sender: &str, recipient: &str| {
+            let log: Log = Rc::new(RefCell::new(Vec::new()));
+            let mut store = StubStore::new(log.clone());
+            store.fee = 10;
+            store.refused = Some(payments::payment_size_refusal(Some(size)));
+            store.held = held;
+            let sent = block_on(store_send(paid(&[(recipient, "m1")]), sender, &store));
+            let (body, status) = outcome_to_http(sent.outcome);
+            (serde_json::to_vec(&body).unwrap(), status)
+        };
+
+        let unheld = answer(None, "T", "R1");
+        assert_eq!(unheld.1, 413);
+        let (body, _) = payments::payment_size_refusal(Some(size));
+        assert_eq!(body["code"], "ERR_PAYMENT_SIZE");
+        assert_eq!(unheld.0, serde_json::to_vec(&body).unwrap());
+
+        // Another sender presents the id of S's delivered send to R1.
+        assert_eq!(answer(Some(("m1", "S", "R1", 1)), "T", "R1"), unheld);
+        // S presents it to another recipient.
+        assert_eq!(answer(Some(("m1", "S", "R1", 1)), "S", "R2"), unheld);
+        // The stored row is in another box.
+        assert_eq!(answer(Some(("m1", "S", "R1", 2)), "S", "R1"), unheld);
+        // S's own send to R1, for contrast, is the duplicate.
+        assert_eq!(answer(Some(("m1", "S", "R1", 1)), "S", "R1").1, 400);
     }
 }
