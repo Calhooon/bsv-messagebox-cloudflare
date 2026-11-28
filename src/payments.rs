@@ -2860,15 +2860,20 @@ mod tests {
             (400, &json!("ERR_INVALID_PAYMENT"))
         );
         assert_eq!(body["offset"], 0, "{body}");
-        // A text longer than a row is refused before a byte is read: 2,000,001
-        // bytes of hex is no BEEF either, and the answer is the bound's.
-        let long = "00".repeat(1_000_000) + "0";
-        let (body, status) = check_unjudged(&tx(json!(long + "0"))).await.unwrap_err();
-        assert_eq!(
-            (status, &body["code"]),
-            (413, &json!("ERR_BODY_TOO_LARGE")),
-            "{body}"
-        );
+        // A text longer than a row is refused before a byte is parsed: 500,000
+        // bytes sent as an array (written as hex, `txShape` "array": four
+        // characters a byte in the row) are within the payment's figure and
+        // over the row's bound; they are no BEEF either, and the answer is
+        // the row bound's.
+        let rowful = 500_000usize;
+        let sent = json!({ "tx": "00".repeat(rowful), "txShape": "array" });
+        let (body, status) = check_unjudged(&sent).await.unwrap_err();
+        let code = if rowful as u64 <= payment_budget_bytes() {
+            "ERR_BODY_TOO_LARGE"
+        } else {
+            "ERR_PAYMENT_SIZE"
+        };
+        assert_eq!((status, &body["code"]), (413, &json!(code)), "{body}");
         let at_bound = "00".repeat(999_999);
         let (_, status) = check_unjudged(&json!(at_bound)).await.unwrap_err();
         assert_eq!(
