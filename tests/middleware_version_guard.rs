@@ -17,7 +17,7 @@
 
 /// The published version the relay is expected to ship with (see Cargo.toml's
 /// `bsv-middleware-cloudflare` entry and the 2026-07-23 #249 note beneath it).
-const EXPECTED_VERSION: &str = "0.7.2";
+const EXPECTED_VERSION: &str = "0.7.8";
 const CRATE: &str = "bsv-middleware-cloudflare";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
@@ -92,8 +92,8 @@ fn lock_dependencies_of(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// The BRC-31 layer is on bsv-rs 0.8 (bsv-middleware-cloudflare 0.7.2, on
-/// bsv-middleware-core 0.4.1, since 0.7.1; 0.7.0 on bsv-rs 0.7 from 0.6.0;
+/// The BRC-31 layer is on bsv-rs 0.8 (bsv-middleware-cloudflare 0.7.8, on
+/// bsv-middleware-core 0.4.7, since 0.8.10; 0.7.2 on core 0.4.1 from 0.7.1; 0.7.0 on bsv-rs 0.7 from 0.6.0;
 /// 0.6.2 on bsv-rs 0.6 from 0.5.0, 0.5.1 on bsv-rs 0.4 before): the copy of
 /// bsv-rs it is built on is the relay's 0.8.1, so the session, the
 /// wallet and the auth message it takes are the types the relay holds, and no
@@ -158,9 +158,9 @@ fn the_payment_words_are_bsv_middleware_rs_0_6_2_on_bsv_rs_0_8_14_one_copy() {
     };
     assert_eq!(versions("bsv-middleware-rs"), ["0.6.2"]);
     assert_eq!(versions("bsv-rs"), ["0.8.14"]);
-    // 0.7.1: the BRC-31 layer's core is 0.4.1 (the middleware's release on
-    // bsv-rs 0.8), pinned exactly beside it, one copy.
-    assert_eq!(versions("bsv-middleware-core"), ["0.4.1"]);
+    // 0.8.10: the BRC-31 layer's core is 0.4.7 (the auth layer's body
+    // bounds), pinned exactly beside it, one copy.
+    assert_eq!(versions("bsv-middleware-core"), ["0.4.7"]);
     let toml = manifest_file("Cargo.toml");
     let sdk_lines: Vec<&str> = toml
         .lines()
