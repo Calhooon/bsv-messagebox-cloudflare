@@ -48,14 +48,15 @@ objects.
 
 The paid door checks the fee and verifies BEEF ancestry and unproven spends.
 It reads BEEF as a stream, including R2 objects, with a saved cursor when a
-request pauses between elements or inputs. A local script-work decline is not
-a verdict that the payment is invalid.
+request pauses between elements or inputs. A local script-work or stack-memory decline
+is not a verdict that the payment is invalid.
 
 | HTTP | Word | Meaning |
 |---|---|---|
 | 400 | `ERR_INVALID_PAYMENT` | Invalid bytes, spend, output or merkle-root refusal; byte errors name offset and kind. |
 | 400 | `ERR_INSUFFICIENT_PAYMENT` | The delivery output pays less than the fee. |
 | 422 | `ERR_PAYMENT_WORK` | Local work budget exhausted; validity remains undetermined. |
+| 422 | `ERR_PAYMENT_MEMORY` | Local stack-memory budget (8,000,000 bytes per stack) reached; validity remains undetermined. |
 | 500 | `ERR_SERVER_MISCONFIGURED` | No header service is configured. |
 | 503 | `ERR_PAYMENT_UNAVAILABLE` | Header service could not answer; retry. |
 | 503 | `ERR_PAYMENT_PENDING` | Reading paused; repeat the same request to resume. |
