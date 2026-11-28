@@ -57,7 +57,9 @@ ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 # middleware's releases that hash and MAC through `bsv_rs::primitives::hash`,
 # no direct sha2 or hmac). Pinned exactly, with the core it is built on. Its
 # session, wallet and auth message are the relay's own bsv-rs 0.8.1 types.
-# 0.7.8 on core 0.4.7 (0.8.10 of the relay): the auth layer's body bounds.
+# 0.7.8 on core 0.4.7 (0.8.10 of the relay): the auth layer reads at most the
+# relay's own figure of a request's body, through `process_auth_do_with_body_bounds`
+# (`body_bounds::auth_body_bounds`).
 bsv-middleware-cloudflare = "=0.7.8"
 bsv-middleware-core = "=0.4.7"
 # The SDK and the streaming BEEF reader (0.4.0: `verify_stream`, `BeefDecoder`,

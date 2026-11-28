@@ -1,8 +1,8 @@
 use bsv_middleware_cloudflare::{
     add_cors_headers, init_panic_hook,
     middleware::{
-        auth::handle_cors_preflight, process_auth_do, sign_json_response, AuthMiddlewareOptions,
-        AuthResult,
+        auth::handle_cors_preflight, process_auth_do_with_body_bounds, sign_json_response,
+        AuthMiddlewareOptions, AuthResult,
     },
 };
 
@@ -20,6 +20,7 @@ mod broadcast_registry;
 pub use broadcast_registry::BroadcastRegistry;
 mod api_docs;
 mod archive;
+pub mod body_bounds;
 mod d1;
 mod error;
 mod retention;
@@ -459,9 +460,7 @@ async fn handle(req: Request, env: Env, ctx: Context) -> Result<Response> {
         ),
         Some(Err(refusal)) => return Ok(refusal),
         None => {
-            let auth_result = process_auth_do(req, &env, &auth_options, AUTH_SESSION_STORE_BINDING)
-                .await
-                .map_err(|e| Error::from(e.to_string()))?;
+            let auth_result = relay_auth(req, &env, &auth_options).await?;
             match auth_result {
                 AuthResult::Authenticated {
                     context,
@@ -769,8 +768,34 @@ async fn session_lane_auth(
             401,
         )));
     };
-    let body = match req.bytes().await {
-        Ok(b) => b,
+    // The body, read under the lane's own figures before the hub is asked
+    // (`body_bounds::read_session_lane_body`): a declared length over
+    // `SESSION_LANE_BODY_BYTES` refused unread, the read stopped one byte
+    // past it, counted in the lane's total, within the deadline.
+    let content_length = req.headers().get("content-length").ok().flatten();
+    let read = crate::body_bounds::read_session_lane_body(
+        content_length.as_deref(),
+        || match req.stream() {
+            Ok(stream) => Ok(Some(stream)),
+            Err(e @ Error::BodyUsed) => Err(e.to_string()),
+            // A request with no body reads as an empty body.
+            Err(_) => Ok(None),
+        },
+        Delay::from(bsv_middleware_cloudflare::DEFAULT_BODY_DEADLINE),
+        || Date::now().as_millis(),
+    )
+    .await;
+    let body = match read {
+        Ok(Ok(b)) => b,
+        Ok(Err(refusal)) => {
+            console_log!(
+                "TRACE_SESSION http body refused identity={} path={} {}",
+                identity,
+                path_and_query,
+                refusal.log_line()
+            );
+            return Some(Err(session_lane_body_refusal(&refusal)));
+        }
         Err(e) => {
             console_log!("TRACE_SESSION http malformed body: {e}");
             return Some(Err(session_lane_refusal(
@@ -860,6 +885,25 @@ async fn session_lane_auth(
         h,
         body,
     }))
+}
+
+/// The lane's answer to a body it did not read: the relay's own 413
+/// `ERR_BODY_TOO_LARGE`, or the 503 `ERR_AUTH_BODIES_FULL` (with
+/// `Retry-After`) and 408 `ERR_AUTH_BODY_TIMEOUT` the BRC-31 door answers
+/// (`body_bounds::lane_refusal_answer`), with CORS and the lane's headers.
+fn session_lane_body_refusal(refusal: &bsv_middleware_cloudflare::BodyRefusal) -> Response {
+    let (body, status, retry_after) = crate::body_bounds::lane_refusal_answer(refusal);
+    match Response::from_json(&body) {
+        Ok(r) => {
+            let r = with_session_lane_cors(add_cors_headers(r.with_status(status)));
+            if let Some(seconds) = retry_after {
+                let _ = r.headers().set("Retry-After", &seconds.to_string());
+            }
+            r
+        }
+        Err(_) => Response::error("request body refused", status)
+            .unwrap_or_else(|_| Response::empty().expect("an empty response builds")),
+    }
 }
 
 /// The lane's refusal body: `{status, code, reason}` with CORS, so a browser
@@ -1500,9 +1544,7 @@ async fn route_websocket_upgrade(
     env: &Env,
     auth_options: &AuthMiddlewareOptions,
 ) -> Result<Response> {
-    let auth_result = process_auth_do(req, env, auth_options, AUTH_SESSION_STORE_BINDING)
-        .await
-        .map_err(|e| Error::from(e.to_string()))?;
+    let auth_result = relay_auth(req, env, auth_options).await?;
 
     let (identity_key, request) = match auth_result {
         AuthResult::Authenticated {
@@ -1516,6 +1558,47 @@ async fn route_websocket_upgrade(
     let namespace = crate::hub_store::hub_namespace(env)?;
     let stub = namespace.id_from_name(&identity_key)?.get_stub()?;
     stub.fetch_with_request(request).await
+}
+
+/// Every call of the BRC-31 layer: `process_auth_do_with_body_bounds` with
+/// the relay's figures (`body_bounds::auth_body_bounds()`: at most
+/// `validation::SEND_BODY_BYTES` of one request, `AUTH_HELD_BODY_BYTES` held
+/// at once, the default deadline). The layer's 413 `ERR_AUTH_BODY_TOO_LARGE`
+/// is answered as the relay's own 413 `ERR_BODY_TOO_LARGE`
+/// (`body_bounds::layer_refusal_answer`), unsigned and with the CORS headers,
+/// as no caller is authenticated yet; every other answer of the layer (its 503
+/// `ERR_AUTH_BODIES_FULL` with `Retry-After`, its 408 `ERR_AUTH_BODY_TIMEOUT`,
+/// its 401) goes to the sender unchanged.
+async fn relay_auth(
+    req: Request,
+    env: &Env,
+    auth_options: &AuthMiddlewareOptions,
+) -> Result<AuthResult> {
+    let auth_result = process_auth_do_with_body_bounds(
+        req,
+        env,
+        auth_options,
+        AUTH_SESSION_STORE_BINDING,
+        body_bounds::auth_body_bounds(),
+    )
+    .await
+    .map_err(|e| Error::from(e.to_string()))?;
+    match auth_result {
+        AuthResult::Response(mut response) if response.status_code() == 413 => {
+            let layer: serde_json::Value = response
+                .cloned()?
+                .json()
+                .await
+                .unwrap_or(serde_json::Value::Null);
+            match body_bounds::layer_refusal_answer(413, &layer) {
+                Some((body, status)) => Ok(AuthResult::Response(add_cors_headers(
+                    Response::from_json(&body)?.with_status(status),
+                ))),
+                None => Ok(AuthResult::Response(response)),
+            }
+        }
+        other => Ok(other),
+    }
 }
 
 // --- Socket.IO transport routing (M10 Phase A — issue #61) ---
@@ -2262,17 +2345,15 @@ mod push_route_tests {
             .find("letlane=session_lane_auth(&mutreq,&env).await;")
             .expect("the lane ask");
         let brc104 = handle
-            .find("process_auth_do(req,&env,&auth_options,AUTH_SESSION_STORE_BINDING)")
+            .find("relay_auth(req,&env,&auth_options)")
             .expect("BRC-104");
         assert!(lane < brc104, "the lane is asked first");
         let none_arm = handle
-            .find("None=>{letauth_result=process_auth_do(")
+            .find("None=>{letauth_result=relay_auth(")
             .expect("BRC-104 only without the header");
         assert!(none_arm < brc104 + 1);
         assert_eq!(
-            handle
-                .matches("process_auth_do(req,&env,&auth_options,AUTH_SESSION_STORE_BINDING)")
-                .count(),
+            handle.matches("relay_auth(req,&env,&auth_options)").count(),
             1,
             "one BRC-104 call, inside the no-header arm"
         );
@@ -2283,6 +2364,42 @@ mod push_route_tests {
         assert!(handle
             .contains("(None,Some((key,h)))=>seal_session_lane_response(&body,status,&key,h),"));
         assert!(handle.contains("returnhandle_cors_preflight().map(with_session_lane_cors);"));
+    }
+
+    /// Every call of the BRC-31 layer names the relay's body bounds (one
+    /// helper, `relay_auth`, called by the HTTP routes and the WebSocket
+    /// upgrade), and the layer's 413 is answered as the relay's own.
+    #[test]
+    fn every_call_of_the_brc31_layer_names_the_relays_body_bounds() {
+        let src = strip_ws(include_str!("lib.rs"));
+        let code = &src[..src.find("#[cfg(test)]").expect("the tests")];
+        assert_eq!(code.matches("process_auth_do(").count(), 0);
+        assert_eq!(code.matches("process_auth_do_with_body_bounds(").count(), 1);
+        assert!(code.contains("body_bounds::auth_body_bounds(),"));
+        assert_eq!(
+            code.matches("relay_auth(req,&env,&auth_options)").count(),
+            1
+        );
+        assert_eq!(code.matches("relay_auth(req,env,auth_options)").count(), 1);
+        assert!(code.contains("body_bounds::layer_refusal_answer(413,&layer)"));
+    }
+
+    /// The lane reads the body through its bounded reader, never whole.
+    #[test]
+    fn the_lane_reads_its_body_under_its_figures() {
+        let src = strip_ws(include_str!("lib.rs"));
+        let start = src.find("asyncfnsession_lane_auth(").expect("the lane");
+        let end = src[start..]
+            .find("fnsession_lane_refusal(")
+            .expect("its end")
+            + start;
+        let lane = &src[start..end];
+        assert!(!lane.contains("req.bytes()"));
+        assert!(lane.contains("crate::body_bounds::read_session_lane_body("));
+        assert!(lane.contains("returnSome(Err(session_lane_body_refusal(&refusal)));"));
+        let read = lane.find("read_session_lane_body(").unwrap();
+        let ask = lane.find("/internal/session-verify").unwrap();
+        assert!(read < ask, "the body is bounded before the hub is asked");
     }
 
     /// The lane asks the identity's hub with the body's DIGEST (never the

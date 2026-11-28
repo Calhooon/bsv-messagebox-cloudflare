@@ -22,7 +22,7 @@ fn info() -> Value {
     let budget = crate::payments::payment_budget_bytes();
     json!({
         "title": "rust-message-box",
-        "description": format!("BSV message box service — authenticated message delivery with permissions, payments, and device registration. All authenticated endpoints use BRC-31 mutual authentication. For a payment within this host's bound this server is byte-for-byte compatible with the TS `message-box-server` and Go `go-messagebox-server` reference implementations, and it exposes an opt-in Rust-only R2 upload of a payment's BEEF (see `POST /beef/upload-url`). This host reads at most {budget} bytes of a payment, inline or uploaded (`[limits] payment_bytes`); `/sendMessage` answers a larger payment 413 `ERR_PAYMENT_SIZE`: a bound of this host, not a rule of the chain, and no verdict on the payment.\n\nIn addition to the HTTP routes documented here, the service exposes a WebSocket endpoint at `GET /ws` (Upgrade: websocket) that mirrors the TS `@bsv/authsocket` event surface (`joinRoom`, `leaveRoom`, `sendMessage`, etc.) on a per-identity hibernatable Cloudflare Durable Object. WebSocket APIs are out of OpenAPI 3.0 scope — OpenAPI does not model WS event channels — so they are intentionally not included in this spec. See the project README's \"WebSocket\" section for the event envelope and parity boundary; AsyncAPI would be the appropriate spec format if a machine-readable description is needed in the future."),
+        "description": format!("BSV message box service — authenticated message delivery with permissions, payments, and device registration. All authenticated endpoints use BRC-31 mutual authentication. For a payment within this host's bound this server is byte-for-byte compatible with the TS `message-box-server` and Go `go-messagebox-server` reference implementations, and it exposes an opt-in Rust-only R2 upload of a payment's BEEF (see `POST /beef/upload-url`). This host reads at most {budget} bytes of a payment, inline or uploaded (`[limits] payment_bytes`); `/sendMessage` answers a larger payment 413 `ERR_PAYMENT_SIZE`: a bound of this host, not a rule of the chain, and no verdict on the payment.\n\nRequest bodies, on every authenticated route (BRC-31 and the session lane): this host reads at most {body} bytes of one request's body (`SEND_BODY_BYTES`) and answers a larger one 413 `ERR_BODY_TOO_LARGE`, before the body is read where its declared length is over the bound, unsigned (no caller is authenticated yet); it holds at most {held} bytes of bodies being read at once ({lane} on the session lane) and answers a body that would pass that 503 `ERR_AUTH_BODIES_FULL` with `Retry-After` (send it again after the seconds named); and it waits at most {secs} seconds for a body to arrive, 408 `ERR_AUTH_BODY_TIMEOUT` past it. These are bounds of this host.\n\nIn addition to the HTTP routes documented here, the service exposes a WebSocket endpoint at `GET /ws` (Upgrade: websocket) that mirrors the TS `@bsv/authsocket` event surface (`joinRoom`, `leaveRoom`, `sendMessage`, etc.) on a per-identity hibernatable Cloudflare Durable Object. WebSocket APIs are out of OpenAPI 3.0 scope — OpenAPI does not model WS event channels — so they are intentionally not included in this spec. See the project README's \"WebSocket\" section for the event envelope and parity boundary; AsyncAPI would be the appropriate spec format if a machine-readable description is needed in the future.", body = crate::validation::SEND_BODY_BYTES, held = crate::body_bounds::AUTH_HELD_BODY_BYTES, lane = crate::body_bounds::SESSION_LANE_HELD_BODY_BYTES, secs = bsv_middleware_cloudflare::DEFAULT_BODY_DEADLINE.as_secs()),
         "version": "0.1.0",
         "license": { "name": "Proprietary" }
     })
@@ -716,7 +716,7 @@ fn payment_size_response() -> Value {
     let budget = crate::payments::payment_budget_bytes();
     let (payment_size, _) = crate::payments::payment_size_refusal(Some(budget + 1));
     json!({
-        "description": format!("Not judged: the payment's bytes (its BEEF as bytes, inline in any shape of `payment.tx`, or uploaded and named by `payment.beefR2Key`) are over this host's bound of {budget} bytes (`[limits] payment_bytes`): ERR_PAYMENT_SIZE, with `budget` (the bound), `size` (the payment's bytes), `resource` `Size` and a one-sentence `description`. Measured from the encoding's length or the object's stored length, before any of the payment is parsed, verified or settled. A bound of this host, not a rule of the chain, and no verdict on the payment: pay with other coins. The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then. A send whose first message id is already stored answers 400 ERR_DUPLICATE_MESSAGE instead. Also ERR_BODY_TOO_LARGE: the request body is over the relay's bound for one request, or a payment a box keeps unjudged is over its row's bound."),
+        "description": format!("Not judged: the payment's bytes (its BEEF as bytes, inline in any shape of `payment.tx`, or uploaded and named by `payment.beefR2Key`) are over this host's bound of {budget} bytes (`[limits] payment_bytes`): ERR_PAYMENT_SIZE, with `budget` (the bound), `size` (the payment's bytes), `resource` `Size` and a one-sentence `description`. Measured from the encoding's length or the object's stored length, before any of the payment is parsed, verified or settled. A bound of this host, not a rule of the chain, and no verdict on the payment: pay with other coins. The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then. A send whose first message id is already stored answers 400 ERR_DUPLICATE_MESSAGE instead. Also ERR_BODY_TOO_LARGE: the request body is over the relay's bound for one request ({body} bytes; answered before the body is read where its declared length is over the bound, unsigned, as no caller is authenticated yet), or a payment a box keeps unjudged is over its row's bound.", body = crate::validation::SEND_BODY_BYTES),
         "content": { "application/json": {
             "schema": {
                 "allOf": [
@@ -729,7 +729,8 @@ fn payment_size_response() -> Value {
                 ]
             },
             "examples": {
-                "paymentSize": { "value": payment_size }
+                "paymentSize": { "value": payment_size },
+                "bodyTooLarge": { "value": crate::validation::body_too_large(Some(crate::validation::SEND_BODY_BYTES as u64 + 1)).0 }
             }
         }}
     })
@@ -770,6 +771,7 @@ fn send_message_responses() -> Value {
             }}
         },
         "413": payment_size_response(),
+        "408": body_timeout_response(),
         "429": {
             "description": "The sender's send budget for the window is spent (ERR_SEND_BUDGET, with `windowStart`, `windowSecs`, `retryAt`); or (0.8.1, under `HUB_STORE = \"sql\"`) a recipient's mailbox holds 10,000 unacknowledged rows or 1 GiB of their text (ERR_INBOX_QUOTA_EXCEEDED, the reference's quota refusal, with `resource` (`messages` or `bytes`), `limit`, `held`, `recipient` and `freedBy`). Nothing is stored for that recipient; rows stored for the recipients before it stay, so a resend with the same message ids meets the duplicate answer for those.",
             "content": { "application/json": {
@@ -791,7 +793,43 @@ fn send_message_responses() -> Value {
         "500": {
             "description": "Internal server error; or (0.8.1) the operator's `HUB_STORE` is not `kv`, `sql` or `kv-drain` (ERR_HUB_STORE_INVALID, on every request until it is).",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
-        }
+        },
+        "503": bodies_full_response()
+    })
+}
+
+/// The 408 of every authenticated route: a body that did not arrive within
+/// the deadline, the BRC-31 layer's and the session lane's answer.
+fn body_timeout_response() -> Value {
+    let secs = bsv_middleware_cloudflare::DEFAULT_BODY_DEADLINE.as_secs();
+    let late = bsv_middleware_cloudflare::BodyRefusal::TimedOut {
+        held: 0,
+        waited_ms: secs * 1000,
+        deadline_ms: secs * 1000,
+    };
+    json!({
+        "description": format!("The request's body did not arrive within {secs} seconds, the longest this host waits for one (ERR_AUTH_BODY_TIMEOUT): a bound of this host. Nothing of the request is done."),
+        "content": { "application/json": {
+            "schema": { "type": "object", "properties": { "code": { "type": "string" }, "description": { "type": "string" } } },
+            "examples": { "bodyTimeout": { "value": late.to_json() } }
+        }}
+    })
+}
+
+/// The 503 of every authenticated route for a body this host cannot hold
+/// now, the BRC-31 layer's and the session lane's answer.
+fn bodies_full_response() -> Value {
+    let full = bsv_middleware_cloudflare::BodyRefusal::BodiesFull {
+        held: 0,
+        total: crate::body_bounds::AUTH_HELD_BODY_BYTES,
+    };
+    json!({
+        "description": format!("This host is holding as many request bodies as it reads at once ({held} bytes at the BRC-31 layer, {lane} on the session lane): ERR_AUTH_BODIES_FULL, with `Retry-After`; send the same request again after the seconds named. A bound of this host, not a fault of the request. Nothing of the request is done.", held = crate::body_bounds::AUTH_HELD_BODY_BYTES, lane = crate::body_bounds::SESSION_LANE_HELD_BODY_BYTES),
+        "headers": { "Retry-After": { "schema": { "type": "integer" }, "description": "Seconds to wait before sending the request again." } },
+        "content": { "application/json": {
+            "schema": { "type": "object", "properties": { "code": { "type": "string" }, "description": { "type": "string" } } },
+            "examples": { "bodiesFull": { "value": full.to_json() } }
+        }}
     })
 }
 
@@ -1309,6 +1347,45 @@ mod tests {
             assert!(text.contains("ERR_PAYMENT_SIZE"), "{text}");
             assert!(!text.contains("refused for its size"), "{text}");
         }
+    }
+
+    /// The documented body answers are the ones the doors answer: the
+    /// relay's 413 for a send over `SEND_BODY_BYTES`, the 408 and the 503.
+    #[test]
+    fn spec_send_message_names_the_body_bounds() {
+        let spec = openapi_spec();
+        let responses = &spec["paths"]["/sendMessage"]["post"]["responses"];
+        let over =
+            &responses["413"]["content"]["application/json"]["examples"]["bodyTooLarge"]["value"];
+        let size = crate::validation::SEND_BODY_BYTES as u64 + 1;
+        let refusal = bsv_middleware_cloudflare::BodyRefusal::TooLarge {
+            size: Some(size),
+            budget: crate::body_bounds::AUTH_BODY_BYTES,
+        };
+        assert_eq!(
+            Some((over.clone(), 413)),
+            crate::body_bounds::layer_refusal_answer(413, &refusal.to_json()),
+            "the documented 413 is the one a sender gets"
+        );
+        assert_eq!(over["code"], "ERR_BODY_TOO_LARGE");
+        assert_eq!(
+            responses["408"]["content"]["application/json"]["examples"]["bodyTimeout"]["value"]
+                ["code"],
+            "ERR_AUTH_BODY_TIMEOUT"
+        );
+        let full = &responses["503"];
+        assert_eq!(
+            full["content"]["application/json"]["examples"]["bodiesFull"]["value"]["code"],
+            "ERR_AUTH_BODIES_FULL"
+        );
+        assert!(full["headers"].get("Retry-After").is_some());
+        let info = spec["info"]["description"].as_str().unwrap();
+        assert!(
+            info.contains("at most 12582912 bytes of one request's body"),
+            "{info}"
+        );
+        assert!(info.contains("at most 25165824 bytes of bodies"), "{info}");
+        assert!(info.contains("at most 30 seconds"), "{info}");
     }
 
     #[test]
