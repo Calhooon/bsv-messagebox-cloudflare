@@ -255,7 +255,7 @@ mod tests {
     fn the_lanes_figure_is_the_relays_send_bound() {
         assert_eq!(SESSION_LANE_BODY_BYTES, SEND_BODY_BYTES as u64);
         assert_eq!(SESSION_LANE_HELD_BODY_BYTES, 12 * 1024 * 1024);
-        assert!(SESSION_LANE_HELD_BODY_BYTES >= SESSION_LANE_BODY_BYTES);
+        const { assert!(SESSION_LANE_HELD_BODY_BYTES >= SESSION_LANE_BODY_BYTES) };
     }
 
     /// The layer's 413 for a declared length over the bound is answered with
@@ -369,7 +369,7 @@ mod tests {
     async fn one_byte_over_the_figure_is_refused_and_no_chunk_pulled_after() {
         let ledger = BodyLedger::new();
         let pulled = Cell::new(0usize);
-        let body = vec![1u8; 65];
+        let body = [1u8; 65];
         let source = stream::iter(body.chunks(1).map(|c| c.to_vec()).collect::<Vec<_>>())
             .chain(stream::iter(vec![vec![2u8; 10]; 3]))
             .inspect(|_| pulled.set(pulled.get() + 1))
