@@ -36,6 +36,43 @@ pub struct ValidatedSendMessage {
 /// inline.
 pub const SEND_BODY_BYTES: usize = 12 * 1024 * 1024;
 
+/// The relay's answer to a body over `SEND_BODY_BYTES`: 413
+/// `ERR_BODY_TOO_LARGE`, `{status, code, description}`. `size` is the body's
+/// length where it is known (the body read, or a declared `Content-Length`);
+/// where the read stopped at the bound the length is not known, and the
+/// description says "more than" the bound. The relay's own check after the
+/// read (`read_send_body`) and the BRC-31 layer's refusal before it
+/// (`body_bounds::layer_refusal_answer`) both answer with this.
+pub fn body_too_large(size: Option<u64>) -> ValErr {
+    let description = match size {
+        Some(size) => format!(
+            "The send is {size} bytes and the relay reads at most {SEND_BODY_BYTES} in one request."
+        ),
+        None => format!(
+            "The send is more than {SEND_BODY_BYTES} bytes and the relay reads at most {SEND_BODY_BYTES} in one request."
+        ),
+    };
+    err(413, "ERR_BODY_TOO_LARGE", &description)
+}
+
+/// A bearer-gated route's answer to a body over its figure: 413
+/// `ERR_BODY_TOO_LARGE`, `{status, code, description}` as [`body_too_large`],
+/// the description naming the route (`/push`, `/session/attest`,
+/// `/broadcast`) and its figure `budget`. `size` is the declared length where
+/// one was declared; where the read stopped at the figure the description
+/// says "more than" it.
+pub fn request_body_too_large(route: &str, size: Option<u64>, budget: u64) -> ValErr {
+    let description = match size {
+        Some(size) => format!(
+            "The {route} body is {size} bytes and the relay reads at most {budget} of it in one request."
+        ),
+        None => format!(
+            "The {route} body is more than {budget} bytes and the relay reads at most {budget} of it in one request."
+        ),
+    };
+    err(413, "ERR_BODY_TOO_LARGE", &description)
+}
+
 /// The `/sendMessage` body as a `Value`, read so that no `payment.tx` is
 /// ever a `Value` a byte (0.4.4, bsv-low #591 NOTE-4): the body is held to
 /// `SEND_BODY_BYTES` before a byte of it is parsed (413
@@ -47,15 +84,7 @@ pub const SEND_BODY_BYTES: usize = 12 * 1024 * 1024;
 /// `txShape` the sender wrote is the relay's field and is dropped.
 pub fn read_send_body(raw: &[u8]) -> ValResult<Value> {
     if raw.len() > SEND_BODY_BYTES {
-        return Err(err(
-            413,
-            "ERR_BODY_TOO_LARGE",
-            &format!(
-                "The send is {} bytes and the relay reads at most {} in one request.",
-                raw.len(),
-                SEND_BODY_BYTES
-            ),
-        ));
+        return Err(body_too_large(Some(raw.len() as u64)));
     }
     let invalid = || err(400, "ERR_INVALID_JSON", "Invalid JSON body");
     let spans = tx_spans(raw);

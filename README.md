@@ -55,6 +55,8 @@ is no verdict on the payment: the payment is not judged.
 |---|---|---|
 | 400 | `ERR_INVALID_PAYMENT` | Invalid bytes, spend, output or merkle-root refusal; byte errors name offset and kind. |
 | 400 | `ERR_INSUFFICIENT_PAYMENT` | The delivery output pays less than the fee. |
+| 408 | `ERR_AUTH_BODY_TIMEOUT` | Any authenticated route, and `/push`, `/session/attest` and `/broadcast` after their bearer: the request's body did not arrive within 30 seconds, the longest this host waits for one. Nothing of the request is done. Unsigned (no caller is authenticated yet). |
+| 413 | `ERR_BODY_TOO_LARGE` | Any authenticated route: the request's body is over this host's bound for one request, 12,582,912 bytes (12 MiB, `validation::SEND_BODY_BYTES`). A declared `Content-Length` over it is answered before the body is read, and the read stops one byte past it; that answer is unsigned (no caller is authenticated yet). `{status, code, description}`; the description names the body's size where it is known (`The send is 12582913 bytes and the relay reads at most 12582912 in one request.`) and says "more than" the bound where the read stopped. Also a payment a box keeps unjudged that is over its row's bound. On `/push`, `/session/attest` and `/broadcast`, after their bearer: the body is over the route's figure (`/push` 12,582,912 bytes, `/session/attest` 16,384, `/broadcast` 262,144; [src/body_bounds.rs](src/body_bounds.rs) says why), the description naming the route and its figure (`The /broadcast body is 262145 bytes and the relay reads at most 262144 of it in one request.`), before the body is read where its declared length is over. |
 | 413 | `ERR_PAYMENT_SIZE` | Not judged: the payment's bytes (its BEEF as bytes, inline in any shape of `tx` or uploaded) are over this host's bound (`budget`, the figure in force: `[limits] payment_bytes`, 614,400 bytes by default; `size` the payment's bytes). Refused from the encoding's or the stored length before any of it is parsed; the door keeps no state of the reading and no spool for it. A bound of this host, not a rule of the chain, and no verdict on the payment: pay with other coins. A send whose first message id is already stored answers `ERR_DUPLICATE_MESSAGE` instead. The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then. Each refusal is logged for the operator (`AUDIT payment.not_judged`). |
 | 422 | `ERR_PAYMENT_WORK` | Local work budget exhausted; validity remains undetermined. |
 | 422 | `ERR_PAYMENT_MEMORY` | Not judged: this host declined memory for a script of an unproven transaction in the payment's BEEF, the payment itself or one of its ancestors, at its stack-memory bound (1,000,000 bytes per stack, named in `budget`) or for a step. The bound is this host's, not a rule of the chain, and the answer is no verdict on the payment. `txid` and `input` name that transaction and input; the `description` is one sentence that says so. The way out, the free one first: present the payment again once that transaction has its proof (a transaction with its own proof is not run), or pay with other coins. Each decline is logged for the operator (`AUDIT payment.not_judged`). |
@@ -62,6 +64,8 @@ is no verdict on the payment: the payment is not judged.
 | 503 | `ERR_PAYMENT_UNAVAILABLE` | Header service could not answer; retry. |
 | 503 | `ERR_PAYMENT_PENDING` | Reading paused; repeat the same request to resume. |
 | 503 | `ERR_PAYMENT_CHANGED` | Object changed between verification and hand-off. |
+| 503 | `ERR_AUTH_BODIES_FULL` | Any authenticated route, and `/push`, `/session/attest` and `/broadcast` after their bearer: this host is holding as many request bodies as it reads at once; send the same request again after the `Retry-After` seconds. A bound of this host, not a fault of the request. Unsigned (no caller is authenticated yet). |
+| 413, 503, 408 | (plain text) | The Socket.IO polling POST (`POST /socket.io/?transport=polling&sid=…`): its body is over 1,000,000 bytes, the `maxPayload` the Engine.IO handshake names (413, before the body is read where its declared length is over, and the read stops one byte past it); this host is holding as many bodies read before a caller is known as it reads at once (503, with `Retry-After`); the body did not arrive within 30 seconds (408). `text/plain` with the CORS headers of the route's other polling answers; the text is one sentence naming the bound. |
 
 The reference message box server answers a payment it cannot verify with 503 or 500;
 this relay answers a local work or memory decline with 422, because the same bytes
@@ -77,7 +81,26 @@ zero stops the build. An
 ordinary payment is about a kilobyte (in 727 real payments the median was 1.2 KB and the
 largest 434 KB); a host that must read a larger payment raises the setting. The rest of the
 body keeps its own bound (12 MiB). A Worker's isolate is memory-limited, and a door bounds
-what it reads. The reference names no figure for a payment; only its whole body is bounded
+what it reads.
+
+Every body of a client's request the Worker reads is bounded before it is read past a figure. Before
+its caller is known, at three doors: the BRC-31 layer (bsv-middleware-cloudflare 0.7.8,
+called through `process_auth_do_with_body_bounds` for the HTTP routes and the `/ws`
+upgrade) and the HTTP session lane each read at most 12 MiB of one request
+(`validation::SEND_BODY_BYTES`, the one figure for a send, so the doors and the relay's own
+check after the read agree), and the Socket.IO polling POST reads at most 1,000,000 bytes,
+the `maxPayload` its handshake names. After the bearer, `/push` reads at most 12 MiB (a
+send), `/session/attest` 16 KiB (the hub's verify body) and `/broadcast` 256 KiB (one
+carrier event, written once per subscriber). Each door keeps a total of the bodies it is
+reading at once: 24 MiB for the BRC-31 layer, 12 MiB shared by the session lane and the
+polling POST, 12 MiB for the bearer-gated routes; with one send's three copies once it is
+handed over (36 MiB) that is 84 MiB of a 128 MiB isolate
+([src/body_bounds.rs](src/body_bounds.rs) shows the arithmetic). Each waits at most 30
+seconds for a body. The figures are constants of this crate, not settings. The answers are
+in the table above: 413 `ERR_BODY_TOO_LARGE` (the relay's own code and body for an
+over-size send), 503 `ERR_AUTH_BODIES_FULL` with `Retry-After`, 408
+`ERR_AUTH_BODY_TIMEOUT`. `/beef/upload-url` presigns a PUT straight to R2, so an upload's
+bytes never pass through the Worker. The reference names no figure for a payment; only its whole body is bounded
 (bsv-blockchain/ts-stack 57c5f13, `infra/message-box-server/src/app.ts:203-213`, and the
 socket's at `src/compose.ts:195`).
 

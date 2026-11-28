@@ -1,6 +1,6 @@
 [package]
 name = "bsv-messagebox-cloudflare"
-version = "0.8.9"
+version = "0.8.10"
 description = "A BSV messaging relay on Cloudflare Workers: BRC-31 authentication, delivery permissions, paid delivery, D1 storage and hibernatable WebSockets."
 license = "MIT"
 repository = "https://github.com/Calhooon/bsv-messagebox-cloudflare"
@@ -57,8 +57,11 @@ ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 # middleware's releases that hash and MAC through `bsv_rs::primitives::hash`,
 # no direct sha2 or hmac). Pinned exactly, with the core it is built on. Its
 # session, wallet and auth message are the relay's own bsv-rs 0.8.1 types.
-bsv-middleware-cloudflare = "=0.7.2"
-bsv-middleware-core = "=0.4.1"
+# 0.7.8 on core 0.4.7 (0.8.10 of the relay): the auth layer reads at most the
+# relay's own figure of a request's body, through `process_auth_do_with_body_bounds`
+# (`body_bounds::auth_body_bounds`).
+bsv-middleware-cloudflare = "=0.7.8"
+bsv-middleware-core = "=0.4.7"
 # The SDK and the streaming BEEF reader (0.4.0: `verify_stream`, `BeefDecoder`,
 # `StreamVerifier`, `Cursor`; 0.4.1: a transaction with no input is invalid
 # bytes, `Kind::NoInputs`; 0.4.3: a transaction with no output is invalid
